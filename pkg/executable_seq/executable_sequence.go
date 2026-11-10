@@ -22,7 +22,7 @@ package executable_seq
 import (
 	"errors"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/utils"
+	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"go.uber.org/zap"
 	"reflect"
 	"strconv"

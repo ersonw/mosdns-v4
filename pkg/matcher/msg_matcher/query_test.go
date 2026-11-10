@@ -21,11 +21,11 @@ package msg_matcher
 
 import (
 	"context"
-	"github.com/liang-hiwin/mosdns-v4/pkg/dnsutils"
-	"github.com/liang-hiwin/mosdns-v4/pkg/matcher/domain"
-	"github.com/liang-hiwin/mosdns-v4/pkg/matcher/elem"
-	"github.com/liang-hiwin/mosdns-v4/pkg/matcher/netlist"
-	"github.com/liang-hiwin/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/dnsutils"
+	"github.com/ersonw/mosdns-v4/pkg/matcher/domain"
+	"github.com/ersonw/mosdns-v4/pkg/matcher/elem"
+	"github.com/ersonw/mosdns-v4/pkg/matcher/netlist"
+	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/miekg/dns"
 	"net"
 	"net/netip"

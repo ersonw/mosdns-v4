@@ -21,8 +21,8 @@ package ip_observer
 
 import (
 	"bytes"
-	"github.com/liang-hiwin/mosdns-v4/pkg/concurrent_limiter"
-	"github.com/liang-hiwin/mosdns-v4/pkg/utils"
+	"github.com/ersonw/mosdns-v4/pkg/concurrent_limiter"
+	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"go.uber.org/zap"
 	"net/http"
 	"net/netip"

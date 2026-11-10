@@ -21,7 +21,7 @@ package data_provider
 
 import (
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/safe_close"
+	"github.com/ersonw/mosdns-v4/pkg/safe_close"
 	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 	"os"

@@ -20,7 +20,7 @@
 package tools
 
 import (
-	"github.com/liang-hiwin/mosdns-v4/coremain"
+	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/spf13/cobra"
 )
 

@@ -20,7 +20,7 @@
 package mem_cache
 
 import (
-	"github.com/liang-hiwin/mosdns-v4/pkg/concurrent_lru"
+	"github.com/ersonw/mosdns-v4/pkg/concurrent_lru"
 	"sync/atomic"
 	"time"
 )

@@ -21,8 +21,8 @@ package dnsutils
 
 import (
 	"encoding/binary"
-	"github.com/liang-hiwin/mosdns-v4/pkg/pool"
-	"github.com/liang-hiwin/mosdns-v4/pkg/utils"
+	"github.com/ersonw/mosdns-v4/pkg/pool"
+	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"github.com/miekg/dns"
 	"strconv"
 	"strings"

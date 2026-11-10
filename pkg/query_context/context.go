@@ -22,7 +22,7 @@ package query_context
 import (
 	"errors"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/dnsutils"
+	"github.com/ersonw/mosdns-v4/pkg/dnsutils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"net/netip"

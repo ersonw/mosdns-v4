@@ -22,7 +22,7 @@ package server
 import (
 	"crypto/tls"
 	"errors"
-	"github.com/liang-hiwin/mosdns-v4/pkg/server/dns_handler"
+	"github.com/ersonw/mosdns-v4/pkg/server/dns_handler"
 	"go.uber.org/zap"
 	"io"
 	"net/http"

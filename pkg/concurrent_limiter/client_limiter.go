@@ -21,8 +21,8 @@ package concurrent_limiter
 
 import (
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/concurrent_map"
-	"github.com/liang-hiwin/mosdns-v4/pkg/utils"
+	"github.com/ersonw/mosdns-v4/pkg/concurrent_map"
+	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"net/netip"
 	"sync"
 	"time"

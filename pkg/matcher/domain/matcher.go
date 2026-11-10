@@ -21,7 +21,7 @@ package domain
 
 import (
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/utils"
+	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"regexp"
 	"strings"
 )

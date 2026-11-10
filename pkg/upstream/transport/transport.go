@@ -22,7 +22,7 @@ package transport
 import (
 	"context"
 	"errors"
-	"github.com/liang-hiwin/mosdns-v4/pkg/utils"
+	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"io"

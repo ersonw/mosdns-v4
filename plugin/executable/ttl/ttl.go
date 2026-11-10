@@ -21,10 +21,10 @@ package ttl
 
 import (
 	"context"
-	"github.com/liang-hiwin/mosdns-v4/coremain"
-	"github.com/liang-hiwin/mosdns-v4/pkg/dnsutils"
-	"github.com/liang-hiwin/mosdns-v4/pkg/executable_seq"
-	"github.com/liang-hiwin/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/coremain"
+	"github.com/ersonw/mosdns-v4/pkg/dnsutils"
+	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
+	"github.com/ersonw/mosdns-v4/pkg/query_context"
 )
 
 const (

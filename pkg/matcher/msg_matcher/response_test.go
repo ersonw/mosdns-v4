@@ -20,7 +20,7 @@
 package msg_matcher
 
 import (
-	"github.com/liang-hiwin/mosdns-v4/pkg/matcher/netlist"
+	"github.com/ersonw/mosdns-v4/pkg/matcher/netlist"
 	"github.com/miekg/dns"
 	"net"
 	"testing"

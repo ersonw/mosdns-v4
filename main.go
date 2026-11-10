@@ -21,16 +21,17 @@ package main
 
 import (
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/coremain"
-	"github.com/liang-hiwin/mosdns-v4/mlog"
-	_ "github.com/liang-hiwin/mosdns-v4/plugin"
-	_ "github.com/liang-hiwin/mosdns-v4/tools"
-	"github.com/spf13/cobra"
 	_ "net/http/pprof"
+
+	"github.com/ersonw/mosdns-v4/coremain"
+	"github.com/ersonw/mosdns-v4/mlog"
+	_ "github.com/ersonw/mosdns-v4/plugin"
+	_ "github.com/ersonw/mosdns-v4/tools"
+	"github.com/spf13/cobra"
 )
 
 var (
-	version = "dev/unknown"
+	version = "dev/4.0"
 )
 
 func init() {

@@ -3,9 +3,9 @@ package coremain
 import (
 	"errors"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/server"
-	"github.com/liang-hiwin/mosdns-v4/pkg/server/dns_handler"
-	"github.com/liang-hiwin/mosdns-v4/pkg/server/http_handler"
+	"github.com/ersonw/mosdns-v4/pkg/server"
+	"github.com/ersonw/mosdns-v4/pkg/server/dns_handler"
+	"github.com/ersonw/mosdns-v4/pkg/server/http_handler"
 	"github.com/pires/go-proxyproto"
 	"go.uber.org/zap"
 	"net"

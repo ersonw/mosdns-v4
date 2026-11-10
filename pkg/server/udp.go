@@ -4,8 +4,8 @@ package server
 import (
 	"context"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/pool"
-	"github.com/liang-hiwin/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/pool"
+	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"net/netip"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"

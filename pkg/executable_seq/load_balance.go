@@ -22,7 +22,7 @@ package executable_seq
 import (
 	"context"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"go.uber.org/zap"
 	"strconv"
 	"sync/atomic"

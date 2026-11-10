@@ -24,9 +24,9 @@ package ipset
 import (
 	"context"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/coremain"
-	"github.com/liang-hiwin/mosdns-v4/pkg/executable_seq"
-	"github.com/liang-hiwin/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/coremain"
+	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
+	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/miekg/dns"
 	"github.com/nadoo/ipset"
 	"go.uber.org/zap"

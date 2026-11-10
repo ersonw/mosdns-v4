@@ -22,7 +22,7 @@ package bundled_upstream
 import (
 	"context"
 	"errors"
-	"github.com/liang-hiwin/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 )

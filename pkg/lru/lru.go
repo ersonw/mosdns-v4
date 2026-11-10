@@ -21,7 +21,7 @@ package lru
 
 import (
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/list"
+	"github.com/ersonw/mosdns-v4/pkg/list"
 )
 
 type LRU[K comparable, V any] struct {

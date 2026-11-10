@@ -22,8 +22,8 @@ package hosts
 import (
 	"errors"
 	"fmt"
-	"github.com/liang-hiwin/mosdns-v4/pkg/dnsutils"
-	"github.com/liang-hiwin/mosdns-v4/pkg/matcher/domain"
+	"github.com/ersonw/mosdns-v4/pkg/dnsutils"
+	"github.com/ersonw/mosdns-v4/pkg/matcher/domain"
 	"github.com/miekg/dns"
 	"net/netip"
 	"strings"
