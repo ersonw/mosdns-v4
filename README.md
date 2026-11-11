@@ -22,7 +22,7 @@ prerouting/forward/postrouting），探测候选真实 IP 的可达性，写 `/3
       next_hop: "10.131.160.3"
       next_hop_dev: "eth0"
       route_table: "main"       # 默认 main，策略路由可填自定义表名
-      route_aggregation: true   # 默认 true，把 /32 host route 延迟几秒后严格聚合为 CIDR
+      route_aggregation: true   # 默认 true：每 30 秒扫描路由表，把指向出口的 /32 聚合为 CIDR
       realip: false             # 默认 false（发 fake IP）；true 则不分配假 IP、不做 DNAT，只给真实 IP 写出口路由
 ```
 

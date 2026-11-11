@@ -110,11 +110,8 @@ func TestFakeIPModeAnswersFakeIP(t *testing.T) {
 	}
 }
 
-func TestRealIPRoutesUseDebouncedAggregation(t *testing.T) {
+func TestRealIPRoutesAreAggregatedFromTheTable(t *testing.T) {
 	p := newRealIPPlugin(t, true)
-	// The debounce timer would fire during the test; drive aggregation by hand
-	// so the assertions stay deterministic.
-	p.aggregateRoutes = false
 	fr := p.runner.(*fakeRunner)
 
 	p.syncRealRoutes(context.Background(), []string{"1.2.3.4", "1.2.3.5", "1.2.3.6", "1.2.3.7"})
@@ -129,7 +126,10 @@ func TestRealIPRoutesUseDebouncedAggregation(t *testing.T) {
 		t.Fatalf("missing /32 host route, calls: %v", fr.all())
 	}
 
-	p.aggregateRealRoutes(context.Background(), "11.10.12.1", "wg0")
+	// The periodic scan reads the kernel table, so feed what a previous pass
+	// would have found there.
+	routes := []string{"1.2.3.4/32", "1.2.3.5/32", "1.2.3.6/32", "1.2.3.7/32"}
+	p.collapseManagedRoutes(context.Background(), routes, "11.10.12.1", "wg0")
 	if _, ok := fr.find("route replace 1.2.3.4/30 via 11.10.12.1 dev wg0"); !ok {
 		t.Fatalf("four adjacent /32 were not collapsed into /30, calls: %v", fr.all())
 	}

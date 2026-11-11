@@ -130,16 +130,18 @@ type FakeIPNatPlugin struct {
 	routeTable      string
 	aggregateRoutes bool
 	// realRoutes is the set of real IPs that already carry a /32 host route in
-	// realip mode. Route aggregation collapses them into CIDR blocks a few
-	// seconds later, so a burst of queries does not thrash the table.
+	// realip mode. It is informational only: aggregation re-reads the routing
+	// table, so routes written by an earlier process are also collapsed.
 	realMu     sync.Mutex
 	realRoutes map[string]struct{}
-	// aggMu guards aggTimer, the debounce timer for route aggregation.
-	aggMu    sync.Mutex
-	aggTimer *time.Timer
-	natMu    sync.Mutex // serializes nft / ip command sequences
-	runner   cmdRunner
-	probe    func(ctx context.Context, ip string) bool
+	// aggMu guards the aggregation loop handles. The loop re-reads the routing
+	// table on every tick instead of relying on anything tracked in memory.
+	aggMu   sync.Mutex
+	aggStop chan struct{}
+	aggDone chan struct{}
+	natMu   sync.Mutex // serializes nft / ip command sequences
+	runner  cmdRunner
+	probe   func(ctx context.Context, ip string) bool
 
 	// TUN data path: the whole ipv4_range is routed to a device requested from
 	// the system instead of being DNAT-ed hop by hop.
@@ -387,8 +389,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		p.L().Warn("fakeip nat: restore runtime mappings failed", zap.Error(err))
 	}
 	// The nft path has a second source of truth: the dnat map survives restarts
-	// even when a database row did not. Swap the differences into both.
-	if !p.useTun {
+	// even when a database row did not. Swap the differences into both. realip
+	// mode has no DNAT map at all, so there is nothing to reconcile.
+	if !p.useTun && !p.realIP {
 		p.reconcileFirewallMappings(restoreCtx)
 	}
 	restoreCancel()
@@ -453,6 +456,10 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			p.setupTunEgress()
 		}
 	}
+
+	// The NAT data path writes one host route per resolution. A periodic scan
+	// folds them into CIDR blocks; the tun path needs none of that.
+	p.startRouteAggregation()
 
 	// coremain never iterates plugins to close them, so the sqlite handle has
 	// to ride on the shutdown channel that RunMosdns waits on.
@@ -548,15 +555,52 @@ func (p *FakeIPNatPlugin) stopTunDataPath() {
 	}
 }
 
-// stopRouteAggregation cancels a pending collapse so no ip command runs after
-// the plugin has been closed.
+// startRouteAggregation runs the managed-route collapse on a timer. The scan
+// reads the routing table, not a memory set, so host routes written by an
+// earlier process are collapsed too. Only the NAT data path needs it: the tun
+// data path routes the whole fake range as one prefix already.
+func (p *FakeIPNatPlugin) startRouteAggregation() {
+	if p.useTun || !p.aggregateRoutes {
+		return
+	}
+	p.aggMu.Lock()
+	if p.aggStop != nil {
+		p.aggMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	p.aggStop, p.aggDone = stop, done
+	p.aggMu.Unlock()
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(routeAggInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				p.aggregateManagedRoutes()
+			}
+		}
+	}()
+	p.L().Debug("fakeip nat: route aggregation started", zap.Duration("interval", routeAggInterval))
+}
+
+// stopRouteAggregation stops the loop and waits for a running collapse to
+// finish, so no ip command outlives the plugin.
 func (p *FakeIPNatPlugin) stopRouteAggregation() {
 	p.aggMu.Lock()
-	defer p.aggMu.Unlock()
-	if p.aggTimer != nil {
-		p.aggTimer.Stop()
-		p.aggTimer = nil
+	stop, done := p.aggStop, p.aggDone
+	p.aggStop, p.aggDone = nil, nil
+	p.aggMu.Unlock()
+	if stop == nil {
+		return
 	}
+	close(stop)
+	<-done
 }
 
 // Close stops the data path and releases the SQLite handle. Without it the

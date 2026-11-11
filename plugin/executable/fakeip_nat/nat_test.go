@@ -25,6 +25,7 @@ type fakeRunner struct {
 	devs         map[string]bool   // per-name existence, takes precedence over devExists
 	devAddrs     map[string]string // output of `ip addr show dev X`
 	ifaces       map[string]bool   // `ifconfig X` answers; nil means every probe succeeds
+	routes       string            // output of `ip -4 route show`
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
@@ -51,6 +52,8 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 		return f.mappings, nil
 	case call == "ip route show default":
 		return "default via 10.0.0.1 dev eth0", nil
+	case call == "ip -4 route show" || strings.HasPrefix(call, "ip -4 route show table "):
+		return f.routes, nil
 	case strings.HasPrefix(call, "ip link show dev "):
 		name := strings.TrimPrefix(call, "ip link show dev ")
 		if f.devs != nil {
@@ -349,29 +352,36 @@ func TestSyncNATUsesDBCandidates(t *testing.T) {
 	}
 }
 
-func TestSyncNATAggregatesRoutes(t *testing.T) {
-	// The map already holds two adjacent /32 entries for other fake ips. The
-	// fast path does not trigger for our fake ip, so aggregation runs.
-	runner := &fakeRunner{
-		tableExists: true,
-		mappings: `elements = {
-			198.18.0.9 : 1.2.3.4,
-			198.18.0.10 : 1.2.3.5
-		}`,
-	}
-	p := newNativePlugin(t, runner, func(_ context.Context, ip string) bool { return ip == "9.9.9.9" })
+func TestAggregateManagedRoutes(t *testing.T) {
+	// Two adjacent /32 host routes steer traffic to the same gateway. The scan
+	// must install the /31 first and only then delete the originals.
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
 
-	p.syncNAT(context.Background(), "198.18.0.1", "example.com", "9.9.9.9")
-	// Aggregation is debounced now, so run the scheduled pass by hand.
-	p.aggregateRoutesNow("10.0.0.1", "eth0")
+	p.collapseManagedRoutes(context.Background(),
+		[]string{"1.2.3.4/32", "1.2.3.5/32"}, "10.0.0.1", "eth0")
 
-	if _, ok := runner.find("ip route replace 1.2.3.4/31 via 10.0.0.1 dev eth0"); !ok {
-		t.Fatalf("aggregated route missing: %v", runner.all())
-	}
-	for _, ip := range []string{"1.2.3.4/32", "1.2.3.5/32"} {
-		if _, ok := runner.find("ip route delete " + ip); !ok {
-			t.Fatalf("old host route %s was not deleted: %v", ip, runner.all())
+	calls := runner.all()
+	addIdx, delIdx := -1, -1
+	for i, call := range calls {
+		if addIdx < 0 && strings.Contains(call, "route replace 1.2.3.4/31") {
+			addIdx = i
 		}
+		if delIdx < 0 && strings.Contains(call, "route delete 1.2.3.4/32") {
+			delIdx = i
+		}
+	}
+	if addIdx < 0 {
+		t.Fatalf("aggregated route missing: %v", calls)
+	}
+	if delIdx < 0 {
+		t.Fatalf("old host route not deleted: %v", calls)
+	}
+	if addIdx > delIdx {
+		t.Fatalf("routes were deleted before the aggregate was installed: %v", calls)
+	}
+	if _, ok := runner.find("ip route delete 1.2.3.5/32"); !ok {
+		t.Fatalf("second host route not deleted: %v", calls)
 	}
 }
 

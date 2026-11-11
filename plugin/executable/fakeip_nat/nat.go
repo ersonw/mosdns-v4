@@ -34,10 +34,11 @@ const (
 	// shorter than natTimeout on purpose: a client that waits too long retries
 	// or times out, and a late mapping is still installed for the next query.
 	natSyncWait = 3 * time.Second
-	// routeAggDelay is how long host route writes are collected before they
-	// are collapsed into CIDR blocks, so a burst of resolutions does not
-	// rewrite the routing table once per query.
-	routeAggDelay = 3 * time.Second
+	// routeAggInterval is how often the NAT data path scans the routing table
+	// and folds the host routes that point at the outlet into CIDR blocks. It
+	// is a periodic scan rather than a per-write debounce: routes written before
+	// a restart, or by a resolution that already left memory, are folded too.
+	routeAggInterval = 30 * time.Second
 )
 
 // nftElementRe extracts "fake : real" pairs from `nft list map` output.
@@ -146,10 +147,9 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 	}
 	p.applyHostRoute(ctx, selected, hop, dev)
 
-	// Collapse the /32 routes a few seconds after the last write instead of
-	// right here: one resolution should not rewrite the table, and a burst of
-	// them should end with aggregated CIDR blocks rather than hundreds of /32.
-	p.scheduleRouteAggregation(hop, dev, routeAggDelay)
+	// No collapse here: the periodic scan folds every managed host route, so
+	// one resolution never rewrites the table and a burst still ends up
+	// aggregated.
 
 	p.L().Info("nat mapping updated",
 		zap.String("fake_ip", fakeIP), zap.String("real_ip", selected),
@@ -241,84 +241,107 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 		zap.String("route_table", p.routeTable))
 }
 
-// syncAggregatedRoutes replaces the /32 host routes of the map with strictly
-// aggregated CIDR routes, like ipaddress.collapse_addresses did.
-func (p *FakeIPNatPlugin) syncAggregatedRoutes(ctx context.Context, table, hop, dev string) {
-	prefixes := make([]netip.Prefix, 0, 64)
-	for _, ip := range p.nftMappings(ctx, table) {
-		addr, err := netip.ParseAddr(ip)
-		if err != nil || !addr.Is4() {
+// aggregateManagedRoutes folds every route that steers traffic to the
+// configured gateway/device into CIDR blocks. The list is read from the
+// kernel, the originals are kept verbatim, the aggregated blocks are installed
+// first and the originals are deleted afterwards, so a packet never falls into
+// the gap between the two passes.
+func (p *FakeIPNatPlugin) aggregateManagedRoutes() {
+	ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
+	defer cancel()
+
+	hop, dev := p.nextHop, p.nextHopDev
+	if hop == "" && dev == "" {
+		hop, dev = p.systemDefaultRoute(ctx)
+	}
+	if hop == "" && dev == "" {
+		p.L().Debug("route aggregation: no next hop and no device, scan skipped")
+		return
+	}
+
+	original := p.listManagedRoutes(ctx, hop, dev)
+	p.collapseManagedRoutes(ctx, original, hop, dev)
+}
+
+// collapseManagedRoutes installs the aggregated blocks of the given route list
+// first and deletes the originals afterwards, so no packet falls into the gap
+// between the two passes.
+func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []string, hop, dev string) {
+	p.natMu.Lock()
+	defer p.natMu.Unlock()
+
+	if len(original) < 2 {
+		p.L().Debug("route aggregation: fewer than two managed routes", zap.Int("routes", len(original)))
+		return
+	}
+
+	prefixes := make([]netip.Prefix, 0, len(original))
+	skipped := 0
+	for _, route := range original {
+		pfx, err := netip.ParsePrefix(route)
+		if err != nil || !pfx.Addr().Is4() {
+			skipped++
 			continue
 		}
-		prefixes = append(prefixes, netip.PrefixFrom(addr, 32))
+		// A block wider than /8 cannot come from collapsing host routes; it
+		// would merge unrelated space, so it stays out of the pass.
+		if pfx.Bits() < 8 {
+			skipped++
+			continue
+		}
+		prefixes = append(prefixes, pfx)
 	}
-	if len(prefixes) == 0 {
-		p.L().Debug("fakeip nat: route aggregation skipped, nft map is empty")
+	if len(prefixes) < 2 {
+		p.L().Debug("route aggregation: not enough collapsible routes",
+			zap.Int("routes", len(prefixes)), zap.Int("skipped", skipped))
 		return
 	}
 
 	collapsed := collapsePrefixes(prefixes)
-
-	deleted := 0
-	for _, prefix := range prefixes {
-		args := []string{"route", "delete", prefix.String()}
-		if p.routeTable != "" && p.routeTable != "main" {
-			args = append(args, "table", p.routeTable)
-		}
-		if _, err := p.runner.Run(ctx, "ip", args...); err == nil {
-			deleted++
-		}
+	kept := make(map[string]struct{}, len(collapsed))
+	for _, pfx := range collapsed {
+		kept[pfx.String()] = struct{}{}
 	}
 
+	withTable := func(args []string) []string {
+		if p.routeTable != "" && p.routeTable != "main" {
+			return append(args, "table", p.routeTable)
+		}
+		return args
+	}
+
+	// Install the aggregated blocks before deleting anything.
 	added := 0
-	for _, prefix := range collapsed {
-		args := []string{"route", "replace", prefix.String()}
+	for _, pfx := range collapsed {
+		args := []string{"route", "replace", pfx.String()}
 		if hop != "" {
 			args = append(args, "via", hop)
 		}
 		if dev != "" {
 			args = append(args, "dev", dev)
 		}
-		if p.routeTable != "" && p.routeTable != "main" {
-			args = append(args, "table", p.routeTable)
-		}
-		if _, err := p.runner.Run(ctx, "ip", args...); err == nil {
+		if _, err := p.runner.Run(ctx, "ip", withTable(args)...); err == nil {
 			added++
 		}
 	}
 
-	p.L().Debug("host routes re-aggregated",
-		zap.Int("before", len(prefixes)), zap.Int("after", len(collapsed)),
-		zap.Int("deleted", deleted), zap.Int("added", added))
-}
+	// Then drop the originals, skipping the blocks the collapse reproduced
+	// unchanged: deleting those would undo what the add pass just installed.
+	deleted := 0
+	for _, pfx := range prefixes {
+		if _, ok := kept[pfx.String()]; ok {
+			continue
+		}
+		args := []string{"route", "delete", pfx.String()}
+		if _, err := p.runner.Run(ctx, "ip", withTable(args)...); err == nil {
+			deleted++
+		}
+	}
 
-// scheduleRouteAggregation restarts the debounce timer so the collapse runs a
-// few seconds after the last route write. A timer left over from an earlier
-// write is replaced, so a stream of resolutions still ends in one collapse.
-func (p *FakeIPNatPlugin) scheduleRouteAggregation(hop, dev string, delay time.Duration) {
-	if !p.aggregateRoutes {
-		return
-	}
-	p.aggMu.Lock()
-	if p.aggTimer != nil {
-		p.aggTimer.Stop()
-	}
-	p.aggTimer = time.AfterFunc(delay, func() {
-		p.aggregateRoutesNow(hop, dev)
-	})
-	p.aggMu.Unlock()
-}
-
-func (p *FakeIPNatPlugin) aggregateRoutesNow(hop, dev string) {
-	ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
-	defer cancel()
-	p.natMu.Lock()
-	defer p.natMu.Unlock()
-	if p.realIP {
-		p.aggregateRealRoutes(ctx, hop, dev)
-		return
-	}
-	p.syncAggregatedRoutes(ctx, p.nftTableName(), hop, dev)
+	p.L().Debug("managed routes re-aggregated",
+		zap.Int("before", len(prefixes)), zap.Int("skipped", skipped),
+		zap.Int("after", len(collapsed)), zap.Int("added", added), zap.Int("deleted", deleted),
+		zap.String("next_hop", hop), zap.String("dev", dev))
 }
 
 // syncRealRoutes installs a /32 host route for every real ip of a resolution
@@ -356,66 +379,6 @@ func (p *FakeIPNatPlugin) syncRealRoutes(ctx context.Context, ips []string) {
 	p.L().Info("realip routes updated",
 		zap.Strings("real_ips", ips), zap.String("next_hop", hop), zap.String("dev", dev),
 		zap.Int("applied", applied), zap.String("route_table", p.routeTable))
-
-	p.scheduleRouteAggregation(hop, dev, routeAggDelay)
-}
-
-// aggregateRealRoutes collapses the real ip host routes of realip mode into the
-// strictest CIDR blocks, mirroring syncAggregatedRoutes for the nft map.
-func (p *FakeIPNatPlugin) aggregateRealRoutes(ctx context.Context, hop, dev string) {
-	p.realMu.Lock()
-	ips := make([]string, 0, len(p.realRoutes))
-	for ip := range p.realRoutes {
-		ips = append(ips, ip)
-	}
-	p.realMu.Unlock()
-	if len(ips) == 0 {
-		p.L().Debug("realip: route aggregation skipped, no real ips")
-		return
-	}
-
-	prefixes := make([]netip.Prefix, 0, len(ips))
-	for _, ip := range ips {
-		addr, err := netip.ParseAddr(ip)
-		if err != nil || !addr.Is4() {
-			continue
-		}
-		prefixes = append(prefixes, netip.PrefixFrom(addr, 32))
-	}
-	if len(prefixes) == 0 {
-		return
-	}
-	collapsed := collapsePrefixes(prefixes)
-
-	withTable := func(args []string) []string {
-		if p.routeTable != "" && p.routeTable != "main" {
-			return append(args, "table", p.routeTable)
-		}
-		return args
-	}
-
-	deleted, added := 0, 0
-	for _, prefix := range prefixes {
-		if _, err := p.runner.Run(ctx, "ip", withTable([]string{"route", "delete", prefix.String()})...); err == nil {
-			deleted++
-		}
-	}
-	for _, prefix := range collapsed {
-		args := []string{"route", "replace", prefix.String()}
-		if hop != "" {
-			args = append(args, "via", hop)
-		}
-		if dev != "" {
-			args = append(args, "dev", dev)
-		}
-		if _, err := p.runner.Run(ctx, "ip", withTable(args)...); err == nil {
-			added++
-		}
-	}
-
-	p.L().Debug("realip host routes re-aggregated",
-		zap.Int("before", len(prefixes)), zap.Int("after", len(collapsed)),
-		zap.Int("deleted", deleted), zap.Int("added", added))
 }
 
 // selectReachable probes every candidate in parallel and returns the first
