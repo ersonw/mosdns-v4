@@ -333,8 +333,9 @@ func TestHopFakeForSkipsAllocatedAddresses(t *testing.T) {
 
 func TestHopNameSuffixDefaultAndValidation(t *testing.T) {
 	p := newTestPlugin(t, "198.18.0.0/16")
-	if p.hopSuffix != "mosdns" {
-		t.Fatalf("default hop suffix = %q, want mosdns", p.hopSuffix)
+	// newTestPlugin uses table_prefix "test", which becomes the default suffix.
+	if p.hopSuffix != "test" {
+		t.Fatalf("default hop suffix = %q, want test", p.hopSuffix)
 	}
 
 	bp := coremain.NewBP("test_fakeip", PluginType, zap.NewNop(), nil)
@@ -346,5 +347,19 @@ func TestHopNameSuffixDefaultAndValidation(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatalf("a suffix with a space must be rejected")
+	}
+
+	// A table prefix with underscores still yields a legal DNS label.
+	q, err := Init(coremain.NewBP("test_fakeip2", PluginType, zap.NewNop(), nil), &Args{
+		DBPath:      filepath.Join(t.TempDir(), "fakeip.db"),
+		TablePrefix: "my_pfx",
+		IPv4Range:   "198.18.0.0/16",
+	})
+	if err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+	defer func() { _ = q.Close() }()
+	if got := q.(*FakeIPNatPlugin).hopSuffix; got != "my-pfx" {
+		t.Fatalf("hop suffix = %q, want my-pfx", got)
 	}
 }

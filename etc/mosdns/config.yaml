@@ -515,7 +515,8 @@ servers:
 #   hop_name_suffix - reverse lookup suffix for the virtual address handed to
 #                     one traceroute hop. The PTR record answers
 #                     "<real hop>.<suffix>", so the client prints the real
-#                     next hop next to the virtual address. Default: mosdns
+#                     next hop next to the virtual address. Default: the
+#                     table_prefix, with underscores turned into dashes.
 # -----------------------------------------------------------------------------
 #   - tag: fakeip
 #     type: fakeip_nat
@@ -527,7 +528,7 @@ servers:
 #       next_hop: ""
 #       next_hop_dev: ""
 #       route_table: main
-#       hop_name_suffix: mosdns
+#       hop_name_suffix: default        # defaults to table_prefix
 #       route_aggregation: true
 #       tun_route_table: 100
 #       use_tun: false

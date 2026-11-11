@@ -71,7 +71,8 @@ type Args struct {
 	// ProxyInsecure 跳过 https / trojan 代理的证书校验，供自签证书使用。
 	ProxyInsecure bool `yaml:"proxy_insecure"`
 
-	// HopNameSuffix 是路由探测时给每一跳分配的反向解析后缀，默认 "mosdns"：
+	// HopNameSuffix 是路由探测时给每一跳分配的反向解析后缀，默认复用 table_prefix
+	// （下划线换成连字符）：
 	// 虚拟地址的 PTR 记录返回 "<真实跳地址>.<后缀>"，下游 traceroute 因此能
 	// 同时看到真实下一跳和发给它的虚拟地址。只允许字母、数字和连字符。
 	HopNameSuffix string `yaml:"hop_name_suffix"`
@@ -189,7 +190,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		return nil, fmt.Errorf("invalid route_table %q: only alphanumeric, underscore, dot and dash allowed", cfg.RouteTable)
 	}
 	if cfg.HopNameSuffix == "" {
-		cfg.HopNameSuffix = "mosdns"
+		// Reuse the table prefix so a deployment names its hops after its
+		// own table; underscores become dashes to keep the label legal.
+		cfg.HopNameSuffix = strings.ReplaceAll(cfg.TablePrefix, "_", "-")
 	}
 	if !validHostLabel.MatchString(cfg.HopNameSuffix) {
 		return nil, fmt.Errorf("invalid hop_name_suffix %q: only alphanumeric and dashes allowed", cfg.HopNameSuffix)
