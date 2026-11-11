@@ -63,6 +63,13 @@ type Args struct {
 	// Script 已废弃：脚本回调已移除，保留字段只是为了让带 script 的旧配置仍能启动。
 	Script string `yaml:"script"`
 
+	// MSSClamp 用于 NAT 数据面：在 nft 里给经过本机的 SYN / SYN-ACK 改写 MSS
+	// 选项，避免客户端按 1500 的链路 MTU 协商出 1460 字节的段，而出口隧道
+	// （wg 常见 1400）接不住，表现为握手成功但网页卡死在传输阶段。
+	// 0 表示关闭（默认，行为不变）。建议填隧道 MTU 减 40，例如 1400 -> 1360。
+	// 只在 fake-ip 的 nft 表里生效：tun 数据面由 tun_mtu 负责，realip 模式没有表。
+	MSSClamp int `yaml:"mss_clamp"`
+
 	// NAT 数据面（默认）：插件直接管理 nftables DNAT 与 host route。
 	RouteTable      string `yaml:"route_table"`       // host route 写入的路由表，默认: "main"
 	AggregateRoutes *bool  `yaml:"route_aggregation"` // 是否把 /32 host route 做严格 CIDR 聚合，默认: true
@@ -129,6 +136,9 @@ type FakeIPNatPlugin struct {
 	// NAT data path: the plugin owns the nftables map and host routes.
 	routeTable      string
 	aggregateRoutes bool
+	// mssClamp is the MSS value written into SYN / SYN-ACK packets, 0 to leave
+	// the negotiated value alone.
+	mssClamp int
 	// realRoutes is the set of real IPs that already carry a /32 host route in
 	// realip mode. It is informational only: aggregation re-reads the routing
 	// table, so routes written by an earlier process are also collapsed.
@@ -265,6 +275,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("next_hop", cfg.NextHop),
 		zap.String("next_hop_dev", cfg.NextHopDev),
 		zap.Bool("realip", cfg.RealIP),
+		zap.Int("mss_clamp", cfg.MSSClamp),
 		zap.Bool("proxy_configured", strings.TrimSpace(cfg.Proxy) != ""))
 
 	if !validTableName.MatchString(cfg.TablePrefix) {
@@ -291,6 +302,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		if _, err := netip.ParseAddr(cfg.NextHop); err != nil {
 			return nil, fmt.Errorf("invalid next_hop IP %q: %w", cfg.NextHop, err)
 		}
+	}
+
+	if cfg.MSSClamp != 0 && (cfg.MSSClamp < 536 || cfg.MSSClamp > 65535) {
+		return nil, fmt.Errorf("invalid mss_clamp %d: must be 0 or between 536 and 65535", cfg.MSSClamp)
+	}
+	if cfg.MSSClamp > 0 && (cfg.UseTun || cfg.RealIP) {
+		bp.L().Warn("mss_clamp only applies to the fake-ip nft table",
+			zap.Int("mss_clamp", cfg.MSSClamp), zap.Bool("use_tun", cfg.UseTun), zap.Bool("realip", cfg.RealIP))
 	}
 
 	db, err := sql.Open("sqlite", cfg.DBPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
@@ -373,6 +392,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		routeTable:      cfg.RouteTable,
 		tunRouteTable:   cfg.TunRouteTable,
 		aggregateRoutes: aggregateRoutes,
+		mssClamp:        cfg.MSSClamp,
 		useTun:          cfg.UseTun,
 		tunDev:          strings.TrimSpace(cfg.TunDev),
 	}

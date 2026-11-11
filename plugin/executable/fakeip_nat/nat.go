@@ -177,6 +177,20 @@ func (p *FakeIPNatPlugin) ensureNFTTable(ctx context.Context, table, dev string)
 	if dev != "" {
 		setup = append(setup, []string{"add", "rule", "ip", table, "postrouting", "oifname", dev, "masquerade"})
 	}
+	if p.mssClamp > 0 {
+		mss := fmt.Sprint(p.mssClamp)
+		setup = append(setup,
+			// The mangle hook runs before the NAT chain (priority -100), so the
+			// client's SYN still carries the fake destination address here.
+			[]string{"add", "chain", "ip", table, "mss_clamp", "{ type filter hook prerouting priority mangle; policy accept; }"},
+			[]string{"add", "rule", "ip", table, "mss_clamp", "ip", "daddr", p.cidr,
+				"tcp", "flags", "syn", "tcp", "option", "maxseg", "size", "set", mss},
+			// The server's SYN-ACK arrives already DNATed, so match it through
+			// conntrack instead of the destination address.
+			[]string{"add", "rule", "ip", table, "mss_clamp", "ct", "status", "dnat",
+				"tcp", "flags", "syn", "tcp", "option", "maxseg", "size", "set", mss},
+		)
+	}
 
 	p.L().Debug("fakeip nat: creating nft table",
 		zap.String("nft_table", table), zap.String("egress_dev", dev), zap.Int("commands", len(setup)))

@@ -424,3 +424,28 @@ func TestCleanupDataPathDropsNFTTable(t *testing.T) {
 		t.Fatalf("nft table was not removed on shutdown: %v", runner.all())
 	}
 }
+
+func TestEnsureNFTTableAddsMSSClamp(t *testing.T) {
+	runner := &fakeRunner{tableExists: false}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.mssClamp = 1360
+
+	if err := p.ensureNFTTable(context.Background(), p.nftTableName(), "eth0"); err != nil {
+		t.Fatalf("ensureNFTTable: %v", err)
+	}
+
+	// Both the client SYN and the server SYN-ACK have to be clamped, otherwise
+	// one direction keeps advertising the full Ethernet MSS.
+	count := 0
+	for _, call := range runner.all() {
+		if strings.Contains(call, "tcp option maxseg size set 1360") {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("mss clamp rules = %d, want 2, calls: %v", count, runner.all())
+	}
+	if !strings.Contains(strings.Join(runner.all(), "\n"), "hook prerouting priority mangle") {
+		t.Fatalf("mss clamp chain missing: %v", runner.all())
+	}
+}

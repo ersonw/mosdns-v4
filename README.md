@@ -24,6 +24,7 @@ prerouting/forward/postrouting），探测候选真实 IP 的可达性，写 `/3
       route_table: "main"       # 默认 main，策略路由可填自定义表名
       route_aggregation: true   # 默认 true：每 30 秒扫描路由表，把指向出口的 /32 聚合为 CIDR
       realip: false             # 默认 false（发 fake IP）；true 则不分配假 IP、不做 DNAT，只给真实 IP 写出口路由
+      mss_clamp: 0              # 默认 0 关闭；出口隧道 MTU 1400 时填 1360，改写 SYN/SYN-ACK 的 MSS
 ```
 
 打开 `use_tun` 后改走 TUN 数据面：插件向系统申请 tun 网卡，把网卡地址设为 `ipv4_range` 的段首地址
