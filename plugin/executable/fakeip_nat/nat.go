@@ -344,6 +344,59 @@ func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []
 		zap.String("next_hop", hop), zap.String("dev", dev))
 }
 
+// deleteManagedRoutes removes the given prefixes from the routing table. It is
+// the counterpart of collapseManagedRoutes: an aggregation pass replaces a
+// batch of /32 with wider blocks, and the blocks themselves are what a stopped
+// plugin has to remove again.
+func (p *FakeIPNatPlugin) deleteManagedRoutes(ctx context.Context, prefixes []string) int {
+	withTable := func(args []string) []string {
+		if p.routeTable != "" && p.routeTable != "main" {
+			return append(args, "table", p.routeTable)
+		}
+		return args
+	}
+	deleted := 0
+	for _, prefix := range prefixes {
+		if _, err := p.runner.Run(ctx, "ip", withTable([]string{"route", "delete", prefix})...); err == nil {
+			deleted++
+		}
+	}
+	return deleted
+}
+
+// cleanupDataPath removes everything the plugin installed: the managed host
+// routes (the aggregated blocks included) and, on the fake-ip NAT path, the
+// nft table. A stopped or reloaded plugin must not leave state behind, because
+// the next process would inherit routes it never wrote.
+func (p *FakeIPNatPlugin) cleanupDataPath() {
+	ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
+	defer cancel()
+
+	hop, dev := p.nextHop, p.nextHopDev
+	if hop == "" && dev == "" {
+		hop, dev = p.systemDefaultRoute(ctx)
+	}
+
+	p.natMu.Lock()
+	defer p.natMu.Unlock()
+
+	routesDeleted := 0
+	if hop != "" || dev != "" {
+		routesDeleted = p.deleteManagedRoutes(ctx, p.listManagedRoutes(ctx, hop, dev))
+	}
+
+	tableDeleted := false
+	if !p.useTun && !p.realIP {
+		if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", p.nftTableName()); err == nil {
+			tableDeleted = true
+		}
+	}
+
+	p.L().Info("fakeip nat: data path cleaned up",
+		zap.Int("routes_deleted", routesDeleted), zap.Bool("nft_table_deleted", tableDeleted),
+		zap.String("next_hop", hop), zap.String("dev", dev))
+}
+
 // syncRealRoutes installs a /32 host route for every real ip of a resolution
 // and debounces the CIDR collapse. It is the whole data plane of realip mode:
 // no fake ip is allocated and no DNAT element is written.

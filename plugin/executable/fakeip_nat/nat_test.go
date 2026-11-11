@@ -398,3 +398,29 @@ func TestSyncNATSkipsWhenNFTFails(t *testing.T) {
 		t.Fatalf("must not leave host routes behind when the table failed: %v", runner.all())
 	}
 }
+
+func TestDeleteManagedRoutes(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	deleted := p.deleteManagedRoutes(context.Background(), []string{"1.2.3.4/32", "1.2.3.4/30"})
+	if deleted != 2 {
+		t.Fatalf("deleted = %d, want 2", deleted)
+	}
+	for _, prefix := range []string{"1.2.3.4/32", "1.2.3.4/30"} {
+		if _, ok := runner.find("ip route delete " + prefix); !ok {
+			t.Fatalf("route %s was not removed: %v", prefix, runner.all())
+		}
+	}
+}
+
+func TestCleanupDataPathDropsNFTTable(t *testing.T) {
+	runner := &fakeRunner{tableExists: true}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	p.cleanupDataPath()
+
+	if _, ok := runner.find("nft delete table ip fakeip_test"); !ok {
+		t.Fatalf("nft table was not removed on shutdown: %v", runner.all())
+	}
+}

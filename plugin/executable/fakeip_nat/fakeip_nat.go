@@ -608,6 +608,7 @@ func (p *FakeIPNatPlugin) stopRouteAggregation() {
 func (p *FakeIPNatPlugin) Close() error {
 	p.L().Debug("fakeip nat: closing plugin")
 	p.stopRouteAggregation()
+	p.cleanupDataPath()
 	p.stopRecordRetention()
 	p.stopTunDataPath()
 	p.stopTunEgress()
