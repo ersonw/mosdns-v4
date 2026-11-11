@@ -158,9 +158,10 @@ func tunRoutePlan(cidr, hop, dev, table string) [][]string {
 	}
 }
 
-// dialUDP opens the outbound datagram socket. A proxy outlet that cannot carry
-// UDP (socks5/http/trojan in this build) falls back to a direct socket so DNS
-// over UDP keeps working.
+// dialUDP opens the outbound datagram socket. socks5 and trojan outlets carry
+// UDP themselves (see egress.go: socks5Egress.dialUDP / trojanEgress.dialUDP);
+// an outlet that cannot, i.e. plain http CONNECT, falls back to a direct socket
+// so DNS over UDP keeps working.
 func (p *FakeIPNatPlugin) dialUDP(ctx context.Context, target string) (net.Conn, error) {
 	c, err := p.egress.DialContext(ctx, "udp", target)
 	if err == nil {

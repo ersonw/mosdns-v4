@@ -26,30 +26,45 @@ prerouting/forward/postrouting），探测候选真实 IP 的可达性，写 `/3
 ```
 
 打开 `use_tun` 后改走 TUN 数据面：插件向系统申请 tun 网卡，把网卡地址设为 `ipv4_range` 的段首地址
-（该地址由配置的网段推导，被保留、不会再分配给任何域名），并在主表把整段路由到该网卡，
-不再写任何 nft 元素。设备命名按平台不同：Linux 从 `mth0` 起取第一个空闲编号；macOS 的 utun
+并带上**与网段相同的掩码**（例如 `198.18.0.1/15`），内核据此自动生成整段的 connected 路由
+（`198.18.0.0/15 dev mth0 proto kernel scope link src 198.18.0.1`），出站选源与回程下一跳都由
+这条路由提供；只有网段是 `/32` 时才需要显式补一条 `ip route replace`。Linux 上还会 best effort
+关掉该设备的 IPv6（`net.ipv6.conf.<dev>.disable_ipv6=1`），避免内核把 MLD/DAD 报文写进只处理
+IPv4 的栈。段首地址由配置的网段推导、被保留，不会再分配给任何域名。设备命名按平台不同：Linux 从 `mth0` 起取第一个空闲编号；macOS 的 utun
 编号由内核分配（`tun_dev` 留空即可，指定一个已存在的 `utunN` 会被拒绝，因为那是别的进程的设备）；
 FreeBSD 取空闲的 `/dev/tun<N>`；Windows 用 Wintun。utun/tun 都是点对点接口，`ifconfig` 必须同时
 给出对端地址，插件把对端也填成段首地址（`inet <段首> <段首> netmask 255.255.255.255`），
 再由整段路由把流量收进设备。创建网卡在所有平台都需要 root / 管理员权限。
 `proxy` 传入 socks5 / http / trojan 链接时作为该数据面的出站代理；探测不通过会回退直连并报错日志。
+TCP 走 CONNECT；UDP 上 socks5 用 RFC 1928 UDP ASSOCIATE、trojan 用流内 udp-associate 请求行 +
+长度前缀数据帧，两者都能承载 UDP，只有 `http`/`https` 因为协议本身只有 CONNECT 而回落直连。
 
-TUN 数据面没有代理时，出口 socket 需要自己选路：插件新建一张专用路由表（`tun_route_table`，
-默认 `100`），写入 `default via <next_hop> dev <next_hop_dev>`，并加一条
-`ip rule from <ipv4_range> lookup <table>`，让段内源地址开出的新连接都走这条默认路由，
-主机自身的流量不受影响。源地址用段内地址（段首 `.1`，设备已持有该地址），网卡绑定同时生效
-（Linux `SO_BINDTODEVICE`、macOS `IP_BOUND_IF`）。`next_hop` 留空时回落系统默认路由的网关/网卡；
-两者都留空则完全不建表、不绑源地址，保持原来的直连行为。配了代理时这张表不会创建，
-出口就是代理链路（`console` 里可见 `tun egress: proxy carries the outlet`）。
-macOS 只有一张路由表、没有 `ip rule`，所以只做源地址 + `next_hop_dev` 网卡绑定；
-独立路由表这一步仅在 Linux 生效。
+TUN 数据面没有代理时，出口 socket 需要自己选路并改写源地址。Linux 上插件新建一张专用路由表
+（`tun_route_table`，默认 `100`），写入 `default via <next_hop> dev <next_hop_dev>`，再加一条
+`ip rule from <ipv4_range> to !<ipv4_range> lookup <table>`：只有**目标在段外**的包才进这张表，
+客户端发往 fake IP 的包（源地址同样是段首）不会被拽出去、仍按主表的 connected 路由进 tun。
+源地址用段内地址（段首 `.1`，设备已持有该地址），网卡绑定同时生效（Linux `SO_BINDTODEVICE`、
+macOS `IP_BOUND_IF`）。
+
+出站前还要做 **SNAT**：Linux 在独立 nft 表 `<prefix>_tun_snat` 里装
+`oifname <next_hop_dev> ip saddr <ipv4_range> masquerade`，把段首源地址改写成宿主地址，否则
+包会带着 `198.18.x.x` 源地址离开物理网卡、上游网关无法回程。选路发生在改写之前，所以
+`next_hop` 决定的路由不会被 SNAT 干扰；这张表和 NAT 数据面的 DNAT 表互不删除。macOS 的出口
+socket 本来就用宿主地址（无法把段首绑到别的接口），等价于改写后的状态，只打一条 Info 日志，
+不动 `pf`。
+
+`next_hop` 留空时回落系统默认路由的网关/网卡；两者都留空则完全不建表、不绑源地址、不装 SNAT，
+保持原来的直连行为。配了代理时上述表与 SNAT 都不会创建，出口就是代理链路
+（`console` 里可见 `tun egress: proxy carries the outlet`）。macOS 只有一张路由表、没有
+`ip rule`，所以只做源地址 + `next_hop_dev` 网卡绑定，`next_hop` 在该平台不生效，
+**指定网关这一步仅在 Linux 生效**。
 ICMP 也按地址翻译（SNAT）语义处理：`ping` 发往 fake IP 的 echo 请求被转发到真实 IP，
 回包把源地址改写回 fake IP；UDP 出口收到的 port unreachable / time exceeded 同样改写后
 回给客户端，引用的报文是客户端实际发出的那份（含 IP 头与 UDP 头，短于 IP 头 + 8 字节
 传输头的引用会被客户端内核按 bad length 丢弃），源地址保留真实来源。
 客户端 TTL 2..30 的 UDP 探针（`traceroute`）不由本设备代答：插件用同样的 TTL 向真实 IP
-再探一次，把应答那一跳的真实地址分配为段内一个虚拟地址（从段尾往下取，避开已分配的
-fake IP），用这个虚拟地址做回包源地址、客户端原报文做引用回给客户端，所以回包一定落在
+再探一次，把应答那一跳的真实地址分配为段内一个虚拟地址（取段尾一侧的地址、避开已分配的
+fake IP；起点由真实地址的哈希决定，所以同一跳每轮拿到同一地址，冲突时向低位顺延），用这个虚拟地址做回包源地址、客户端原报文做引用回给客户端，所以回包一定落在
 客户端发往 tun 的路由范围内。该虚拟地址的反向解析（PTR）返回真实跳地址，`traceroute`
 因此显示 `192.168.10.1.mosdns (198.19.255.254)`（后缀由 `hop_name_suffix` 指定，不写则复用
 `table_prefix`（下划线转连字符）；单独的点分四段不是合法主机名，解析器会丢弃）；前提是客户端把 DNS 指向本插件，
@@ -87,7 +102,14 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
       next_hop: "192.168.1.1"            # 留空则用系统默认路由的网关
       next_hop_dev: "en0"                # 留空则由路由查找决定；填了则同时绑定该网卡
       tun_route_table: 100               # 专用路由表号，仅 Linux 建表
+      record_ttl: "168h"                 # 记录保留期；留空 = 7 天，"0" = 不清理
 ```
+
+`record_ttl` 控制数据库与内存里映射记录的保留期：启动 5 秒后先扫一次，之后每
+`min(record_ttl, 1h)`（不低于 1 分钟）扫一次，把「内存 touch / 库内 `last_seen` / `created_at`
+三者最大值」都早于 cutoff 的域名及其 `real_ips` 删掉，`pending` 行不受影响。清理在单个事务里
+完成，提交成功后才把地址放回可用池，所以被回收的低位 fake IP 会被下一个域名重新拿到。
+老库第一次运行不会被整表误删。
 
 TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所有）。升级到该模式前，
 请确认 `<prefix>_mapping` 里没有域名正好占着段首地址。
@@ -155,6 +177,12 @@ wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/ge
 wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat -O /etc/mosdns/rule/geoip.dat
 
 ```
+
+CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中 `geosite:cn` 时先问本地解析器
+（`forward_local`），有结果就直接返回真实地址、不再改写；否则问公网（`forward_public`），答案落在
+`geoip:cn` 也停，只有真正要出公网的目标才分配 fake IP。第一级用的是 sequence 的 fallback 节点而不是
+裸 `forward_local`：本地解析器宕机或慢于 `fast_fallback`（500 ms）时由公网接手，客户端不会拿到空答案；
+没有开 `always_standby`，本地正常时不会多发一次公网查询，CN 域名也不会离开本地网络。
 ### ocserv_ctl
 把 DNS 请求的来源地址映射到 ocserv 当前登录用户：源地址命中 `occtl --json show users` 里的
 `Remote IP`（客户端公网地址）或 `IPv4`（隧道内地址）时，给查询打上标记（`mark`），供后续
