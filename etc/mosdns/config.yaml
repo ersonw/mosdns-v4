@@ -512,6 +512,10 @@ servers:
 #           the plugin logs a warning and falls back to direct.
 #   proxy_insecure - skip certificate verification for https/trojan proxies
 #                    (self-signed certificates). Default: false
+#   hop_name_suffix - reverse lookup suffix for the virtual address handed to
+#                     one traceroute hop. The PTR record answers
+#                     "<real hop>.<suffix>", so the client prints the real
+#                     next hop next to the virtual address. Default: mosdns
 # -----------------------------------------------------------------------------
 #   - tag: fakeip
 #     type: fakeip_nat
@@ -523,6 +527,7 @@ servers:
 #       next_hop: ""
 #       next_hop_dev: ""
 #       route_table: main
+#       hop_name_suffix: mosdns
 #       route_aggregation: true
 #       tun_route_table: 100
 #       use_tun: false

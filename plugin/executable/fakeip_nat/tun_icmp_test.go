@@ -4,9 +4,13 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/ersonw/mosdns-v4/coremain"
+	"go.uber.org/zap"
 )
 
 func syscallECONNREFUSED() error { return syscall.ECONNREFUSED }
@@ -257,7 +261,7 @@ func TestProbeReplyRewritesHopAddress(t *testing.T) {
 	if !from.IsValid() || !p.prefix.Contains(from) {
 		t.Fatalf("source = %s, want a virtual address of the range", from)
 	}
-	if real, ok := p.lookupHop(from); !ok || real != hop {
+	if real, ok := p.takeHop(from); !ok || real != hop {
 		t.Fatalf("reverse lookup of %s = %s/%v, want the hop %s", from, real, ok, hop)
 	}
 	if got := netip.AddrFrom4([4]byte{written[16], written[17], written[18], written[19]}); got != client {
@@ -310,14 +314,37 @@ func TestHopFakeForSkipsAllocatedAddresses(t *testing.T) {
 	if fake == last {
 		t.Fatalf("virtual address %s was already allocated to a domain", fake)
 	}
-	if real, ok := p.lookupHop(fake); !ok || real != hop {
+	if real, ok := p.takeHop(fake); !ok || real != hop {
 		t.Fatalf("reverse lookup = %s/%v, want %s", real, ok, hop)
 	}
-	// A second probe for the same hop reuses the entry instead of growing it.
-	if again, _ := p.hopFakeFor(hop); again != fake {
-		t.Fatalf("hop was handed a new address: %s vs %s", again, fake)
+	// The entry is gone after its answer, so a second lookup must miss.
+	if _, ok := p.takeHop(fake); ok {
+		t.Fatalf("hop view survived its answer")
+	}
+	// A later probe gets a fresh entry, and the sweep drops it when nobody
+	// asks for the name.
+	if _, ok := p.hopFakeFor(hop); !ok {
+		t.Fatalf("no virtual address was handed out on the second probe")
 	}
 	if n := p.sweepHops(time.Now().Add(hopViewTTL + time.Second)); n != 1 {
 		t.Fatalf("swept %d hop views, want 1", n)
+	}
+}
+
+func TestHopNameSuffixDefaultAndValidation(t *testing.T) {
+	p := newTestPlugin(t, "198.18.0.0/16")
+	if p.hopSuffix != "mosdns" {
+		t.Fatalf("default hop suffix = %q, want mosdns", p.hopSuffix)
+	}
+
+	bp := coremain.NewBP("test_fakeip", PluginType, zap.NewNop(), nil)
+	_, err := Init(bp, &Args{
+		DBPath:        filepath.Join(t.TempDir(), "fakeip.db"),
+		TablePrefix:   "test",
+		IPv4Range:     "198.18.0.0/16",
+		HopNameSuffix: "bad name",
+	})
+	if err == nil {
+		t.Fatalf("a suffix with a space must be rejected")
 	}
 }

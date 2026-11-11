@@ -34,6 +34,9 @@ var validTableName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 // route tables are either a name (main, oversea) or an iproute2 id.
 var validRouteTable = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
+// validHostLabel keeps hop_name_suffix a single DNS label.
+var validHostLabel = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
 }
@@ -67,6 +70,11 @@ type Args struct {
 	Proxy string `yaml:"proxy"`
 	// ProxyInsecure 跳过 https / trojan 代理的证书校验，供自签证书使用。
 	ProxyInsecure bool `yaml:"proxy_insecure"`
+
+	// HopNameSuffix 是路由探测时给每一跳分配的反向解析后缀，默认 "mosdns"：
+	// 虚拟地址的 PTR 记录返回 "<真实跳地址>.<后缀>"，下游 traceroute 因此能
+	// 同时看到真实下一跳和发给它的虚拟地址。只允许字母、数字和连字符。
+	HopNameSuffix string `yaml:"hop_name_suffix"`
 
 	// TunRouteTable 是 tun 数据面直连时新建的路由表，默认 "100"。插件在该表里
 	// 写一条 default 路由（via next_hop / dev next_hop_dev），并用
@@ -139,6 +147,7 @@ type FakeIPNatPlugin struct {
 	hopMu     sync.Mutex
 	hops      map[netip.Addr]hopView
 	hopByReal map[netip.Addr]netip.Addr
+	hopSuffix string
 	// conn tracks the flows of the tun data path so replies can be mapped back
 	// to the client.
 	conn *conntrack
@@ -178,6 +187,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 	if !validRouteTable.MatchString(cfg.RouteTable) {
 		return nil, fmt.Errorf("invalid route_table %q: only alphanumeric, underscore, dot and dash allowed", cfg.RouteTable)
+	}
+	if cfg.HopNameSuffix == "" {
+		cfg.HopNameSuffix = "mosdns"
+	}
+	if !validHostLabel.MatchString(cfg.HopNameSuffix) {
+		return nil, fmt.Errorf("invalid hop_name_suffix %q: only alphanumeric and dashes allowed", cfg.HopNameSuffix)
 	}
 	if cfg.TunRouteTable == "" {
 		cfg.TunRouteTable = "100"
@@ -295,6 +310,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		taskSem:      make(chan struct{}, defaultTaskConcurrency),
 		taskInFlight: make(map[string]struct{}),
 
+		hopSuffix:       cfg.HopNameSuffix,
 		routeTable:      cfg.RouteTable,
 		tunRouteTable:   cfg.TunRouteTable,
 		aggregateRoutes: aggregateRoutes,
@@ -484,7 +500,7 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	// "<real hop> (<virtual ip>)" instead of a bare address.
 	if question.Qtype == dns.TypePTR {
 		if addr, ok := ptrAddr(question.Name); ok {
-			if real, ok := p.lookupHop(addr); ok {
+			if real, ok := p.takeHop(addr); ok {
 				resp := new(dns.Msg)
 				resp.SetReply(q)
 				resp.RecursionAvailable = true
@@ -494,7 +510,7 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 					// the resolver would throw the answer away and traceroute
 					// would print the bare address. The suffix makes it a
 					// domain while keeping the address readable as-is.
-					Ptr: real.String() + ".mosdns.",
+					Ptr: real.String() + "." + p.hopSuffix + ".",
 				}}
 				p.L().Debug("fakeip nat: hop reverse lookup answered",
 					zap.String("name", question.Name), zap.String("virtual_ip", addr.String()), zap.String("real_ip", real.String()))

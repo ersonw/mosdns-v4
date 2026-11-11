@@ -426,7 +426,9 @@ type hopView struct {
 }
 
 const (
-	hopViewTTL = 30 * time.Second
+	// hopViewTTL is only a backstop: the entry is deleted as soon as the
+	// reverse lookup that shows the hop to the client has been answered.
+	hopViewTTL = 5 * time.Second
 	hopViewMax = 256
 )
 
@@ -491,22 +493,21 @@ func (p *FakeIPNatPlugin) trimHops() {
 	}
 }
 
-// lookupHop resolves a virtual hop address back to the real one.
-func (p *FakeIPNatPlugin) lookupHop(addr netip.Addr) (netip.Addr, bool) {
+// takeHop resolves a virtual hop address back to the real one and drops the
+// entry: the reverse lookup is the last thing a traceroute needs from it, so
+// nothing stays booked once the probe is over.
+func (p *FakeIPNatPlugin) takeHop(addr netip.Addr) (netip.Addr, bool) {
 	p.hopMu.Lock()
 	defer p.hopMu.Unlock()
 	v, ok := p.hops[addr]
 	if !ok {
 		return netip.Addr{}, false
 	}
+	delete(p.hops, addr)
+	if p.hopByReal[v.real] == addr {
+		delete(p.hopByReal, v.real)
+	}
 	if time.Since(v.at) > hopViewTTL {
-		delete(p.hops, addr)
-		for real, a := range p.hopByReal {
-			if a == addr {
-				delete(p.hopByReal, real)
-				break
-			}
-		}
 		return netip.Addr{}, false
 	}
 	return v.real, true
