@@ -44,6 +44,12 @@ TCP 走 CONNECT；UDP 上 socks5 用 RFC 1928 UDP ASSOCIATE、trojan 用流内 u
 答复并保留域名交给代理去解析（等价于 `socks5h://`），所以配置成 `socks5://` 也不会把 `198.18.x.x`
 发给代理。其余出口（`http`/`https`/`trojan`）始终原样传域名。
 
+`gost://user:pass@host:1080` 对应 gost 不带协议启动的监听（`gost -L=user:pass@:1080`，协议由服务端
+按首字节嗅探）。插件会为该地址同时构造 socks5h、socks5、trojan、https、http 五种出口，启动时各探测
+一次：能握手的保留、握不上的剔除，日志 `gost outlet protocols selected` 列出最终保留的协议；实际拨号
+按保留顺序依次尝试，某个协议这次连不上就换下一个，全部失败则直接走宿主机网络（等同没配代理）。若五种
+全部探测失败，启动日志仍然是 `proxy is not usable, falling back to direct egress`。
+
 TUN 数据面没有代理时，出口 socket 需要自己选路并改写源地址。Linux 上插件新建一张专用路由表
 （`tun_route_table`，默认 `100`），写入 `default via <next_hop> dev <next_hop_dev>`，再加一条
 `ip rule from <ipv4_range> to !<ipv4_range> lookup <table>`：只有**目标在段外**的包才进这张表，
@@ -102,7 +108,7 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
       use_tun: true
       tun_dev: ""                        # 留空自动申请 mth0/mth1…；填名字则复用同名设备
       tun_mtu: 0                         # 0 = 自动：直连 1500，代理出口 1400；显式值优先
-      proxy: "socks5h://user:pass@10.0.0.9:1080"   # 或 http://、https://、trojan://pass@host:443?sni=host
+      proxy: "socks5h://user:pass@10.0.0.9:1080"   # 或 http://、https://、trojan://pass@host:443?sni=host、gost://user:pass@host:1080
       proxy_insecure: false              # 仅自签证书的 https / trojan 需要打开
       # 无代理时的直连出口：默认路由 = 下一跳 + 下一跳网卡，源地址 = 段内地址
       next_hop: "192.168.1.1"            # 留空则用系统默认路由的网关

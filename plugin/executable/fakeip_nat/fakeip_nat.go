@@ -454,7 +454,13 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			p.L().Warn("proxy is configured but use_tun is false; it only applies to the tun data path",
 				zap.String("proxy", redactProxy(cfg.Proxy)))
 		} else {
-			probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			// A gost link probes one flavour per protocol it may answer, so it
+			// gets a budget that covers all of them instead of a single dial.
+			probeBudget := 5 * time.Second
+			if _, ok := dialer.(*gostEgress); ok {
+				probeBudget = 10 * time.Second
+			}
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), probeBudget)
 			p.L().Debug("fakeip nat: probing proxy egress", zap.String("proxy", redactProxy(cfg.Proxy)))
 			if err := probeEgress(probeCtx, dialer); err != nil {
 				p.L().Warn("proxy is not usable, falling back to direct egress",
@@ -462,6 +468,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			} else {
 				p.egress = dialer
 				p.proxyActive = true
+				// A gost listener picks its protocol from the first bytes, so
+				// the log names the flavours that actually answered.
+				if g, ok := dialer.(*gostEgress); ok {
+					p.L().Info("gost outlet protocols selected",
+						zap.String("server", g.server), zap.Strings("protocols", g.protocols()))
+				}
 				p.L().Info("proxy egress ready", zap.String("proxy", redactProxy(cfg.Proxy)))
 			}
 			probeCancel()

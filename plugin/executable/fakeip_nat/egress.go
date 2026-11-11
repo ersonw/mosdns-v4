@@ -97,6 +97,15 @@ func newEgress(raw string, insecure bool) (egressDialer, error) {
 			remoteDNS: scheme == "socks5h",
 		}, nil
 
+	case "gost":
+		// gost can listen without naming a protocol and detect it from the
+		// first bytes. Every flavour this plugin implements is built here and
+		// probed at startup; the ones that answer are kept, the rest dropped.
+		if port == "" {
+			port = "1080"
+		}
+		return newGostEgress(net.JoinHostPort(host, port), host, user, pass, insecure), nil
+
 	case "http", "https":
 		if port == "" {
 			if scheme == "https" {
@@ -161,6 +170,8 @@ func describeEgress(d egressDialer) string {
 		return "http://" + e.server
 	case *trojanEgress:
 		return "trojan://" + e.server
+	case *gostEgress:
+		return "gost://" + e.server
 	default:
 		return "unknown"
 	}
@@ -425,16 +436,25 @@ func fakeAddressInRange(target string, fake netip.Prefix) bool {
 	return fake.Contains(addr)
 }
 
-// setFakeRange teaches the socks5 outlet which addresses it must never dial.
+// setFakeRange teaches the socks5 outlets which addresses they must never dial.
 // Only socks5 resolves locally, so the other outlets report false and keep
-// sending the domain unchanged.
+// sending the domain unchanged. A gost outlet forwards the call to the socks5
+// flavours it keeps.
 func setFakeRange(d egressDialer, prefix netip.Prefix) bool {
-	e, ok := d.(*socks5Egress)
-	if !ok {
-		return false
+	switch e := d.(type) {
+	case *socks5Egress:
+		e.fakeRange = prefix
+		return true
+	case *gostEgress:
+		applied := false
+		for _, c := range e.candidates {
+			if setFakeRange(c, prefix) {
+				applied = true
+			}
+		}
+		return applied
 	}
-	e.fakeRange = prefix
-	return true
+	return false
 }
 
 // httpEgress dials through an HTTP CONNECT proxy.
@@ -494,12 +514,37 @@ func (e *httpEgress) DialContext(ctx context.Context, network, addr string) (net
 	return c, nil
 }
 
+// Probe proves the listener speaks HTTP: the CONNECT request must be answered
+// with a status line. A bare TCP connect cannot tell an HTTP proxy from a socks5
+// one listening on the same port, which is exactly the case a gost listener
+// creates.
 func (e *httpEgress) Probe(ctx context.Context) error {
 	c, err := e.dialProxy(ctx)
 	if err != nil {
 		return err
 	}
-	return c.Close()
+	defer c.Close()
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.SetDeadline(dl)
+	}
+
+	req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
+	if e.user != "" || e.pass != "" {
+		cred := base64.StdEncoding.EncodeToString([]byte(e.user + ":" + e.pass))
+		req += "Proxy-Authorization: Basic " + cred + "\r\n"
+	}
+	req += "\r\n"
+	if _, err := io.WriteString(c, req); err != nil {
+		return fmt.Errorf("http proxy probe write: %w", err)
+	}
+	line, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("http proxy probe read: %w", err)
+	}
+	if !strings.HasPrefix(line, "HTTP/1.") {
+		return fmt.Errorf("http proxy probe: not an http answer (%q)", strings.TrimSpace(line))
+	}
+	return nil
 }
 
 func (e *httpEgress) dialProxy(ctx context.Context) (net.Conn, error) {
@@ -596,4 +641,107 @@ func trojanConnectRequest(password, addr string) []byte {
 	sum := sha256.Sum256([]byte(password))
 	hash := hex.EncodeToString(sum[:])[:56]
 	return []byte(hash + "\r\n1\r\n" + addr + "\r\n")
+}
+
+// gostCandidateProbe bounds one protocol probe of a gost listener. The listener
+// answers on the first bytes, so a flavour that is not spoken there either
+// closes the connection or stays silent; both are detected within this window.
+const gostCandidateProbe = 1500 * time.Millisecond
+
+// gostEgress speaks to a gost listener that was started without naming a
+// protocol ("-L=user:pass@:1080"): gost detects the protocol from the first
+// bytes, so the same address may answer socks5, http or trojan depending on how
+// it was built.
+//
+// Every flavour this plugin implements is built at startup and probed once. The
+// ones that answer are kept in preference order and used for every dial; a
+// flavour that fails while connecting falls through to the next one, and when
+// every candidate fails the connection leaves without the proxy.
+type gostEgress struct {
+	server     string
+	candidates []egressDialer
+}
+
+// newGostEgress builds the candidate list. socks5h comes first because it keeps
+// the domain on the proxy side, which is the only safe choice when this plugin
+// is the client's resolver.
+func newGostEgress(server, host, user, pass string, insecure bool) *gostEgress {
+	candidates := []egressDialer{
+		&socks5Egress{server: server, user: user, pass: pass, remoteDNS: true},
+		&socks5Egress{server: server, user: user, pass: pass},
+		&trojanEgress{server: server, password: gostPassword(user, pass), sni: host, insecure: insecure},
+		&httpEgress{server: server, user: user, pass: pass, tlsCfg: &tls.Config{ServerName: host, InsecureSkipVerify: insecure}},
+		&httpEgress{server: server, user: user, pass: pass},
+	}
+	return &gostEgress{server: server, candidates: candidates}
+}
+
+// gostPassword picks the credential a trojan handshake uses. The link form is
+// user:pass, so the password half wins; a link with only a user keeps that
+// value.
+func gostPassword(user, pass string) string {
+	if pass != "" {
+		return pass
+	}
+	return user
+}
+
+// Probe keeps only the flavours the listener actually answered. It returns an
+// error when nothing answers, which makes the caller keep the direct outlet.
+func (e *gostEgress) Probe(ctx context.Context) error {
+	alive := make([]egressDialer, 0, len(e.candidates))
+	dropped := make([]string, 0, len(e.candidates))
+	for _, c := range e.candidates {
+		probeCtx, cancel := context.WithTimeout(ctx, gostCandidateProbe)
+		prober, ok := c.(egressProber)
+		var err error
+		if ok {
+			err = prober.Probe(probeCtx)
+		}
+		cancel()
+		if err != nil {
+			dropped = append(dropped, describeEgress(c))
+			continue
+		}
+		alive = append(alive, c)
+	}
+	if len(alive) == 0 {
+		return fmt.Errorf("gost listener %s answered no supported protocol (tried %s)",
+			e.server, strings.Join(dropped, ", "))
+	}
+	e.candidates = alive
+	return nil
+}
+
+// DialContext tries the working flavours in order and leaves without the proxy
+// when none of them completes a connection.
+func (e *gostEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	var lastErr error
+	for _, c := range e.candidates {
+		conn, err := c.DialContext(ctx, network, addr)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	// Every protocol failed for this target: fall back to the host network,
+	// which is the same outcome as running without a proxy link.
+	var direct directEgress
+	conn, err := direct.DialContext(ctx, network, addr)
+	if err != nil {
+		if lastErr != nil {
+			return nil, fmt.Errorf("gost candidates failed (%v) and direct dial failed: %w", lastErr, err)
+		}
+		return nil, err
+	}
+	return conn, nil
+}
+
+// protocols reports the flavours kept for this outlet, for the startup log.
+func (e *gostEgress) protocols() []string {
+	out := make([]string, 0, len(e.candidates))
+	for _, c := range e.candidates {
+		out = append(out, describeEgress(c))
+	}
+	return out
 }
