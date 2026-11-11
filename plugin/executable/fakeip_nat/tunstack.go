@@ -257,9 +257,8 @@ func (p *FakeIPNatPlugin) relayTCP(r *tcp.ForwarderRequest) {
 		zap.Duration("duration", time.Since(start)))
 }
 
-// relayUDP terminates one UDP flow and relays datagrams to the outlet.
-
-// relayUDP terminates one UDP flow and relays datagrams to the outlet.
+// relayUDP terminates one UDP flow and relays datagrams to the outlet. Probes
+// of a client traceroute are handed to the hop prober instead.
 func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
 	id := r.ID()
 
