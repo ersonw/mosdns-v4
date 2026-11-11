@@ -362,6 +362,8 @@ func TestSyncNATAggregatesRoutes(t *testing.T) {
 	p := newNativePlugin(t, runner, func(_ context.Context, ip string) bool { return ip == "9.9.9.9" })
 
 	p.syncNAT(context.Background(), "198.18.0.1", "example.com", "9.9.9.9")
+	// Aggregation is debounced now, so run the scheduled pass by hand.
+	p.aggregateRoutesNow("10.0.0.1", "eth0")
 
 	if _, ok := runner.find("ip route replace 1.2.3.4/31 via 10.0.0.1 dev eth0"); !ok {
 		t.Fatalf("aggregated route missing: %v", runner.all())

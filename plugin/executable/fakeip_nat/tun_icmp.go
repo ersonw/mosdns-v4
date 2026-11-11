@@ -435,8 +435,8 @@ const (
 	// next one starts, and this only catches a traceroute that stops without
 	// another following. Long enough that a reply to the client's reverse
 	// lookup, which can lag the probe, still finds the view.
-	hopViewTTL   = 30 * time.Second
-	hopViewMax   = 256
+	hopViewTTL = 30 * time.Second
+	hopViewMax = 256
 	// probeRoundGap separates two rounds that walk back to a shorter TTL: a
 	// round climbs from probeMinTTL to probeMaxTTL, so a shorter TTL after a
 	// pause means traceroute started again.

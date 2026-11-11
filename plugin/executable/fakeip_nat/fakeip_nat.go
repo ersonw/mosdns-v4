@@ -53,6 +53,13 @@ type Args struct {
 	NextHop    string `yaml:"next_hop"`     // 可选：NAT 模式下真实目标 IP 的下一跳网关（不填则用系统默认路由）
 	NextHopDev string `yaml:"next_hop_dev"` // 可选：NAT 模式下下一跳出站网卡名称（不填则不指定 dev）
 
+	// RealIP 切换 DNS 答复的内容，默认 false。
+	// false：分配虚拟 IP、建立 DNAT 映射，并把虚拟 IP 回复给客户端；映射成功
+	// 之后才回复，避免客户端拿到虚拟 IP 时数据面还没准备好。
+	// true：不分配虚拟 IP、不写 DNAT 映射，DNS 直接回复真实 IP，只给解析出来
+	// 的真实 IP 写一条到出口的 host route（等价于纯路由分流）。
+	RealIP bool `yaml:"realip"`
+
 	// Script 已废弃：脚本回调已移除，保留字段只是为了让带 script 的旧配置仍能启动。
 	Script string `yaml:"script"`
 
@@ -110,7 +117,10 @@ type FakeIPNatPlugin struct {
 	retentionOnce sync.Once
 	nextHop       string
 	nextHopDev    string
-	mu            sync.Mutex // serializes fake ip allocation
+	// realIP mirrors Args.RealIP: when set the plugin answers real IPs and only
+	// maintains the host routes that steer them out of the chosen gateway.
+	realIP bool
+	mu     sync.Mutex // serializes fake ip allocation
 
 	taskSem      chan struct{}       // bounds concurrently running NAT tasks
 	taskMu       sync.Mutex          // guards taskInFlight
@@ -119,9 +129,17 @@ type FakeIPNatPlugin struct {
 	// NAT data path: the plugin owns the nftables map and host routes.
 	routeTable      string
 	aggregateRoutes bool
-	natMu           sync.Mutex // serializes nft / ip command sequences
-	runner          cmdRunner
-	probe           func(ctx context.Context, ip string) bool
+	// realRoutes is the set of real IPs that already carry a /32 host route in
+	// realip mode. Route aggregation collapses them into CIDR blocks a few
+	// seconds later, so a burst of queries does not thrash the table.
+	realMu     sync.Mutex
+	realRoutes map[string]struct{}
+	// aggMu guards aggTimer, the debounce timer for route aggregation.
+	aggMu    sync.Mutex
+	aggTimer *time.Timer
+	natMu    sync.Mutex // serializes nft / ip command sequences
+	runner   cmdRunner
+	probe    func(ctx context.Context, ip string) bool
 
 	// TUN data path: the whole ipv4_range is routed to a device requested from
 	// the system instead of being DNAT-ed hop by hop.
@@ -244,6 +262,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("tun_dev", strings.TrimSpace(cfg.TunDev)),
 		zap.String("next_hop", cfg.NextHop),
 		zap.String("next_hop_dev", cfg.NextHopDev),
+		zap.Bool("realip", cfg.RealIP),
 		zap.Bool("proxy_configured", strings.TrimSpace(cfg.Proxy) != ""))
 
 	if !validTableName.MatchString(cfg.TablePrefix) {
@@ -343,6 +362,8 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		recordTTL:    recordTTL,
 		nextHop:      strings.TrimSpace(cfg.NextHop),
 		nextHopDev:   strings.TrimSpace(cfg.NextHopDev),
+		realIP:       cfg.RealIP,
+		realRoutes:   make(map[string]struct{}),
 		taskSem:      make(chan struct{}, defaultTaskConcurrency),
 		taskInFlight: make(map[string]struct{}),
 
@@ -379,6 +400,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// The proxy is the outlet of the tun data path only: the NAT data path is
 	// kernel DNAT and never sees the connection. An unusable proxy degrades to
 	// direct egress instead of blocking startup, but it is logged as an error.
+	if cfg.RealIP && cfg.UseTun {
+		p.L().Warn("realip has no effect with use_tun: the tun data path routes the whole fake range instead of real IPs")
+	}
 	if cfg.Proxy != "" {
 		dialer, err := newEgress(cfg.Proxy, cfg.ProxyInsecure)
 		if err != nil {
@@ -524,10 +548,22 @@ func (p *FakeIPNatPlugin) stopTunDataPath() {
 	}
 }
 
+// stopRouteAggregation cancels a pending collapse so no ip command runs after
+// the plugin has been closed.
+func (p *FakeIPNatPlugin) stopRouteAggregation() {
+	p.aggMu.Lock()
+	defer p.aggMu.Unlock()
+	if p.aggTimer != nil {
+		p.aggTimer.Stop()
+		p.aggTimer = nil
+	}
+}
+
 // Close stops the data path and releases the SQLite handle. Without it the
 // database file stays locked for the lifetime of the process.
 func (p *FakeIPNatPlugin) Close() error {
 	p.L().Debug("fakeip nat: closing plugin")
+	p.stopRouteAggregation()
 	p.stopRecordRetention()
 	p.stopTunDataPath()
 	p.stopTunEgress()
@@ -606,34 +642,50 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 			domain := strings.TrimSuffix(question.Name, ".")
 			p.L().Debug("fakeip nat: real ips collected",
 				zap.String("domain", domain), zap.Int("count", len(realIPs)), zap.Strings("real_ips", realIPs))
-			fakeIP, err := p.recordAndAllocate(ctx, domain, realIPs)
-			if err != nil {
-				p.L().Error("sqlite record fakeip failed", zap.String("domain", domain), zap.Error(err))
-			} else if fakeAddr, err := netip.ParseAddr(fakeIP); err != nil {
-				// A leftover "pending" row or a corrupted value must never
-				// produce an A record with a nil IP.
-				p.L().Error("invalid allocated fake ip", zap.String("domain", domain), zap.String("fake_ip", fakeIP), zap.Error(err))
+			if p.realIP {
+				// Pure routing mode: the answer keeps the real IPs and the
+				// plugin only steers each of them out of the chosen gateway.
+				p.L().Debug("fakeip nat: realip mode keeps real answers",
+					zap.String("domain", domain), zap.Strings("real_ips", realIPs))
+				go p.syncRealRoutes(context.Background(), realIPs)
 			} else {
-				p.dispatchNAT(fakeIP, domain, strings.Join(realIPs, ","))
-				p.L().Debug("fakeip nat: fake ip answered",
-					zap.String("domain", domain), zap.String("fake_ip", fakeIP),
-					zap.Uint32("ttl", p.ttl), zap.Bool("data_plane_tun", p.useTun))
+				fakeIP, err := p.recordAndAllocate(ctx, domain, realIPs)
+				if err != nil {
+					p.L().Error("sqlite record fakeip failed", zap.String("domain", domain), zap.Error(err))
+				} else if fakeAddr, err := netip.ParseAddr(fakeIP); err != nil {
+					// A leftover "pending" row or a corrupted value must never
+					// produce an A record with a nil IP.
+					p.L().Error("invalid allocated fake ip", zap.String("domain", domain), zap.String("fake_ip", fakeIP), zap.Error(err))
+				} else {
+					// Wait for the data plane before answering: a client that
+					// receives a fake IP while the DNAT entry is still missing
+					// can only fail, which is what "the mapping exists but the
+					// client got a real IP" looked like from the outside.
+					ready := p.dispatchNAT(ctx, fakeIP, domain, strings.Join(realIPs, ","))
+					if !ready {
+						p.L().Warn("nat mapping not ready, answering fake ip anyway",
+							zap.String("domain", domain), zap.String("fake_ip", fakeIP))
+					}
+					p.L().Debug("fakeip nat: fake ip answered",
+						zap.String("domain", domain), zap.String("fake_ip", fakeIP),
+						zap.Uint32("ttl", p.ttl), zap.Bool("data_plane_tun", p.useTun))
 
-				newResp := new(dns.Msg)
-				newResp.SetReply(q)
-				newResp.RecursionAvailable = true
-				newResp.Answer = []dns.RR{
-					&dns.A{
-						Hdr: dns.RR_Header{
-							Name:   question.Name,
-							Rrtype: dns.TypeA,
-							Class:  dns.ClassINET,
-							Ttl:    p.ttl,
+					newResp := new(dns.Msg)
+					newResp.SetReply(q)
+					newResp.RecursionAvailable = true
+					newResp.Answer = []dns.RR{
+						&dns.A{
+							Hdr: dns.RR_Header{
+								Name:   question.Name,
+								Rrtype: dns.TypeA,
+								Class:  dns.ClassINET,
+								Ttl:    p.ttl,
+							},
+							A: fakeAddr.AsSlice(),
 						},
-						A: fakeAddr.AsSlice(),
-					},
+					}
+					qCtx.SetResponse(newResp)
 				}
-				qCtx.SetResponse(newResp)
 			}
 		}
 	}
@@ -821,28 +873,45 @@ func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, real
 	return err
 }
 
-// dispatchNAT starts the data plane work for one fake ip without blocking the
-// query path. The NAT path maps the fake ip to a reachable real ip; the tun
-// path routes the whole range instead, so there is nothing per-domain to do.
-func (p *FakeIPNatPlugin) dispatchNAT(fakeIP, domain, latestIPs string) {
+// dispatchNAT maps one fake ip to a real ip and reports whether the data plane
+// is ready for it. The NAT path must have the DNAT entry in place before the
+// fake IP reaches the client, so the query waits for the task (bounded by
+// natSyncWait) instead of racing it. The tun path routes the whole range, so
+// there is nothing per-domain to do and it is always ready.
+func (p *FakeIPNatPlugin) dispatchNAT(ctx context.Context, fakeIP, domain, latestIPs string) bool {
 	if p.useTun {
 		p.L().Debug("fakeip nat: nat dispatch skipped, tun data plane owns the range",
 			zap.String("domain", domain), zap.String("fake_ip", fakeIP))
-		return
+		return true
 	}
-	p.enqueueTask(domain, func() {
-		p.syncNAT(context.Background(), fakeIP, domain, latestIPs)
-	})
+	done := make(chan bool, 1)
+	if !p.enqueueTask(domain, func() {
+		done <- p.syncNAT(context.Background(), fakeIP, domain, latestIPs)
+	}) {
+		return false
+	}
+	select {
+	case ok := <-done:
+		return ok
+	case <-ctx.Done():
+		p.L().Debug("nat dispatch wait interrupted", zap.String("domain", domain), zap.Error(ctx.Err()))
+		return false
+	case <-time.After(natSyncWait):
+		p.L().Warn("nat mapping is still running, answering without waiting",
+			zap.String("domain", domain), zap.String("fake_ip", fakeIP))
+		return false
+	}
 }
 
 // enqueueTask runs fn in the background: at most one task per domain and at
-// most defaultTaskConcurrency tasks overall.
-func (p *FakeIPNatPlugin) enqueueTask(domain string, fn func()) {
+// most defaultTaskConcurrency tasks overall. It reports whether the task was
+// actually started.
+func (p *FakeIPNatPlugin) enqueueTask(domain string, fn func()) bool {
 	p.taskMu.Lock()
 	if _, ok := p.taskInFlight[domain]; ok {
 		p.taskMu.Unlock()
 		p.L().Debug("nat task already running for domain", zap.String("domain", domain))
-		return
+		return false
 	}
 	select {
 	case p.taskSem <- struct{}{}:
@@ -851,7 +920,7 @@ func (p *FakeIPNatPlugin) enqueueTask(domain string, fn func()) {
 	default:
 		p.taskMu.Unlock()
 		p.L().Warn("nat task concurrency limit reached, skip", zap.String("domain", domain), zap.Int("limit", cap(p.taskSem)))
-		return
+		return false
 	}
 
 	go func() {
@@ -863,4 +932,5 @@ func (p *FakeIPNatPlugin) enqueueTask(domain string, fn func()) {
 		}()
 		fn()
 	}()
+	return true
 }

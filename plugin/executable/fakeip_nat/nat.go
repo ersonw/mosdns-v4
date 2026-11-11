@@ -30,6 +30,14 @@ const (
 	pingTimeout      = 3 * time.Second
 	commandTimeout   = 10 * time.Second
 	natTimeout       = 30 * time.Second
+	// natSyncWait bounds how long a DNS query waits for the DNAT entry. It is
+	// shorter than natTimeout on purpose: a client that waits too long retries
+	// or times out, and a late mapping is still installed for the next query.
+	natSyncWait = 3 * time.Second
+	// routeAggDelay is how long host route writes are collected before they
+	// are collapsed into CIDR blocks, so a burst of resolutions does not
+	// rewrite the routing table once per query.
+	routeAggDelay = 3 * time.Second
 )
 
 // nftElementRe extracts "fake : real" pairs from `nft list map` output.
@@ -56,7 +64,7 @@ func (p *FakeIPNatPlugin) nftTableName() string {
 
 // syncNAT brings the kernel side in sync with the fake ip of one domain.
 // It is the Go port of nat_map.py: same table layout, same command sequence.
-func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs string) {
+func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs string) bool {
 	ctx, cancel := context.WithTimeout(ctx, natTimeout)
 	defer cancel()
 
@@ -79,7 +87,7 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 		// Without the table an element write has nowhere to go, so leaving
 		// host routes behind would only mask the failure.
 		p.L().Error("nft table is not ready, nat mapping skipped", zap.String("nft_table", table), zap.Error(err))
-		return
+		return false
 	}
 
 	// Fast path: keep an existing mapping that still works, which is what
@@ -90,7 +98,7 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 		if p.probe(ctx, current) {
 			p.L().Debug("existing nat mapping still reachable, keep it",
 				zap.String("fake_ip", fakeIP), zap.String("real_ip", current))
-			return
+			return true
 		}
 		p.L().Info("existing nat mapping unreachable, selecting a new real ip",
 			zap.String("fake_ip", fakeIP), zap.String("old_real_ip", current))
@@ -107,7 +115,7 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 	if len(candidates) == 0 {
 		p.L().Warn("no candidate real ip, nat mapping skipped",
 			zap.String("fake_ip", fakeIP), zap.String("domain", domain))
-		return
+		return false
 	}
 
 	// The probes need a route for each candidate, so warm the top ones first.
@@ -134,17 +142,19 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 	if _, err := p.runner.Run(ctx, "nft", "add", "element", "ip", table, nftMapName, "{ "+fakeIP+" : "+selected+" }"); err != nil {
 		p.L().Error("write nat mapping failed",
 			zap.String("fake_ip", fakeIP), zap.String("real_ip", selected), zap.Error(err))
-		return
+		return false
 	}
 	p.applyHostRoute(ctx, selected, hop, dev)
 
-	if p.aggregateRoutes {
-		p.syncAggregatedRoutes(ctx, table, hop, dev)
-	}
+	// Collapse the /32 routes a few seconds after the last write instead of
+	// right here: one resolution should not rewrite the table, and a burst of
+	// them should end with aggregated CIDR blocks rather than hundreds of /32.
+	p.scheduleRouteAggregation(hop, dev, routeAggDelay)
 
 	p.L().Info("nat mapping updated",
 		zap.String("fake_ip", fakeIP), zap.String("real_ip", selected),
 		zap.String("domain", domain), zap.String("route_table", p.routeTable))
+	return true
 }
 
 // ensureNFTTable creates the table, the dnat map and the three chains the
@@ -278,6 +288,132 @@ func (p *FakeIPNatPlugin) syncAggregatedRoutes(ctx context.Context, table, hop, 
 	}
 
 	p.L().Debug("host routes re-aggregated",
+		zap.Int("before", len(prefixes)), zap.Int("after", len(collapsed)),
+		zap.Int("deleted", deleted), zap.Int("added", added))
+}
+
+// scheduleRouteAggregation restarts the debounce timer so the collapse runs a
+// few seconds after the last route write. A timer left over from an earlier
+// write is replaced, so a stream of resolutions still ends in one collapse.
+func (p *FakeIPNatPlugin) scheduleRouteAggregation(hop, dev string, delay time.Duration) {
+	if !p.aggregateRoutes {
+		return
+	}
+	p.aggMu.Lock()
+	if p.aggTimer != nil {
+		p.aggTimer.Stop()
+	}
+	p.aggTimer = time.AfterFunc(delay, func() {
+		p.aggregateRoutesNow(hop, dev)
+	})
+	p.aggMu.Unlock()
+}
+
+func (p *FakeIPNatPlugin) aggregateRoutesNow(hop, dev string) {
+	ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
+	defer cancel()
+	p.natMu.Lock()
+	defer p.natMu.Unlock()
+	if p.realIP {
+		p.aggregateRealRoutes(ctx, hop, dev)
+		return
+	}
+	p.syncAggregatedRoutes(ctx, p.nftTableName(), hop, dev)
+}
+
+// syncRealRoutes installs a /32 host route for every real ip of a resolution
+// and debounces the CIDR collapse. It is the whole data plane of realip mode:
+// no fake ip is allocated and no DNAT element is written.
+func (p *FakeIPNatPlugin) syncRealRoutes(ctx context.Context, ips []string) {
+	ctx, cancel := context.WithTimeout(ctx, natTimeout)
+	defer cancel()
+
+	hop, dev := p.nextHop, p.nextHopDev
+	if hop == "" && dev == "" {
+		hop, dev = p.systemDefaultRoute(ctx)
+	}
+	if hop == "" && dev == "" {
+		p.L().Debug("realip: no next hop and no device, routes not installed")
+		return
+	}
+
+	p.natMu.Lock()
+	defer p.natMu.Unlock()
+
+	applied := 0
+	for _, ip := range ips {
+		addr, err := netip.ParseAddr(ip)
+		if err != nil || !addr.Is4() {
+			continue
+		}
+		p.applyHostRoute(ctx, addr.String(), hop, dev)
+		p.realMu.Lock()
+		p.realRoutes[addr.String()] = struct{}{}
+		p.realMu.Unlock()
+		applied++
+	}
+
+	p.L().Info("realip routes updated",
+		zap.Strings("real_ips", ips), zap.String("next_hop", hop), zap.String("dev", dev),
+		zap.Int("applied", applied), zap.String("route_table", p.routeTable))
+
+	p.scheduleRouteAggregation(hop, dev, routeAggDelay)
+}
+
+// aggregateRealRoutes collapses the real ip host routes of realip mode into the
+// strictest CIDR blocks, mirroring syncAggregatedRoutes for the nft map.
+func (p *FakeIPNatPlugin) aggregateRealRoutes(ctx context.Context, hop, dev string) {
+	p.realMu.Lock()
+	ips := make([]string, 0, len(p.realRoutes))
+	for ip := range p.realRoutes {
+		ips = append(ips, ip)
+	}
+	p.realMu.Unlock()
+	if len(ips) == 0 {
+		p.L().Debug("realip: route aggregation skipped, no real ips")
+		return
+	}
+
+	prefixes := make([]netip.Prefix, 0, len(ips))
+	for _, ip := range ips {
+		addr, err := netip.ParseAddr(ip)
+		if err != nil || !addr.Is4() {
+			continue
+		}
+		prefixes = append(prefixes, netip.PrefixFrom(addr, 32))
+	}
+	if len(prefixes) == 0 {
+		return
+	}
+	collapsed := collapsePrefixes(prefixes)
+
+	withTable := func(args []string) []string {
+		if p.routeTable != "" && p.routeTable != "main" {
+			return append(args, "table", p.routeTable)
+		}
+		return args
+	}
+
+	deleted, added := 0, 0
+	for _, prefix := range prefixes {
+		if _, err := p.runner.Run(ctx, "ip", withTable([]string{"route", "delete", prefix.String()})...); err == nil {
+			deleted++
+		}
+	}
+	for _, prefix := range collapsed {
+		args := []string{"route", "replace", prefix.String()}
+		if hop != "" {
+			args = append(args, "via", hop)
+		}
+		if dev != "" {
+			args = append(args, "dev", dev)
+		}
+		if _, err := p.runner.Run(ctx, "ip", withTable(args)...); err == nil {
+			added++
+		}
+	}
+
+	p.L().Debug("realip host routes re-aggregated",
 		zap.Int("before", len(prefixes)), zap.Int("after", len(collapsed)),
 		zap.Int("deleted", deleted), zap.Int("added", added))
 }
