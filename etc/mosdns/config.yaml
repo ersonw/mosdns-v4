@@ -129,7 +129,7 @@ plugins:
       ipv4_range: 198.18.0.0/15
       ttl: 60
       use_tun: true
-#      hop_name_suffix: "mth.remote"
+#      hop_name_suffix: "mth-remote"   # one DNS label; empty = table_prefix
 
   # 6) Workflow: CN -> local (stop), otherwise public -> fake IP.
   - tag: main
@@ -528,7 +528,7 @@ servers:
 #       next_hop: ""
 #       next_hop_dev: ""
 #       route_table: main
-#       hop_name_suffix: mosdns
+#       hop_name_suffix: default        # one label; empty = table_prefix
 #       route_aggregation: true
 #       tun_route_table: 100
 #       use_tun: false
