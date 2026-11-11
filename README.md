@@ -46,9 +46,14 @@ TCP 走 CONNECT；UDP 上 socks5 用 RFC 1928 UDP ASSOCIATE、trojan 用流内 u
 
 `gost://user:pass@host:1080` 对应 gost 不带协议启动的监听（`gost -L=user:pass@:1080`，协议由服务端
 按首字节嗅探）。插件会为该地址同时构造 socks5h、socks5、trojan、https、http 五种出口，启动时各探测
-一次：能握手的保留、握不上的剔除，日志 `gost outlet protocols selected` 列出最终保留的协议；实际拨号
-按保留顺序依次尝试，某个协议这次连不上就换下一个，全部失败则直接走宿主机网络（等同没配代理）。若五种
-全部探测失败，启动日志仍然是 `proxy is not usable, falling back to direct egress`。
+一次并计时：能握手的保留，握不上的剔除，日志 `gost outlet protocols selected` 列出 `tcp_protocols`
+（按握手耗时从快到慢）与 `udp_protocols`（只含真正接受了 UDP ASSOCIATE 的协议，同样按耗时排序）。
+之后按流量类型各走各的：TCP 只用 `tcp_protocols` 里最快的那个，连不上就退到下一个；UDP 只用
+`udp_protocols`，为空则直接走宿主机网络（http/https 只有 CONNECT，本来就不承载 UDP）。某个协议这次
+连不上就换下一个，整张列表都失败则直接走宿主机网络（等同没配代理）。若五种全部探测失败，启动日志
+仍然是 `proxy is not usable, falling back to direct egress`。
+ICMP echo 不经过任何代理协议（socks5 / trojan / http 都不承载 ICMP），一律由宿主机的原始套接字发出，
+因此 gost 的协议选择只影响 TCP 与 UDP。
 
 TUN 数据面没有代理时，出口 socket 需要自己选路并改写源地址。Linux 上插件新建一张专用路由表
 （`tun_route_table`，默认 `100`），写入 `default via <next_hop> dev <next_hop_dev>`，再加一条

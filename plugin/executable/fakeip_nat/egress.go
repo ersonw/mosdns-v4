@@ -20,6 +20,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -447,7 +448,7 @@ func setFakeRange(d egressDialer, prefix netip.Prefix) bool {
 		return true
 	case *gostEgress:
 		applied := false
-		for _, c := range e.candidates {
+		for _, c := range e.all {
 			if setFakeRange(c, prefix) {
 				applied = true
 			}
@@ -648,32 +649,49 @@ func trojanConnectRequest(password, addr string) []byte {
 // closes the connection or stays silent; both are detected within this window.
 const gostCandidateProbe = 1500 * time.Millisecond
 
+// gostCandidate is one protocol of a gost listener together with the time its
+// handshake took. The latency is what makes "use the fastest protocol for TCP"
+// a measurement instead of a guess.
+type gostCandidate struct {
+	dialer  egressDialer
+	latency time.Duration
+}
+
 // gostEgress speaks to a gost listener that was started without naming a
 // protocol ("-L=user:pass@:1080"): gost detects the protocol from the first
-// bytes, so the same address may answer socks5, http or trojan depending on how
-// it was built.
+// bytes, so the same address may answer socks5, http or trojan.
 //
-// Every flavour this plugin implements is built at startup and probed once. The
-// ones that answer are kept in preference order and used for every dial; a
-// flavour that fails while connecting falls through to the next one, and when
-// every candidate fails the connection leaves without the proxy.
+// Every flavour this plugin implements is built at startup and probed once,
+// then kept in two ordered lists:
+//
+//   - tcp: every flavour that answered, fastest first, used for TCP flows;
+//   - udp: only the flavours whose UDP association was granted, fastest first.
+//
+// A UDP flow therefore never even tries an http outlet, and a TCP flow goes
+// straight to the protocol with the shortest handshake. When the chosen list is
+// empty, or every entry fails while connecting, the flow leaves through the
+// host network just like a run without a proxy link.
 type gostEgress struct {
-	server     string
-	candidates []egressDialer
+	server string
+	all    []egressDialer
+	tcp    []gostCandidate
+	udp    []gostCandidate
 }
 
 // newGostEgress builds the candidate list. socks5h comes first because it keeps
 // the domain on the proxy side, which is the only safe choice when this plugin
 // is the client's resolver.
 func newGostEgress(server, host, user, pass string, insecure bool) *gostEgress {
-	candidates := []egressDialer{
-		&socks5Egress{server: server, user: user, pass: pass, remoteDNS: true},
-		&socks5Egress{server: server, user: user, pass: pass},
-		&trojanEgress{server: server, password: gostPassword(user, pass), sni: host, insecure: insecure},
-		&httpEgress{server: server, user: user, pass: pass, tlsCfg: &tls.Config{ServerName: host, InsecureSkipVerify: insecure}},
-		&httpEgress{server: server, user: user, pass: pass},
+	return &gostEgress{
+		server: server,
+		all: []egressDialer{
+			&socks5Egress{server: server, user: user, pass: pass, remoteDNS: true},
+			&socks5Egress{server: server, user: user, pass: pass},
+			&trojanEgress{server: server, password: gostPassword(user, pass), sni: host, insecure: insecure},
+			&httpEgress{server: server, user: user, pass: pass, tlsCfg: &tls.Config{ServerName: host, InsecureSkipVerify: insecure}},
+			&httpEgress{server: server, user: user, pass: pass},
+		},
 	}
-	return &gostEgress{server: server, candidates: candidates}
 }
 
 // gostPassword picks the credential a trojan handshake uses. The link form is
@@ -686,46 +704,86 @@ func gostPassword(user, pass string) string {
 	return user
 }
 
-// Probe keeps only the flavours the listener actually answered. It returns an
-// error when nothing answers, which makes the caller keep the direct outlet.
+// udpDialer is implemented by the outlets that can carry a datagram: socks5
+// through RFC 1928 UDP ASSOCIATE, trojan through its udp-associate stream.
+type udpDialer interface {
+	dialUDP(ctx context.Context, addr string) (net.Conn, error)
+}
+
+// Probe keeps only the flavours the listener actually answered, times each
+// handshake, and records which of them accepted a UDP association. It returns
+// an error when no flavour answers at all, which makes the caller keep the
+// direct outlet.
 func (e *gostEgress) Probe(ctx context.Context) error {
-	alive := make([]egressDialer, 0, len(e.candidates))
-	dropped := make([]string, 0, len(e.candidates))
-	for _, c := range e.candidates {
-		probeCtx, cancel := context.WithTimeout(ctx, gostCandidateProbe)
+	tcp := make([]gostCandidate, 0, len(e.all))
+	udp := make([]gostCandidate, 0, len(e.all))
+	dropped := make([]string, 0, len(e.all))
+	for _, c := range e.all {
 		prober, ok := c.(egressProber)
-		var err error
-		if ok {
-			err = prober.Probe(probeCtx)
+		if !ok {
+			continue
 		}
+		probeCtx, cancel := context.WithTimeout(ctx, gostCandidateProbe)
+		start := time.Now()
+		err := prober.Probe(probeCtx)
+		latency := time.Since(start)
 		cancel()
 		if err != nil {
 			dropped = append(dropped, describeEgress(c))
 			continue
 		}
-		alive = append(alive, c)
+		tcp = append(tcp, gostCandidate{dialer: c, latency: latency})
+
+		// Only a flavour whose association is granted may carry UDP. The
+		// request is opened and closed without sending a datagram.
+		if _, ok := c.(udpDialer); ok {
+			udpCtx, udpCancel := context.WithTimeout(ctx, gostCandidateProbe)
+			conn, udpErr := c.(udpDialer).dialUDP(udpCtx, "127.0.0.1:9")
+			udpCancel()
+			if udpErr != nil {
+				dropped = append(dropped, describeEgress(c)+" (udp)")
+				continue
+			}
+			_ = conn.Close()
+			udp = append(udp, gostCandidate{dialer: c, latency: latency})
+		}
 	}
-	if len(alive) == 0 {
+	if len(tcp) == 0 {
 		return fmt.Errorf("gost listener %s answered no supported protocol (tried %s)",
 			e.server, strings.Join(dropped, ", "))
 	}
-	e.candidates = alive
+	sortCandidates(tcp)
+	sortCandidates(udp)
+	e.tcp, e.udp = tcp, udp
 	return nil
 }
 
-// DialContext tries the working flavours in order and leaves without the proxy
-// when none of them completes a connection.
+// sortCandidates orders a list fastest-first. The sort is stable, so two
+// protocols with the same handshake time keep their configured preference
+// (socks5h before socks5, which matters in a fake-ip deployment).
+func sortCandidates(list []gostCandidate) {
+	sort.SliceStable(list, func(i, j int) bool { return list[i].latency < list[j].latency })
+}
+
+// DialContext picks the list that matches the flow: UDP only ever uses a
+// protocol whose association was granted, TCP uses the fastest one available.
+// A flavour that fails while connecting falls through to the next, and when the
+// list is exhausted the connection leaves without the proxy.
 func (e *gostEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	list := e.tcp
+	if strings.HasPrefix(network, "udp") {
+		list = e.udp
+	}
+
 	var lastErr error
-	for _, c := range e.candidates {
-		conn, err := c.DialContext(ctx, network, addr)
+	for _, c := range list {
+		conn, err := c.dialer.DialContext(ctx, network, addr)
 		if err == nil {
 			return conn, nil
 		}
 		lastErr = err
 	}
-	// Every protocol failed for this target: fall back to the host network,
-	// which is the same outcome as running without a proxy link.
+
 	var direct directEgress
 	conn, err := direct.DialContext(ctx, network, addr)
 	if err != nil {
@@ -737,11 +795,20 @@ func (e *gostEgress) DialContext(ctx context.Context, network, addr string) (net
 	return conn, nil
 }
 
-// protocols reports the flavours kept for this outlet, for the startup log.
-func (e *gostEgress) protocols() []string {
-	out := make([]string, 0, len(e.candidates))
-	for _, c := range e.candidates {
-		out = append(out, describeEgress(c))
+// tcpProtocols reports the TCP order kept for this outlet, for the startup log.
+func (e *gostEgress) tcpProtocols() []string {
+	return describeCandidates(e.tcp)
+}
+
+// udpProtocols reports the UDP order kept for this outlet.
+func (e *gostEgress) udpProtocols() []string {
+	return describeCandidates(e.udp)
+}
+
+func describeCandidates(list []gostCandidate) []string {
+	out := make([]string, 0, len(list))
+	for _, c := range list {
+		out = append(out, fmt.Sprintf("%s (%s)", describeEgress(c.dialer), c.latency.Round(time.Microsecond)))
 	}
 	return out
 }

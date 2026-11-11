@@ -469,10 +469,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 				p.egress = dialer
 				p.proxyActive = true
 				// A gost listener picks its protocol from the first bytes, so
-				// the log names the flavours that actually answered.
+				// the log names the flavours that actually answered: TCP is
+				// ordered by handshake time, UDP only lists the ones whose
+				// association was granted.
 				if g, ok := dialer.(*gostEgress); ok {
 					p.L().Info("gost outlet protocols selected",
-						zap.String("server", g.server), zap.Strings("protocols", g.protocols()))
+						zap.String("server", g.server),
+						zap.Strings("tcp_protocols", g.tcpProtocols()),
+						zap.Strings("udp_protocols", g.udpProtocols()))
 				}
 				p.L().Info("proxy egress ready", zap.String("proxy", redactProxy(cfg.Proxy)))
 			}
