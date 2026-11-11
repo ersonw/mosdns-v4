@@ -204,12 +204,23 @@ func (p *FakeIPNatPlugin) restoreRuntimeMappings(ctx context.Context) error {
 // table: database rows the nft map is missing are re-applied with their newest
 // real ip, and fake ips that only the map knows are reserved.
 func (p *FakeIPNatPlugin) reconcileFirewallMappings(ctx context.Context) {
+	if p.realIP {
+		p.L().Debug("fakeip nat: realip mode has no dnat map, reconciliation skipped")
+		return
+	}
 	table := p.nftTableName()
 	firewall := p.nftMappings(ctx, table)
 	if firewall == nil {
 		p.L().Debug("fakeip nat: firewall mapping unavailable, reconciliation skipped",
 			zap.String("nft_table", table))
 		return
+	}
+
+	// The host routes are part of the same state: a refilled DNAT element
+	// without a route to its real ip is just as broken as a missing element.
+	hop, dev := p.nextHop, p.nextHopDev
+	if hop == "" && dev == "" {
+		hop, dev = p.systemDefaultRoute(ctx)
 	}
 
 	refilled := 0
@@ -230,6 +241,7 @@ func (p *FakeIPNatPlugin) reconcileFirewallMappings(ctx context.Context) {
 			continue
 		}
 		refilled++
+		p.applyHostRoute(ctx, real.String(), hop, dev)
 		p.L().Debug("fakeip nat: firewall mapping refilled",
 			zap.String("domain", domain), zap.String("fake_ip", fakeIP), zap.String("real_ip", real.String()))
 	}

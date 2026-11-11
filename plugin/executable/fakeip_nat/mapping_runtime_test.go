@@ -91,4 +91,9 @@ func TestReconcileFirewallMappings(t *testing.T) {
 	if !strings.Contains(refill, fake+" : 1.2.3.4") {
 		t.Fatalf("refill command = %q, want %s : 1.2.3.4", refill, fake)
 	}
+	// The refilled element needs its host route as well, otherwise the DNAT
+	// target is unreachable right after startup.
+	if _, ok := fr.find("route replace 1.2.3.4/32"); !ok {
+		t.Fatalf("refilled mapping has no host route, calls: %v", fr.all())
+	}
 }
