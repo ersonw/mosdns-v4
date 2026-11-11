@@ -34,9 +34,10 @@
 # - data_providers: two v2dat files (geosite + geoip) and one plain-text list,
 #   all auto-reloaded when the file changes.
 # - two forwarders: a local upstream and a pinned public pair (1.1.1.1/8.8.8.8).
-# - one workflow branch: CN domains go to the local upstream and stop;
-#   everything else goes to the public pair and is then rewritten to a fake IP
-#   by fakeip_nat.
+# - one two-stage workflow: CN domains go to the local upstream and stop;
+#   everything else goes to the public pair, and if the answer's IP is in the
+#   CN CIDR set it stops there too (real IP); only the remaining answers are
+#   rewritten to a fake IP by fakeip_nat.
 #
 # IMPORTANT: the provider files must exist before startup, otherwise the
 # process aborts while loading data_providers. Point them at your own copies
@@ -99,17 +100,17 @@ plugins:
         - "provider:geosite:cn"
         - "provider:cn_domains_text"
 
-  # 4) Response IP matcher over the geoip dat. Not used by the workflow below;
-  #    uncomment it when you want a branch such as
-  #      - if: match_cn_ip
-  #        exec: [...]
+  # 4) Response IP matcher over the geoip dat: true when at least one answer
+  #    address falls inside the "cn" CIDR set. Used as the second stage of the
+  #    workflow below, so a domain that is not on the CN domain list but
+  #    resolves to a CN address still leaves with its real IP.
   #    Note: the dat must actually contain the "cn" category, otherwise
   #    startup fails with "tag cn does not exist".
-  # - tag: match_cn_ip
-  #   type: response_matcher
-  #   args:
-  #     ip:
-  #       - "provider:geoip:cn"
+  - tag: match_cn_ip
+    type: response_matcher
+    args:
+      ip:
+        - "provider:geoip:cn"
 
   # 5) fake-IP + data plane. Answers A queries inside ipv4_range with a fake
   #    IP and records domain -> fake IP -> real IP in SQLite. use_tun: false
@@ -130,8 +131,14 @@ plugins:
       ttl: 60
       use_tun: true
 #      hop_name_suffix: "mth-remote"   # one DNS label; empty = table_prefix
+#      record_ttl: "168h"              # drop mappings idle this long; empty = 7d, "0" = off
 
-  # 6) Workflow: CN -> local (stop), otherwise public -> fake IP.
+  # 6) Workflow, two stages:
+  #    a) the query itself matches a CN domain -> ask the local resolver and
+  #       stop, the client keeps the real CN address;
+  #    b) otherwise ask the public pair; if the answer already sits in the CN
+  #       CIDR set (geoip:cn) stop as well, so only traffic that really leaves
+  #       for the public internet is rewritten to a fake IP.
   - tag: main
     type: sequence
     args:
@@ -141,6 +148,9 @@ plugins:
             - forward_local
             - _return
         - forward_public
+        - if: match_cn_ip
+          exec:
+            - _return
         - fakeip
 
 servers:
