@@ -131,6 +131,14 @@ type FakeIPNatPlugin struct {
 	// packets so an ICMP error can quote the exact bytes the client sent.
 	quoteMu sync.Mutex
 	quotes  map[quoteKey]clientQuote
+
+	// Hop views: a traceroute hop is handed to the client with a virtual
+	// address of this range, and the reverse lookup of that address answers
+	// with the real hop address. Entries expire: the data never outlives the
+	// probe that produced it.
+	hopMu     sync.Mutex
+	hops      map[netip.Addr]hopView
+	hopByReal map[netip.Addr]netip.Addr
 	// conn tracks the flows of the tun data path so replies can be mapped back
 	// to the client.
 	conn *conntrack
@@ -471,6 +479,30 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	}
 
 	question := q.Question[0]
+	// A traceroute hop is shown to the client as a virtual address of this
+	// range; its reverse lookup names the real hop, so the client prints
+	// "<real hop> (<virtual ip>)" instead of a bare address.
+	if question.Qtype == dns.TypePTR {
+		if addr, ok := ptrAddr(question.Name); ok {
+			if real, ok := p.lookupHop(addr); ok {
+				resp := new(dns.Msg)
+				resp.SetReply(q)
+				resp.RecursionAvailable = true
+				resp.Answer = []dns.RR{&dns.PTR{
+					Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: uint32(hopViewTTL.Seconds())},
+					// A dotted quad is not a valid host name, so the
+					// resolver would throw the answer away and traceroute
+					// would print the bare address. Dashes keep the real hop
+					// readable in the same order as the address.
+					Ptr: strings.ReplaceAll(real.String(), ".", "-") + ".",
+				}}
+				p.L().Debug("fakeip nat: hop reverse lookup answered",
+					zap.String("name", question.Name), zap.String("virtual_ip", addr.String()), zap.String("real_ip", real.String()))
+				qCtx.SetResponse(resp)
+				return nil
+			}
+		}
+	}
 	p.L().Debug("fakeip nat: query in",
 		zap.String("name", question.Name), zap.Uint16("qtype", question.Qtype),
 		zap.Bool("has_response", qCtx.R() != nil))

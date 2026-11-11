@@ -253,8 +253,12 @@ func TestProbeReplyRewritesHopAddress(t *testing.T) {
 	if written == nil {
 		t.Fatalf("nothing was written to the client")
 	}
-	if got := netip.AddrFrom4([4]byte{written[12], written[13], written[14], written[15]}); got != hop {
-		t.Fatalf("source = %s, want the hop %s", got, hop)
+	from := netip.AddrFrom4([4]byte{written[12], written[13], written[14], written[15]})
+	if !from.IsValid() || !p.prefix.Contains(from) {
+		t.Fatalf("source = %s, want a virtual address of the range", from)
+	}
+	if real, ok := p.lookupHop(from); !ok || real != hop {
+		t.Fatalf("reverse lookup of %s = %s/%v, want the hop %s", from, real, ok, hop)
 	}
 	if got := netip.AddrFrom4([4]byte{written[16], written[17], written[18], written[19]}); got != client {
 		t.Fatalf("destination = %s, want the client %s", got, client)
@@ -264,5 +268,56 @@ func TestProbeReplyRewritesHopAddress(t *testing.T) {
 	}
 	if _, ok := p.icmp.takeProbe(probePort); ok {
 		t.Fatalf("probe entry must be gone after the answer")
+	}
+}
+
+func TestPtrAddrParsesReverseName(t *testing.T) {
+	cases := []struct {
+		name string
+		want string
+		ok   bool
+	}{
+		{"1.0.18.198.in-addr.arpa.", "198.18.0.1", true},
+		{"254.255.18.198.in-addr.arpa", "198.18.255.254", true},
+		{"example.com.", "", false},
+		{"1.2.3.in-addr.arpa.", "", false},
+		{"x.0.18.198.in-addr.arpa.", "", false},
+	}
+	for _, c := range cases {
+		got, ok := ptrAddr(c.name)
+		if ok != c.ok {
+			t.Fatalf("ptrAddr(%q) ok = %v, want %v", c.name, ok, c.ok)
+		}
+		if ok && got.String() != c.want {
+			t.Fatalf("ptrAddr(%q) = %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+func TestHopFakeForSkipsAllocatedAddresses(t *testing.T) {
+	p := newTestPlugin(t, "198.18.0.0/16")
+	last := netip.MustParseAddr("198.18.255.254")
+	p.runtime.put("example.com", last.String())
+
+	hop := netip.MustParseAddr("192.168.10.1")
+	fake, ok := p.hopFakeFor(hop)
+	if !ok {
+		t.Fatalf("no virtual address was handed out")
+	}
+	if !p.prefix.Contains(fake) {
+		t.Fatalf("virtual address %s is outside %s", fake, p.prefix)
+	}
+	if fake == last {
+		t.Fatalf("virtual address %s was already allocated to a domain", fake)
+	}
+	if real, ok := p.lookupHop(fake); !ok || real != hop {
+		t.Fatalf("reverse lookup = %s/%v, want %s", real, ok, hop)
+	}
+	// A second probe for the same hop reuses the entry instead of growing it.
+	if again, _ := p.hopFakeFor(hop); again != fake {
+		t.Fatalf("hop was handed a new address: %s vs %s", again, fake)
+	}
+	if n := p.sweepHops(time.Now().Add(hopViewTTL + time.Second)); n != 1 {
+		t.Fatalf("swept %d hop views, want 1", n)
 	}
 }

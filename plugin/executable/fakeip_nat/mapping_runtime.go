@@ -111,6 +111,15 @@ func (m *runtimeMap) fakeOf(domain string) (string, bool) {
 
 // isReserved reports whether the address is known to be in use but has no
 // domain attached (firewall-only entry).
+// taken reports whether the address already belongs to a domain or a
+// reservation, so transient allocations can pick a free one.
+func (m *runtimeMap) taken(fakeIP string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	_, ok := m.byFake[fakeIP]
+	return ok
+}
+
 func (m *runtimeMap) isReserved(fakeIP string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

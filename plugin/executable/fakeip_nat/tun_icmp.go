@@ -6,7 +6,10 @@ package fakeipnat
 //     fake ip is mapped to, and the reply is rewritten back to the fake ip;
 //   - ICMP errors produced by the outlet (port unreachable from the far end,
 //     time exceeded from a router on the way) are relayed to the client with
-//     the address they actually came from, never with the fake ip.
+//     the address they actually came from, never with the fake ip;
+//   - a traceroute probe is answered by probing the real path itself, and the
+//     hop is shown as a virtual address of this range whose PTR record names
+//     the real hop.
 //
 // Both need a raw ICMP socket: the upstream UDP socket only reports an error
 // as a failed read and carries no address, and the userspace stack never
@@ -18,6 +21,8 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -265,6 +270,9 @@ func (p *FakeIPNatPlugin) startICMPRelay(ctx context.Context, st *tunStack) {
 				if n := r.sweepProbe(now); n > 0 {
 					p.L().Debug("tun icmp: expired hop probes dropped", zap.Int("count", n))
 				}
+				if n := p.sweepHops(now); n > 0 {
+					p.L().Debug("tun icmp: expired hop views dropped", zap.Int("count", n))
+				}
 			}
 		}
 	}()
@@ -410,6 +418,141 @@ func (p *FakeIPNatPlugin) takeClientQuote(key quoteKey) ([]byte, uint8) {
 	return q.pkt, q.ttl
 }
 
+// hopView is one traceroute hop handed to the client: the virtual address it
+// was shown as, the real address behind it, and when it was last used.
+type hopView struct {
+	real netip.Addr
+	at   time.Time
+}
+
+const (
+	hopViewTTL = 30 * time.Second
+	hopViewMax = 256
+)
+
+// hopFakeFor returns the virtual address that stands for this real hop. It is
+// picked from the tail of the range so the allocator, which fills from the
+// head, never hands the same address to a domain. The entry expires on its own.
+func (p *FakeIPNatPlugin) hopFakeFor(real netip.Addr) (netip.Addr, bool) {
+	if !real.Is4() {
+		return netip.Addr{}, false
+	}
+	p.hopMu.Lock()
+	defer p.hopMu.Unlock()
+	if p.hops == nil {
+		p.hops = make(map[netip.Addr]hopView)
+		p.hopByReal = make(map[netip.Addr]netip.Addr)
+	}
+	if f, ok := p.hopByReal[real]; ok {
+		if v, live := p.hops[f]; live && time.Since(v.at) <= hopViewTTL {
+			p.hops[f] = hopView{real: real, at: time.Now()}
+			return f, true
+		}
+		delete(p.hopByReal, real)
+	}
+	base := p.prefix.Addr().As4()
+	baseUint := uint64(binary.BigEndian.Uint32(base[:]))
+	for off := uint64(0); off+1 < p.maxHosts; off++ {
+		var a [4]byte
+		binary.BigEndian.PutUint32(a[:], uint32(baseUint+p.maxHosts-off))
+		cand := netip.AddrFrom4(a)
+		if p.runtime.taken(cand.String()) {
+			continue
+		}
+		if v, ok := p.hops[cand]; ok && time.Since(v.at) <= hopViewTTL {
+			continue
+		}
+		p.hops[cand] = hopView{real: real, at: time.Now()}
+		p.hopByReal[real] = cand
+		p.trimHops()
+		return cand, true
+	}
+	return netip.Addr{}, false
+}
+
+// trimHops bounds the table: the oldest entries go first.
+func (p *FakeIPNatPlugin) trimHops() {
+	if len(p.hops) <= hopViewMax {
+		return
+	}
+	var oldestAddr netip.Addr
+	var oldest time.Time
+	for addr, v := range p.hops {
+		if oldest.IsZero() || v.at.Before(oldest) {
+			oldestAddr, oldest = addr, v.at
+		}
+	}
+	delete(p.hops, oldestAddr)
+	for real, addr := range p.hopByReal {
+		if addr == oldestAddr {
+			delete(p.hopByReal, real)
+			break
+		}
+	}
+}
+
+// lookupHop resolves a virtual hop address back to the real one.
+func (p *FakeIPNatPlugin) lookupHop(addr netip.Addr) (netip.Addr, bool) {
+	p.hopMu.Lock()
+	defer p.hopMu.Unlock()
+	v, ok := p.hops[addr]
+	if !ok {
+		return netip.Addr{}, false
+	}
+	if time.Since(v.at) > hopViewTTL {
+		delete(p.hops, addr)
+		for real, a := range p.hopByReal {
+			if a == addr {
+				delete(p.hopByReal, real)
+				break
+			}
+		}
+		return netip.Addr{}, false
+	}
+	return v.real, true
+}
+
+// sweepHops drops views the client is done with.
+func (p *FakeIPNatPlugin) sweepHops(now time.Time) int {
+	p.hopMu.Lock()
+	defer p.hopMu.Unlock()
+	n := 0
+	for addr, v := range p.hops {
+		if now.Sub(v.at) > hopViewTTL {
+			delete(p.hops, addr)
+			n++
+		}
+	}
+	for real, addr := range p.hopByReal {
+		if _, ok := p.hops[addr]; !ok {
+			delete(p.hopByReal, real)
+		}
+	}
+	return n
+}
+
+// ptrAddr parses a reverse lookup name (a.b.c.d.in-addr.arpa) into an address.
+func ptrAddr(name string) (netip.Addr, bool) {
+	s := strings.ToLower(strings.TrimSuffix(name, "."))
+	const suffix = ".in-addr.arpa"
+	if !strings.HasSuffix(s, suffix) {
+		return netip.Addr{}, false
+	}
+	parts := strings.Split(strings.TrimSuffix(s, suffix), ".")
+	if len(parts) != 4 {
+		return netip.Addr{}, false
+	}
+	var a [4]byte
+	for i, part := range parts {
+		v, err := strconv.Atoi(part)
+		if err != nil || v < 0 || v > 255 {
+			return netip.Addr{}, false
+		}
+		a[3-i] = byte(v)
+	}
+	return netip.AddrFrom4(a), true
+}
+
 // shouldProbe reports whether the client TTL marks a traceroute probe. A host
 // answers a probe with the hop at that distance; here the tunnel terminates the
 // flow, so the answer has to be fetched from the real path.
@@ -477,13 +620,29 @@ func (p *FakeIPNatPlugin) probeReply(src *net.IPAddr, msg []byte) bool {
 	if !ok {
 		return false
 	}
-	reply := buildICMPError(addrOf(src), entry.client, entry.quote, msg[0], msg[1])
+	// The hop is shown to the client as a virtual address of this range: that
+	// is the only range the client always routes here. Its PTR record names
+	// the real hop, so traceroute prints both.
+	hop, hopOK := netip.AddrFromSlice(src.IP)
+	virtual, ok := netip.Addr{}, false
+	if hopOK {
+		virtual, ok = p.hopFakeFor(hop)
+	}
+	if !ok {
+		reply := buildICMPError(addrOf(src), entry.client, entry.quote, msg[0], msg[1])
+		if reply != nil {
+			_ = r.write(reply)
+		}
+		return true
+	}
+	reply := buildICMPError(virtual, entry.client, entry.quote, msg[0], msg[1])
 	if reply != nil {
 		if err := r.write(reply); err != nil {
 			p.L().Warn("tun icmp: write hop answer to client failed", zap.Error(err))
 		} else {
 			p.L().Debug("tun icmp: hop probe answered",
-				zap.String("from", src.String()), zap.Int("ttl", entry.ttl),
+				zap.String("from", src.String()), zap.String("virtual_ip", virtual.String()),
+				zap.Int("ttl", entry.ttl),
 				zap.String("client", entry.client.String()), zap.String("fake_ip", entry.fakeIP.String()))
 		}
 	}
