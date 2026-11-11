@@ -20,7 +20,6 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -185,8 +184,11 @@ type socks5Egress struct {
 }
 
 func (e *socks5Egress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if strings.HasPrefix(network, "udp") {
+		return e.dialUDP(ctx, addr)
+	}
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
-		return nil, fmt.Errorf("socks5 egress supports tcp only, got %q", network)
+		return nil, fmt.Errorf("socks5 egress does not carry %q", network)
 	}
 
 	// socks5 resolves the target locally, socks5h lets the server resolve it.
@@ -288,37 +290,54 @@ func (e *socks5Egress) connect(c net.Conn, addr string) error {
 		return fmt.Errorf("socks5 connect request: %w", err)
 	}
 
-	var head [4]byte
-	if _, err := io.ReadFull(c, head[:]); err != nil {
-		return fmt.Errorf("socks5 connect reply: %w", err)
-	}
-	if head[0] != 0x05 {
-		return fmt.Errorf("socks5: unexpected connect reply version %#x", head[0])
-	}
-	if head[1] != 0x00 {
-		return fmt.Errorf("socks5: connect %s failed: %s", addr, socks5ReplyText(head[1]))
-	}
-
-	// The bound address in the reply is irrelevant, only its length matters.
-	var n int
-	switch head[3] {
-	case 0x01:
-		n = 4
-	case 0x04:
-		n = 16
-	case 0x03:
-		var l [1]byte
-		if _, err := io.ReadFull(c, l[:]); err != nil {
-			return fmt.Errorf("socks5 connect reply: %w", err)
-		}
-		n = int(l[0])
-	default:
-		return fmt.Errorf("socks5: unsupported bind address type %#x", head[3])
-	}
-	if _, err := io.ReadFull(c, make([]byte, n+2)); err != nil {
-		return fmt.Errorf("socks5 connect reply: %w", err)
+	if _, err := readSocks5BindAddr(c); err != nil {
+		return fmt.Errorf("socks5 connect %s: %w", addr, err)
 	}
 	return nil
+}
+
+// dialUDP opens a socks5 UDP association: the TCP connection stays open as the
+// association, datagrams travel over a second socket to the relay the server
+// returned.
+func (e *socks5Egress) dialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	if _, err := appendProxyAddr(nil, addr); err != nil {
+		return nil, err
+	}
+	var d net.Dialer
+	ctrl, err := d.DialContext(ctx, "tcp", e.server)
+	if err != nil {
+		return nil, fmt.Errorf("dial socks5 server %s: %w", e.server, err)
+	}
+	cleanup := func(err error) (net.Conn, error) {
+		_ = ctrl.Close()
+		return nil, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = ctrl.SetDeadline(dl)
+	}
+	if err := e.negotiate(ctrl); err != nil {
+		return cleanup(err)
+	}
+	if _, err := ctrl.Write(socks5UDPAssociateRequest()); err != nil {
+		return cleanup(fmt.Errorf("socks5 udp associate: %w", err))
+	}
+	bnd, err := readSocks5BindAddr(ctrl)
+	if err != nil {
+		return cleanup(fmt.Errorf("socks5 udp associate: %w", err))
+	}
+	// A wildcard bind means "the address you reached me on".
+	if host, port, herr := net.SplitHostPort(bnd); herr == nil {
+		if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+			proxyHost, _, _ := net.SplitHostPort(e.server)
+			bnd = net.JoinHostPort(proxyHost, port)
+		}
+	}
+	udp, err := d.DialContext(ctx, "udp", bnd)
+	if err != nil {
+		return cleanup(fmt.Errorf("socks5 udp relay %s: %w", bnd, err))
+	}
+	_ = ctrl.SetDeadline(time.Time{})
+	return &socks5UDPConn{ctrl: ctrl, udp: udp, addr: addr}, nil
 }
 
 func socks5ReplyText(code byte) string {
@@ -346,31 +365,7 @@ func socks5ReplyText(code byte) string {
 
 // socks5ConnectRequest encodes a CONNECT for an ipv4, ipv6 or domain target.
 func socks5ConnectRequest(addr string) ([]byte, error) {
-	host, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, fmt.Errorf("invalid target %q: %w", addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 0 || port > 65535 {
-		return nil, fmt.Errorf("invalid target port %q", portStr)
-	}
-
-	buf := []byte{0x05, 0x01, 0x00}
-	if ip := net.ParseIP(host); ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			buf = append(buf, 0x01, ip4[0], ip4[1], ip4[2], ip4[3])
-		} else {
-			buf = append(buf, 0x04)
-			buf = append(buf, ip.To16()...)
-		}
-	} else {
-		if len(host) > 255 {
-			return nil, fmt.Errorf("target host %q is too long for socks5", host)
-		}
-		buf = append(buf, 0x03, byte(len(host)))
-		buf = append(buf, host...)
-	}
-	return append(buf, byte(port>>8), byte(port&0xFF)), nil
+	return appendProxyAddr([]byte{0x05, 0x01, 0x00}, addr)
 }
 
 // resolveLocally rewrites the host of addr to a literal ip; on failure the
@@ -478,8 +473,11 @@ type trojanEgress struct {
 }
 
 func (e *trojanEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if strings.HasPrefix(network, "udp") {
+		return e.dialUDP(ctx, addr)
+	}
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
-		return nil, fmt.Errorf("trojan egress supports tcp only, got %q", network)
+		return nil, fmt.Errorf("trojan egress does not carry %q", network)
 	}
 	c, err := e.dial(ctx)
 	if err != nil {
@@ -490,6 +488,28 @@ func (e *trojanEgress) DialContext(ctx context.Context, network, addr string) (n
 		return nil, fmt.Errorf("trojan request: %w", err)
 	}
 	return c, nil
+}
+
+// dialUDP opens the TLS stream and switches it into UDP mode; every datagram
+// after the header is a frame (see egress_trojan_udp.go).
+func (e *trojanEgress) dialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	if _, err := encodeTrojanUDPFrame(addr, nil); err != nil {
+		return nil, err
+	}
+	c, err := e.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hdr, err := trojanUDPHeader(e.password)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if _, err := c.Write(hdr); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("trojan udp associate: %w", err)
+	}
+	return &trojanUDPConn{conn: c, addr: addr}, nil
 }
 
 func (e *trojanEgress) Probe(ctx context.Context) error {

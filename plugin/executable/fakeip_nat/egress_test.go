@@ -238,10 +238,11 @@ func TestSocks5ProbeFailsWhenServerIsDown(t *testing.T) {
 	}
 }
 
-func TestSocks5EgressRejectsUDP(t *testing.T) {
-	d, _ := newEgress("socks5://127.0.0.1:1080", false)
+func TestHTTPEgressRejectsUDP(t *testing.T) {
+	// http/https only carry CONNECT; udp falls back to a direct socket.
+	d, _ := newEgress("http://127.0.0.1:8080", false)
 	if _, err := d.DialContext(context.Background(), "udp", "1.2.3.4:53"); err == nil {
-		t.Fatal("socks5 egress should reject udp")
+		t.Fatal("http egress should reject udp")
 	}
 }
 
@@ -281,13 +282,6 @@ func TestTrojanConnectRequest(t *testing.T) {
 	}
 	if !strings.HasSuffix(string(req), "example.com:443\r\n") {
 		t.Fatalf("trojan request = %q, want the target at the end", req)
-	}
-}
-
-func TestTrojanEgressRejectsUDP(t *testing.T) {
-	d, _ := newEgress("trojan://secret@127.0.0.1:443", false)
-	if _, err := d.DialContext(context.Background(), "udp", "1.2.3.4:53"); err == nil {
-		t.Fatal("trojan egress should reject udp")
 	}
 }
 
