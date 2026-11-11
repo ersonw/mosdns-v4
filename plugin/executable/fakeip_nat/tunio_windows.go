@@ -57,7 +57,7 @@ func (p *FakeIPNatPlugin) createTunPlatform(ctx context.Context) (string, tunDev
 
 // tunConfigureCommands sets the reserved /32 and adds the range route.
 func (p *FakeIPNatPlugin) tunConfigureCommands(dev string) []tunCommand {
-	return windowsConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr)
+	return windowsConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr, p.tunMTU)
 }
 
 // windowsTunName takes tun_dev when set, otherwise the first mth0..mth63 the

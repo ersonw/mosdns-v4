@@ -51,7 +51,7 @@ func (p *FakeIPNatPlugin) createTunPlatform(ctx context.Context) (string, tunDev
 // tunConfigureCommands assigns the reserved address and routes the range into
 // the device. The device is already attached, so the link name is final.
 func (p *FakeIPNatPlugin) tunConfigureCommands(dev string) []tunCommand {
-	return linuxConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr)
+	return linuxConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr, p.tunMTU)
 }
 
 // pickTunName walks mth0, mth1, ... and takes the first name that is free. A

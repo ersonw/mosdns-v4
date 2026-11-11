@@ -40,6 +40,16 @@ import (
 const (
 	// defaultTunMTU matches the MTU setupTun puts on the device.
 	defaultTunMTU = 1500
+	// proxyTunMTU leaves room for the tunnel a proxied outlet runs through. A
+	// wireguard hop is commonly 1420, and trojan adds a TLS record on top, so
+	// 1500-byte segments are lost on that path while handshakes still succeed:
+	// the page loads its first exchange and then hangs. 1400 keeps a safe
+	// headroom and an explicit tun_mtu overrides it.
+	proxyTunMTU = 1400
+	// minTunMTU is the smallest IPv4 reassembly size a host must accept.
+	minTunMTU = 576
+	// maxTunMTU is the Ethernet MTU; a fake range never needs more.
+	maxTunMTU = 1500
 	// tunLinkQueue is how many outbound packets may wait to be written back to
 	// the device before the stack starts dropping.
 	tunLinkQueue = 256
@@ -71,6 +81,23 @@ type tunStack struct {
 	// one mutex.
 	dev     tunDevice
 	writeMu sync.Mutex
+}
+
+// resolveTunMTU picks the MTU of the tun device: an explicit tun_mtu wins,
+// otherwise a direct outlet keeps the Ethernet size and a proxied outlet drops
+// to proxyTunMTU, because a proxy path carries another tunnel underneath.
+func resolveTunMTU(explicit int, proxyActive bool) (uint32, error) {
+	mtu := uint32(explicit)
+	if mtu == 0 {
+		mtu = defaultTunMTU
+		if proxyActive {
+			mtu = proxyTunMTU
+		}
+	}
+	if mtu < minTunMTU || mtu > maxTunMTU {
+		return 0, fmt.Errorf("tun_mtu %d is outside %d..%d", explicit, minTunMTU, maxTunMTU)
+	}
+	return mtu, nil
 }
 
 func newTunStack(mtu uint32, local netip.Addr) (*tunStack, error) {

@@ -52,7 +52,7 @@ func (p *FakeIPNatPlugin) createTunPlatform(ctx context.Context) (string, tunDev
 }
 
 func (p *FakeIPNatPlugin) tunConfigureCommands(dev string) []tunCommand {
-	return bsdConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr)
+	return bsdConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr, p.tunMTU)
 }
 
 func (p *FakeIPNatPlugin) pickFreeBSDTunName(ctx context.Context) (string, error) {

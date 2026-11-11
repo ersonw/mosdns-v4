@@ -65,7 +65,7 @@ func TestDarwinConfigureCommands(t *testing.T) {
 	plan := p.tunConfigureCommands("utun3")
 	// Point-to-point devices need a peer address, otherwise ifconfig answers
 	// "ioctl (SIOCAIFADDR): Destination address required" (verified on macOS).
-	want := "ifconfig utun3 inet 198.18.0.1 198.18.0.1 netmask 255.255.255.255 up"
+	want := "ifconfig utun3 inet 198.18.0.1 198.18.0.1 netmask 255.255.255.255 mtu 1500 up"
 	if got := strings.Join(plan[0].args, " "); got != want {
 		t.Fatalf("first step = %q, want %q", got, want)
 	}

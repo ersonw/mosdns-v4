@@ -96,6 +96,7 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
       ipv4_range: "198.19.0.0/16"
       use_tun: true
       tun_dev: ""                        # 留空自动申请 mth0/mth1…；填名字则复用同名设备
+      tun_mtu: 0                         # 0 = 自动：直连 1500，代理出口 1400；显式值优先
       proxy: "socks5h://user:pass@10.0.0.9:1080"   # 或 http://、https://、trojan://pass@host:443?sni=host
       proxy_insecure: false              # 仅自签证书的 https / trojan 需要打开
       # 无代理时的直连出口：默认路由 = 下一跳 + 下一跳网卡，源地址 = 段内地址

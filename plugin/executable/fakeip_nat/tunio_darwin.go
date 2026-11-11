@@ -37,7 +37,7 @@ func (p *FakeIPNatPlugin) createTunPlatform(ctx context.Context) (string, tunDev
 
 // tunConfigureCommands gives the device the reserved /32 and routes the range.
 func (p *FakeIPNatPlugin) tunConfigureCommands(dev string) []tunCommand {
-	return bsdConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr)
+	return bsdConfigureTunCommands(dev, p.reservedFakeIP(), p.cidr, p.tunMTU)
 }
 
 // darwinTunUnit decides which utun unit to ask the kernel for.

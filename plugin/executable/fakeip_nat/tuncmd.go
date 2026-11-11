@@ -10,6 +10,16 @@ import (
 // plans are pure data, so they are unit tested on any host; the per-platform
 // files only decide which plan to run.
 
+// effectiveTunMTU falls back to the Ethernet size when Init has not resolved a
+// value (the native data path never builds a device, and plan tests build one
+// without Init).
+func effectiveTunMTU(mtu uint32) uint32 {
+	if mtu == 0 {
+		return defaultTunMTU
+	}
+	return mtu
+}
+
 // linuxCreateTunCommands requests a persistent tun device from iproute2. It is
 // only run when the device does not exist yet.
 func linuxCreateTunCommands(dev string) []tunCommand {
@@ -26,9 +36,13 @@ func linuxCreateTunCommands(dev string) []tunCommand {
 //
 // and both the source selection and the next hop for the return path work
 // without any extra route command.
-func linuxConfigureTunCommands(dev, addr, cidr string) []tunCommand {
+func linuxConfigureTunCommands(dev, addr, cidr string, mtu uint32) []tunCommand {
+	mtu = effectiveTunMTU(mtu)
 	cmds := []tunCommand{
-		{args: []string{"ip", "link", "set", "dev", dev, "up"}},
+		// The MTU is written before the device comes up: the stack advertises
+		// segments of that size to the client, so a device left at the Ethernet
+		// default would keep handing out segments the outlet cannot carry.
+		{args: []string{"ip", "link", "set", "dev", dev, "mtu", strconv.Itoa(int(mtu)), "up"}},
 		{args: []string{"ip", "addr", "replace", addr + tunAddrMask(cidr), "dev", dev}},
 	}
 	// A host mask has no connected route, so the range is named explicitly.
@@ -69,9 +83,10 @@ func tunAddrMask(cidr string) string {
 // /32 on purpose: the range route, not the interface netmask, decides what
 // reaches the device, so no subnet is baked into the plugin - both the reserved
 // address and the cidr are derived from the configured ipv4_range.
-func bsdConfigureTunCommands(dev, addr, cidr string) []tunCommand {
+func bsdConfigureTunCommands(dev, addr, cidr string, mtu uint32) []tunCommand {
+	mtu = effectiveTunMTU(mtu)
 	return []tunCommand{
-		{args: []string{"ifconfig", dev, "inet", addr, addr, "netmask", "255.255.255.255", "up"}},
+		{args: []string{"ifconfig", dev, "inet", addr, addr, "netmask", "255.255.255.255", "mtu", strconv.Itoa(int(mtu)), "up"}},
 		{args: []string{"route", "delete", "-net", cidr}, optional: true},
 		{args: []string{"route", "add", "-net", cidr, "-interface", dev}},
 	}
@@ -79,10 +94,13 @@ func bsdConfigureTunCommands(dev, addr, cidr string) []tunCommand {
 
 // windowsConfigureTunCommands uses netsh, which is present on every supported
 // Windows version and needs no extra tooling.
-func windowsConfigureTunCommands(dev, addr, cidr string) []tunCommand {
+func windowsConfigureTunCommands(dev, addr, cidr string, mtu uint32) []tunCommand {
+	mtu = effectiveTunMTU(mtu)
 	return []tunCommand{
 		{args: []string{"netsh", "interface", "ipv4", "set", "address",
 			"name=" + dev, "source=static", "address=" + addr, "mask=255.255.255.255"}},
+		{args: []string{"netsh", "interface", "ipv4", "set", "subinterface", dev,
+			"mtu=" + strconv.Itoa(int(mtu)), "store=persistent"}},
 		{args: []string{"netsh", "interface", "ipv4", "delete", "route",
 			"prefix=" + cidr, "interface=" + dev}, optional: true},
 		{args: []string{"netsh", "interface", "ipv4", "add", "route",

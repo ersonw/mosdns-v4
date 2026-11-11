@@ -16,9 +16,9 @@ func TestLinuxTunCommandPlan(t *testing.T) {
 		t.Fatalf("create plan = %v", create)
 	}
 
-	plan := linuxConfigureTunCommands("mth3", "198.18.0.1", "198.18.0.0/16")
+	plan := linuxConfigureTunCommands("mth3", "198.18.0.1", "198.18.0.0/16", 1400)
 	want := []string{
-		"ip link set dev mth3 up",
+		"ip link set dev mth3 mtu 1400 up",
 		"ip addr replace 198.18.0.1/16 dev mth3",
 		"sysctl -w net.ipv6.conf.mth3.disable_ipv6=1",
 	}
@@ -38,9 +38,9 @@ func TestLinuxTunCommandPlan(t *testing.T) {
 }
 
 func TestBSDTunCommandPlan(t *testing.T) {
-	plan := bsdConfigureTunCommands("utun4", "198.18.0.1", "198.18.0.0/16")
+	plan := bsdConfigureTunCommands("utun4", "198.18.0.1", "198.18.0.0/16", 1400)
 	want := []string{
-		"ifconfig utun4 inet 198.18.0.1 198.18.0.1 netmask 255.255.255.255 up",
+		"ifconfig utun4 inet 198.18.0.1 198.18.0.1 netmask 255.255.255.255 mtu 1400 up",
 		"route delete -net 198.18.0.0/16",
 		"route add -net 198.18.0.0/16 -interface utun4",
 	}
@@ -59,9 +59,10 @@ func TestBSDTunCommandPlan(t *testing.T) {
 }
 
 func TestWindowsTunCommandPlan(t *testing.T) {
-	plan := windowsConfigureTunCommands("mth2", "198.18.0.1", "198.18.0.0/16")
+	plan := windowsConfigureTunCommands("mth2", "198.18.0.1", "198.18.0.0/16", 1400)
 	want := []string{
 		"netsh interface ipv4 set address name=mth2 source=static address=198.18.0.1 mask=255.255.255.255",
+		"netsh interface ipv4 set subinterface mth2 mtu=1400 store=persistent",
 		"netsh interface ipv4 delete route prefix=198.18.0.0/16 interface=mth2",
 		"netsh interface ipv4 add route prefix=198.18.0.0/16 interface=mth2 metric=1",
 	}
@@ -73,8 +74,10 @@ func TestWindowsTunCommandPlan(t *testing.T) {
 			t.Fatalf("step %d = %q, want %q", i, got, w)
 		}
 	}
-	if !plan[1].optional {
-		t.Fatalf("route delete must be optional: %v", plan)
+	for _, step := range plan {
+		if strings.Join(step.args, " ") == "netsh interface ipv4 delete route prefix=198.18.0.0/16 interface=mth2" && !step.optional {
+			t.Fatalf("route delete must be optional: %v", plan)
+		}
 	}
 }
 
@@ -82,14 +85,14 @@ func TestApplyTunCommandsSkipsOptionalFailure(t *testing.T) {
 	runner := &fakeRunner{failContains: "route delete"}
 	p := newNativePlugin(t, runner, nil)
 
-	err := p.applyTunCommands(context.Background(), bsdConfigureTunCommands("utun0", "198.18.0.1", "198.18.0.0/16"))
+	err := p.applyTunCommands(context.Background(), bsdConfigureTunCommands("utun0", "198.18.0.1", "198.18.0.0/16", 1500))
 	if err != nil {
 		t.Fatalf("a failing optional step must not abort setup: %v", err)
 	}
 
 	runner = &fakeRunner{failContains: "route add"}
 	p = newNativePlugin(t, runner, nil)
-	if err := p.applyTunCommands(context.Background(), bsdConfigureTunCommands("utun0", "198.18.0.1", "198.18.0.0/16")); err == nil {
+	if err := p.applyTunCommands(context.Background(), bsdConfigureTunCommands("utun0", "198.18.0.1", "198.18.0.0/16", 1500)); err == nil {
 		t.Fatal("a failing mandatory step must abort setup")
 	}
 }
@@ -138,6 +141,38 @@ func TestSmallRangeKeepsOneAllocatableHost(t *testing.T) {
 		}
 		if got != "198.18.0.2" {
 			t.Fatalf("allocateFakeIP(%d) = %s, want 198.18.0.2", id, got)
+		}
+	}
+}
+
+func TestResolveTunMTU(t *testing.T) {
+	cases := []struct {
+		name     string
+		explicit int
+		proxy    bool
+		want     uint32
+		wantErr  bool
+	}{
+		{"direct default keeps ethernet", 0, false, defaultTunMTU, false},
+		{"proxy default leaves tunnel headroom", 0, true, proxyTunMTU, false},
+		{"explicit wins over direct default", 1420, false, 1420, false},
+		{"explicit wins over proxy default", 1280, true, 1280, false},
+		{"below ipv4 reassembly minimum", 500, false, 0, true},
+		{"above ethernet", 1501, true, 0, true},
+	}
+	for _, c := range cases {
+		got, err := resolveTunMTU(c.explicit, c.proxy)
+		if c.wantErr {
+			if err == nil {
+				t.Fatalf("%s: expected an error, got mtu %d", c.name, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Fatalf("%s: mtu = %d, want %d", c.name, got, c.want)
 		}
 	}
 }

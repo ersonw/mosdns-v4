@@ -67,6 +67,11 @@ type Args struct {
 	// 空闲名字（上次遗留且地址仍是段首地址的同名设备会被复用）；非空时优先复用
 	// 同名设备，不存在才创建。
 	TunDev string `yaml:"tun_dev"`
+	// TunMTU 是 tun 设备的 MTU，也就是本插件向客户端通告的分段大小上限。
+	// 0 表示自动：直连出口用 1500；代理出口用 1400，因为代理链路还套着一层
+	// 隧道（wg 常见 1420），1500 的段会被丢掉，表现为握手通、网页卡住。
+	// 显式值优先于自动选择，范围 576..1500。
+	TunMTU int `yaml:"tun_mtu"`
 
 	// Proxy 是 tun 数据面的出站代理链接，例如
 	// socks5://user:pass@host:1080、http://host:8080、trojan://pass@host:443?sni=host。
@@ -122,6 +127,9 @@ type FakeIPNatPlugin struct {
 	// the system instead of being DNAT-ed hop by hop.
 	useTun bool
 	tunDev string
+	// tunMTU is the MTU written to the device and advertised by the stack. It
+	// is resolved once in Init from tun_mtu, or from the outlet kind.
+	tunMTU uint32
 	// egress is the outlet of the tun data path: direct by default, or a
 	// socks5 / http / trojan proxy when `proxy` is configured and reachable.
 	egress egressDialer
@@ -398,6 +406,17 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		}
 	}
 
+	// The tun interface sits in front of the outlet, so its MTU bounds the
+	// segment size the stack advertises to clients. A proxied outlet adds the
+	// tunnel the proxy itself runs through, where Ethernet-size segments are
+	// dropped, so the automatic choice is smaller there. An explicit tun_mtu
+	// always wins.
+	mtu, err := resolveTunMTU(cfg.TunMTU, p.proxyActive)
+	if err != nil {
+		return nil, err
+	}
+	p.tunMTU = mtu
+
 	// The tun data path is the alternative to per-domain DNAT: it asks the
 	// system for a device and routes the whole ipv4_range into it.
 	if p.useTun {
@@ -434,7 +453,8 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("tun_dev", p.tunDev),
 		zap.String("route_table", p.routeTable),
 		zap.Bool("route_aggregation", p.aggregateRoutes),
-		zap.Bool("proxy_active", p.proxyActive))
+		zap.Bool("proxy_active", p.proxyActive),
+		zap.Uint32("tun_mtu", p.tunMTU))
 
 	return p, nil
 }
@@ -449,7 +469,7 @@ func (p *FakeIPNatPlugin) startTunDataPath() error {
 	if err != nil {
 		return err
 	}
-	st, err := newTunStack(defaultTunMTU, p.reservedAddr())
+	st, err := newTunStack(p.tunMTU, p.reservedAddr())
 	if err != nil {
 		_ = dev.Close()
 		return err
