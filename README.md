@@ -51,7 +51,16 @@ ICMP 也按地址翻译（SNAT）语义处理：`ping` 发往 fake IP 的 echo �
 fake IP），用这个虚拟地址做回包源地址、客户端原报文做引用回给客户端，所以回包一定落在
 客户端发往 tun 的路由范围内。该虚拟地址的反向解析（PTR）返回真实跳地址，`traceroute`
 因此显示 `192-168-10-1 (198.19.255.254)`（点号换成短横，因为点分四段不是合法主机名，
-解析器会丢弃）；前提是客户端把 DNS 指向本插件，否则 PTR 走上游、客户端只能看到地址。每个探针一张一次性表项（探测 socket
+解析器会丢弃）；前提是客户端把 DNS 指向本插件，否则 PTR 走上游、客户端只能看到地址。
+macOS 客户端不想改全局 DNS 时，只让反向解析走插件即可：
+
+```sh
+sudo mkdir -p /etc/resolver
+printf 'nameserver 127.0.0.1\nport 53\n' | sudo tee /etc/resolver/in-addr.arpa
+sudo killall -HUP mDNSResponder
+```
+
+删掉 `/etc/resolver/in-addr.arpa` 即恢复。每个探针一张一次性表项（探测 socket
 本地端口 → 客户端 / fake IP / 引用报文），应答到达即删除，1.2s 超时也删除；hop 的虚拟
 地址表项保留 30s 供反向解析，过期与 5s 周期清理兜底，不会跨探测累积。出口 socket 报错时即使 raw socket 不可用也会补一条
 同样的回复，不会让客户端超时。
