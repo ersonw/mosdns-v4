@@ -54,6 +54,17 @@ func (p *FakeIPNatPlugin) setupTunEgress() {
 		p.tunEgressCleanup = cleanup
 	}
 	p.prepareDirectEgress()
+	// The outlet now has its device (and, on linux, its range source); rewrite
+	// that source on the way out so the gateway can route the answer back.
+	if cleanup, ok := p.installTunSNAT(ctx); ok {
+		prev := p.tunEgressCleanup
+		p.tunEgressCleanup = func() {
+			if prev != nil {
+				prev()
+			}
+			cleanup()
+		}
+	}
 }
 
 // prepareDirectEgress binds the direct outlet to the range address and the
