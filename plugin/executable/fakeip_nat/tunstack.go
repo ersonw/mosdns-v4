@@ -76,11 +76,28 @@ type tunStack struct {
 	// registered on the NIC so packets sent to it are delivered locally instead
 	// of being treated as traffic for a fake IP.
 	local netip.Addr
+	// virtualSrc maps an address to the virtual one it is shown as. It is used
+	// when this device answers as a hop: a reply whose source is the device's
+	// own address is dropped by the receiving kernel as a martian source, so the
+	// device answers as a stand-in address of the range, whose PTR record names
+	// the device (see hopFakeFor). A nil hook answers with the bare address.
+	virtualSrc func(netip.Addr) (netip.Addr, bool)
 	// dev is the device the write loop writes to. ICMP replies built outside
 	// the stack (echo relay, error relay) use writeOut, so both writers share
 	// one mutex.
 	dev     tunDevice
 	writeMu sync.Mutex
+}
+
+// answerSource picks the address a reply built by this device is sent from.
+func (t *tunStack) answerSource(addr netip.Addr) netip.Addr {
+	if t.virtualSrc == nil || !addr.IsValid() {
+		return addr
+	}
+	if v, ok := t.virtualSrc(addr); ok {
+		return v
+	}
+	return addr
 }
 
 // resolveTunMTU picks the MTU of the tun device: an explicit tun_mtu wins,
@@ -166,14 +183,20 @@ func (t *tunStack) precheck(pkt []byte) (reply []byte, drop bool) {
 	if dst == t.local {
 		// The device runs no UDP services, so a probe to it has to be refused
 		// like a host without a listener would; otherwise traceroute's UDP
-		// probes reach the fake-ip allocator and log "not allocated".
+		// probes reach the fake-ip allocator and log "not allocated". This
+		// answer names the device itself as the destination, so it keeps the
+		// device address: the client is probing this address.
 		if pkt[9] == protoUDP {
 			return buildICMPPortUnreachable(t.local, src, pkt[:total]), true
 		}
 		return nil, false
 	}
 	if pkt[8] <= 1 {
-		return buildICMPTimeExceeded(t.local, src, pkt[:total]), true
+		// Answered as a hop, so the source has to be a stand-in address: the
+		// receiving host drops an ICMP error whose source is one of its own
+		// addresses (martian source), which is why the bare device address
+		// never shows up as the first hop.
+		return buildICMPTimeExceeded(t.answerSource(t.local), src, pkt[:total]), true
 	}
 	return nil, false
 }

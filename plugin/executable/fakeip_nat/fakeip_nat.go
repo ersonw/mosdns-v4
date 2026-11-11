@@ -576,6 +576,10 @@ func (p *FakeIPNatPlugin) startTunDataPath() error {
 		return err
 	}
 	st.dev = dev
+	// The device answers a traceroute probe as a hop, so it must speak as a
+	// stand-in address of the range: its own address is dropped by the
+	// receiving host as a martian source.
+	st.virtualSrc = p.hopFakeFor
 	p.L().Debug("fakeip nat: userspace stack created",
 		zap.Uint32("mtu", st.mtu), zap.Int("nic_id", int(st.nicID)))
 	p.startStack(st)

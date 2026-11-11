@@ -141,6 +141,12 @@ TCP、UDP、ICMP echo 三者都按 **SNAT（地址翻译）** 处理，而不是
 第 1 跳就显示到达。TTL 为 1 且目的不是段首的包由插件构造 ICMP time exceeded。
 目的既不是段首、又从 `<prefix>_mapping` 查不到真实 IP 的包不回（客户端超时）。
 
+**第 1 跳为什么不能直接用段首地址**：回包的源地址若是段首（也就是客户端自己的本地地址，
+`198.18.0.1`），Linux 的输入路由会按 martian source 直接丢弃，`traceroute` 只能显示 `*`。
+所以这一跳和后面的跳一样走虚拟化：源地址取段内一个替身地址，它的 PTR 记录返回
+`<段首地址>.<hop_name_suffix>`，于是第 1 跳显示成 `198.18.0.1.mosdns (198.19.240.7)`。
+本机探测和下游探测因此看到同一种形式。
+
 **UDP**：`relayUDP` 用用户态栈终止一个 UDP 流后按目标拨号，回包再改写回客户端。流表按
 5 元组复用（TTL 2 分钟、上限 8192）。出口 socket 报错时按 errno 生成 ICMP 错误回给客户端：
 `ECONNREFUSED → type 3 code 3`、`EHOSTUNREACH → 3/1`、`ENETUNREACH → 3/0`；即使 raw socket
@@ -151,7 +157,9 @@ socket 以真实 IP 为源重新发出去，标识/序列号改写并登记在 `
 回包（echo reply）按表项改回假 IP 后注入 tun，所以 `ping <假 IP>` 得到的是真实主机的回包。
 
 **ICMP 错误**：真实路由器返回的 port unreachable / time exceeded 由 raw socket 读回，按其
-引用的传输头定位客户端流，源地址改写成假 IP 后回给客户端。引用报文必须是客户端**实际发出的
+引用的传输头定位客户端流。**time exceeded 来自路上的路由器，按跳虚拟化**（源地址换成段内
+替身地址，PTR 返回真实路由器地址 + 后缀），和 `probeReply` 走同一条虚拟化逻辑；port/host
+unreachable 来自目的地本身，保留真实地址不动。引用报文必须是客户端**实际发出的
 那份**：至少要含 IP 头 + 8 字节传输头（`buildICMPError` 对更短的引用直接放弃），否则
 macOS/XNU 的 `icmp_input` 会按 `bad length` 丢弃——这正是早期 traceroute 全 `*` 的原因。
 

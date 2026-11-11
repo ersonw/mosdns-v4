@@ -5,11 +5,14 @@ package fakeipnat
 //   - echo requests addressed to a fake ip are forwarded to the real ip the
 //     fake ip is mapped to, and the reply is rewritten back to the fake ip;
 //   - ICMP errors produced by the outlet (port unreachable from the far end,
-//     time exceeded from a router on the way) are relayed to the client with
-//     the address they actually came from, never with the fake ip;
+//     time exceeded from a router on the way) are relayed to the client: a time
+//     exceeded answer is shown as a virtual hop of this range whose PTR record
+//     names the real router, everything else keeps the address it came from;
 //   - a traceroute probe is answered by probing the real path itself, and the
 //     hop is shown as a virtual address of this range whose PTR record names
-//     the real hop.
+//     the real hop;
+//   - a probe that expires at this device itself is answered as the first hop,
+//     also under a virtual address, so the device shows up like any other hop.
 //
 // Both need a raw ICMP socket: the upstream UDP socket only reports an error
 // as a failed read and carries no address, and the userspace stack never
@@ -337,7 +340,9 @@ func (p *FakeIPNatPlugin) relayEchoReply(src *net.IPAddr, msg []byte) {
 }
 
 // relayICMPError forwards an ICMP error to the client that owns the quoted
-// UDP packet, keeping the address the error came from as the reply source.
+// UDP packet. A time exceeded answer comes from a router, so its source is
+// virtualized exactly like a probe answer; a port/host unreachable answer comes
+// from the destination itself and keeps the address the client asked for.
 func (p *FakeIPNatPlugin) relayICMPError(src *net.IPAddr, msg []byte) {
 	if len(msg) < icmpHeaderLen+ipv4HeaderMinLen {
 		return
@@ -354,7 +359,8 @@ func (p *FakeIPNatPlugin) relayICMPError(src *net.IPAddr, msg []byte) {
 	if !ok {
 		return
 	}
-	reply := buildICMPError(addrOf(src), flow.client, buildClientUDPQuote(flow), typ, code)
+	from := p.hopSource(addrOf(src), typ)
+	reply := buildICMPError(from, flow.client, buildClientUDPQuote(flow), typ, code)
 	if reply == nil {
 		return
 	}
@@ -363,8 +369,24 @@ func (p *FakeIPNatPlugin) relayICMPError(src *net.IPAddr, msg []byte) {
 		return
 	}
 	p.L().Debug("tun icmp: error relayed to client",
-		zap.String("from", src.String()), zap.Uint8("type", typ), zap.Uint8("code", code),
+		zap.String("from", src.String()), zap.String("shown_as", from.String()),
+		zap.Uint8("type", typ), zap.Uint8("code", code),
 		zap.String("client", flow.client.String()), zap.String("fake_ip", flow.fakeIP.String()))
+}
+
+// hopSource returns the address a hop error is shown as. A time exceeded error
+// names a router on the way, so it is virtualized the same way a probe answer
+// is: every hop then appears as an address of this range with a PTR record that
+// reads "<real hop>.<suffix>". Any other error names the endpoint itself and
+// keeps its real address, which is what the client asked for.
+func (p *FakeIPNatPlugin) hopSource(real netip.Addr, typ uint8) netip.Addr {
+	if typ != icmpTimeExceeded || !real.Is4() || p.isFakeAddr(real) {
+		return real
+	}
+	if virtual, ok := p.hopFakeFor(real); ok {
+		return virtual
+	}
+	return real
 }
 
 // rememberClientQuote keeps the header of a UDP packet the client just sent.
@@ -763,7 +785,8 @@ func (p *FakeIPNatPlugin) sendICMPErrorFromTarget(st *tunStack, flow icmpFlow, t
 	if err != nil {
 		return
 	}
-	pkt := buildICMPError(src, flow.client, buildClientUDPQuote(flow), typ, code)
+	from := p.hopSource(src, typ)
+	pkt := buildICMPError(from, flow.client, buildClientUDPQuote(flow), typ, code)
 	if pkt == nil {
 		return
 	}
@@ -772,7 +795,8 @@ func (p *FakeIPNatPlugin) sendICMPErrorFromTarget(st *tunStack, flow icmpFlow, t
 		return
 	}
 	p.L().Debug("tun icmp: error answered from the target",
-		zap.String("from", src.String()), zap.Uint8("type", typ), zap.Uint8("code", code),
+		zap.String("from", src.String()), zap.String("shown_as", from.String()),
+		zap.Uint8("type", typ), zap.Uint8("code", code),
 		zap.String("client", flow.client.String()))
 }
 
