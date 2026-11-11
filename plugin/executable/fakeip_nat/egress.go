@@ -519,6 +519,10 @@ func (e *trojanEgress) Probe(ctx context.Context) error {
 	}
 	// A completed TLS handshake already proves the endpoint and the certificate
 	// are usable; trojan has no plaintext handshake to verify.
+	//
+	// Closing without a header is deliberate: the server logs one "failed to
+	// read hash | EOF" and pushes the connection to its TLS fallback for every
+	// startup. That pair of lines is expected noise, not a broken outlet.
 	return c.Close()
 }
 

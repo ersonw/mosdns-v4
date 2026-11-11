@@ -243,7 +243,11 @@ func (p *FakeIPNatPlugin) startICMPRelay(ctx context.Context, st *tunStack) {
 	r := newICMPRelay(st.writeOut)
 	conn, err := listenRawICMP()
 	if err != nil {
-		p.L().Debug("tun icmp: raw icmp socket unavailable, icmp relay disabled", zap.Error(err))
+		// Warn, not Debug: without this socket ping and traceroute silently
+		// stop working while TCP/UDP keep flowing, and at info level the only
+		// hint would be missing.
+		p.L().Warn("tun icmp: raw icmp socket unavailable, ping and traceroute are disabled",
+			zap.Error(err), zap.String("hint", "needs root or CAP_NET_RAW"))
 		return
 	}
 	r.conn = conn
