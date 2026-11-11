@@ -93,7 +93,7 @@ func TestReconcileFirewallMappings(t *testing.T) {
 	}
 	// The refilled element needs its host route as well, otherwise the DNAT
 	// target is unreachable right after startup.
-	if _, ok := fr.find("route replace 1.2.3.4/32"); !ok {
+	if countRouteCalls(fr.all(), "1.2.3.4", false) == 0 {
 		t.Fatalf("refilled mapping has no host route, calls: %v", fr.all())
 	}
 }

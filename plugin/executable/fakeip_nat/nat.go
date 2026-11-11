@@ -235,20 +235,18 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 		p.L().Debug("fakeip nat: host route skipped, no next hop and no device", zap.String("real_ip", ip))
 		return
 	}
-	args := []string{"route", "replace", ip + "/32"}
-	if hop != "" {
-		args = append(args, "via", hop)
-	}
-	if dev != "" {
-		args = append(args, "dev", dev)
-	}
-	if p.routeTable != "" && p.routeTable != "main" {
-		args = append(args, "table", p.routeTable)
-	}
-	if _, err := p.runner.Run(ctx, "ip", args...); err != nil {
-		p.L().Warn("apply host route failed",
-			zap.String("real_ip", ip), zap.String("route_table", p.routeTable), zap.Strings("cmd", args), zap.Error(err))
+	commands := routeWriteCommands(ip+"/32", hop, dev, p.routeTable)
+	if len(commands) == 0 {
+		p.L().Debug("fakeip nat: host route skipped, platform has no usable route command",
+			zap.String("real_ip", ip), zap.String("next_hop", hop), zap.String("dev", dev))
 		return
+	}
+	for _, cmd := range commands {
+		if _, err := p.runner.Run(ctx, cmd[0], cmd[1:]...); err != nil {
+			p.L().Warn("apply host route failed",
+				zap.String("real_ip", ip), zap.String("route_table", p.routeTable), zap.Strings("cmd", cmd), zap.Error(err))
+			return
+		}
 	}
 	p.L().Debug("fakeip nat: host route applied",
 		zap.String("real_ip", ip), zap.String("next_hop", hop), zap.String("dev", dev),
@@ -363,16 +361,16 @@ func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []
 // batch of /32 with wider blocks, and the blocks themselves are what a stopped
 // plugin has to remove again.
 func (p *FakeIPNatPlugin) deleteManagedRoutes(ctx context.Context, prefixes []string) int {
-	withTable := func(args []string) []string {
-		if p.routeTable != "" && p.routeTable != "main" {
-			return append(args, "table", p.routeTable)
-		}
-		return args
-	}
 	deleted := 0
 	for _, prefix := range prefixes {
-		if _, err := p.runner.Run(ctx, "ip", withTable([]string{"route", "delete", prefix})...); err == nil {
-			deleted++
+		commands := routeDeleteCommands(prefix, p.routeTable)
+		if len(commands) == 0 {
+			continue
+		}
+		for _, cmd := range commands {
+			if _, err := p.runner.Run(ctx, cmd[0], cmd[1:]...); err == nil {
+				deleted++
+			}
 		}
 	}
 	return deleted
@@ -394,9 +392,18 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	p.natMu.Lock()
 	defer p.natMu.Unlock()
 
+	// Only routes that cover an address this plugin is responsible for are
+	// removed. A plain gateway/dev filter would also match routes the operator
+	// configured by hand, and deleting those on shutdown would break the host.
+	known := p.knownRealIPs(ctx)
 	routesDeleted := 0
 	if hop != "" || dev != "" {
-		routesDeleted = p.deleteManagedRoutes(ctx, p.listManagedRoutes(ctx, hop, dev))
+		for _, prefix := range p.listManagedRoutes(ctx, hop, dev) {
+			if !prefixCoversAny(prefix, known) {
+				continue
+			}
+			routesDeleted += p.deleteManagedRoutes(ctx, []string{prefix})
+		}
 	}
 
 	tableDeleted := false
@@ -409,6 +416,47 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	p.L().Info("fakeip nat: data path cleaned up",
 		zap.Int("routes_deleted", routesDeleted), zap.Bool("nft_table_deleted", tableDeleted),
 		zap.String("next_hop", hop), zap.String("dev", dev))
+}
+
+// knownRealIPs returns the real addresses this plugin is responsible for: the
+// ones it routed in realip mode, or the DNAT targets of the fake-ip map.
+func (p *FakeIPNatPlugin) knownRealIPs(ctx context.Context) []netip.Addr {
+	if p.realIP {
+		var out []netip.Addr
+		p.realMu.Lock()
+		for ip := range p.realRoutes {
+			if addr, err := netip.ParseAddr(ip); err == nil {
+				out = append(out, addr)
+			}
+		}
+		p.realMu.Unlock()
+		return out
+	}
+	if p.useTun {
+		return nil
+	}
+	var out []netip.Addr
+	for _, real := range p.nftMappings(ctx, p.nftTableName()) {
+		if addr, err := netip.ParseAddr(real); err == nil {
+			out = append(out, addr)
+		}
+	}
+	return out
+}
+
+// prefixCoversAny reports whether the prefix contains at least one of the
+// addresses. It keeps the cleanup step from touching unrelated routes.
+func prefixCoversAny(prefix string, ips []netip.Addr) bool {
+	pfx, err := netip.ParsePrefix(prefix)
+	if err != nil || !pfx.Addr().Is4() {
+		return false
+	}
+	for _, ip := range ips {
+		if pfx.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // syncRealRoutes installs a /32 host route for every real ip of a resolution

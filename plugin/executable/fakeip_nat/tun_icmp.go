@@ -717,7 +717,7 @@ func listenProbeSocket(ttl int) (*net.UDPConn, error) {
 	}
 	var serr error
 	if cerr := raw.Control(func(fd uintptr) {
-		serr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+		serr = setsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
 	}); cerr != nil {
 		_ = conn.Close()
 		return nil, cerr

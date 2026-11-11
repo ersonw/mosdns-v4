@@ -9,6 +9,36 @@ import (
 	"go.uber.org/zap"
 )
 
+// supportsNamedRouteTable reports whether the platform can write into a table
+// other than main with the same command shape.
+func supportsNamedRouteTable() bool { return true }
+
+// routeWriteCommands installs one route. A named table is expressed with the
+// "table" keyword, which is why linux keeps the single-table and multi-table
+// cases on one branch.
+func routeWriteCommands(prefix, hop, dev, table string) [][]string {
+	args := []string{"route", "replace", prefix}
+	if hop != "" {
+		args = append(args, "via", hop)
+	}
+	if dev != "" {
+		args = append(args, "dev", dev)
+	}
+	if table != "" && table != "main" {
+		args = append(args, "table", table)
+	}
+	return [][]string{append([]string{"ip"}, args...)}
+}
+
+// routeDeleteCommands removes one route.
+func routeDeleteCommands(prefix, table string) [][]string {
+	args := []string{"route", "delete", prefix}
+	if table != "" && table != "main" {
+		args = append(args, "table", table)
+	}
+	return [][]string{append([]string{"ip"}, args...)}
+}
+
 // listManagedRoutes returns the IPv4 prefixes in the routing table that steer
 // traffic to the configured gateway. The scan is deliberately conservative: a
 // route is only a candidate when the hop (if configured) and the device appear

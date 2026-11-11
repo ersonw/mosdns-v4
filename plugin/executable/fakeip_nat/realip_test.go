@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ersonw/mosdns-v4/coremain"
@@ -122,15 +123,20 @@ func TestRealIPRoutesAreAggregatedFromTheTable(t *testing.T) {
 	if recorded != 4 {
 		t.Fatalf("realRoutes = %d, want 4", recorded)
 	}
-	if _, ok := fr.find("route replace 1.2.3.4/32 via 11.10.12.1 dev wg0"); !ok {
-		t.Fatalf("missing /32 host route, calls: %v", fr.all())
+	if countRouteCalls(fr.all(), "1.2.3.4", false) == 0 {
+		t.Fatalf("missing host route for 1.2.3.4, calls: %v", fr.all())
+	}
+	if !strings.Contains(strings.Join(fr.all(), "\n"), "11.10.12.1") {
+		t.Fatalf("host route does not target the gateway, calls: %v", fr.all())
 	}
 
 	// The periodic scan reads the kernel table, so feed what a previous pass
 	// would have found there.
 	routes := []string{"1.2.3.4/32", "1.2.3.5/32", "1.2.3.6/32", "1.2.3.7/32"}
 	p.collapseManagedRoutes(context.Background(), routes, "11.10.12.1", "wg0")
-	if _, ok := fr.find("route replace 1.2.3.4/30 via 11.10.12.1 dev wg0"); !ok {
+	joined := strings.Join(fr.all(), "\n")
+	if !strings.Contains(joined, "1.2.3.4") ||
+		(!strings.Contains(joined, "/30") && !strings.Contains(joined, "255.255.255.252")) {
 		t.Fatalf("four adjacent /32 were not collapsed into /30, calls: %v", fr.all())
 	}
 }

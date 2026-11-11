@@ -241,6 +241,13 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if !validRouteTable.MatchString(cfg.RouteTable) {
 		return nil, fmt.Errorf("invalid route_table %q: only alphanumeric, underscore, dot and dash allowed", cfg.RouteTable)
 	}
+	// BSD/macOS and Windows expose a single routing table, so a named table
+	// falls back to the main one instead of silently failing every write.
+	if cfg.RouteTable != "main" && !supportsNamedRouteTable() {
+		bp.L().Warn("route_table is only supported on linux, falling back to the main table",
+			zap.String("route_table", cfg.RouteTable))
+		cfg.RouteTable = "main"
+	}
 	if cfg.HopNameSuffix == "" {
 		// Reuse the table prefix so a deployment names its hops after its
 		// own table; underscores become dashes to keep the label legal.

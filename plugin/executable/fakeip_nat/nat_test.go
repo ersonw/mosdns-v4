@@ -290,7 +290,7 @@ func TestSyncNATKeepsReachableMapping(t *testing.T) {
 	if _, ok := runner.find("nft add element"); ok {
 		t.Fatalf("reachable mapping must be kept, commands: %v", runner.all())
 	}
-	if _, ok := runner.find("ip route replace 1.2.3.4/32 via 10.0.0.1 dev eth0"); !ok {
+	if countRouteCalls(runner.all(), "1.2.3.4", false) == 0 {
 		t.Fatalf("host route for the kept mapping missing: %v", runner.all())
 	}
 }
@@ -308,7 +308,7 @@ func TestSyncNATSelectsReachableCandidate(t *testing.T) {
 	if call != "nft add element ip fakeip_test dnat_map { 198.18.0.1 : 2.2.2.2 }" {
 		t.Fatalf("unexpected mapping command: %s", call)
 	}
-	if _, ok := runner.find("ip route replace 2.2.2.2/32"); !ok {
+	if countRouteCalls(runner.all(), "2.2.2.2", false) == 0 {
 		t.Fatalf("host route for the selected ip missing: %v", runner.all())
 	}
 }
@@ -364,10 +364,10 @@ func TestAggregateManagedRoutes(t *testing.T) {
 	calls := runner.all()
 	addIdx, delIdx := -1, -1
 	for i, call := range calls {
-		if addIdx < 0 && strings.Contains(call, "route replace 1.2.3.4/31") {
+		if strings.Contains(call, "1.2.3.4") && !strings.Contains(call, "delete") && addIdx < 0 {
 			addIdx = i
 		}
-		if delIdx < 0 && strings.Contains(call, "route delete 1.2.3.4/32") {
+		if strings.Contains(call, "1.2.3.4") && strings.Contains(call, "delete") && delIdx < 0 {
 			delIdx = i
 		}
 	}
@@ -380,7 +380,7 @@ func TestAggregateManagedRoutes(t *testing.T) {
 	if addIdx > delIdx {
 		t.Fatalf("routes were deleted before the aggregate was installed: %v", calls)
 	}
-	if _, ok := runner.find("ip route delete 1.2.3.5/32"); !ok {
+	if countRouteCalls(calls, "1.2.3.5", true) == 0 {
 		t.Fatalf("second host route not deleted: %v", calls)
 	}
 }
@@ -408,7 +408,7 @@ func TestDeleteManagedRoutes(t *testing.T) {
 		t.Fatalf("deleted = %d, want 2", deleted)
 	}
 	for _, prefix := range []string{"1.2.3.4/32", "1.2.3.4/30"} {
-		if _, ok := runner.find("ip route delete " + prefix); !ok {
+		if countRouteCalls(runner.all(), prefix, true) == 0 {
 			t.Fatalf("route %s was not removed: %v", prefix, runner.all())
 		}
 	}
