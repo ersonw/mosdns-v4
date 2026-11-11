@@ -113,6 +113,9 @@ type icmpRelay struct {
 	probes map[uint16]*probeEntry
 	nextID uint16
 	write  func([]byte) error
+	// sendHook replaces the raw socket write in tests, so the forwarding path
+	// can be observed without a privileged socket.
+	sendHook func([]byte, netip.Addr) error
 }
 
 func newICMPRelay(write func([]byte) error) *icmpRelay {
@@ -232,6 +235,9 @@ func (r *icmpRelay) sweepProbe(now time.Time) int {
 }
 
 func (r *icmpRelay) send(pkt []byte, dst netip.Addr) error {
+	if r.sendHook != nil {
+		return r.sendHook(pkt, dst)
+	}
 	if r.conn == nil {
 		return syscall.ENOTCONN
 	}
@@ -254,6 +260,17 @@ func (p *FakeIPNatPlugin) startICMPRelay(ctx context.Context, st *tunStack) {
 		return
 	}
 	r.conn = conn
+	// Everything this socket sends is ICMP the operator wants on the configured
+	// path: hop probes and echo relays must leave through next_hop_dev, not
+	// through whatever the system default route picks.
+	if dev := p.nextHopDev; dev != "" {
+		if berr := bindConnToDevice(conn, dev); berr != nil {
+			p.L().Info("tun icmp: icmp socket stays on the system route",
+				zap.String("dev", dev), zap.Error(berr))
+		} else {
+			p.L().Debug("tun icmp: icmp socket bound to device", zap.String("dev", dev))
+		}
+	}
 	p.icmpMu.Lock()
 	p.icmp = r
 	p.icmpMu.Unlock()
@@ -654,7 +671,7 @@ func (p *FakeIPNatPlugin) probeHop(flow icmpFlow, realIP netip.Addr, ttl int) {
 	if r == nil {
 		return
 	}
-	conn, err := listenProbeSocket(ttl)
+	conn, err := listenProbeSocket(ttl, p.nextHopDev)
 	if err != nil {
 		p.L().Debug("tun icmp: open hop probe socket failed", zap.Int("ttl", ttl), zap.Error(err))
 		return
@@ -734,7 +751,11 @@ func (p *FakeIPNatPlugin) probeReply(src *net.IPAddr, msg []byte) bool {
 
 // listenProbeSocket opens an unconnected UDP socket whose IPv4 TTL is fixed,
 // so the probe expires exactly at the requested hop.
-func listenProbeSocket(ttl int) (*net.UDPConn, error) {
+// listenProbeSocket opens an unconnected UDP socket whose IPv4 TTL is fixed, so
+// the probe expires exactly at the requested hop. When a device is configured
+// the socket is pinned to it, so the probe walks the path the operator chose
+// instead of the system default route.
+func listenProbeSocket(ttl int, dev string) (*net.UDPConn, error) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		return nil, err
@@ -746,7 +767,10 @@ func listenProbeSocket(ttl int) (*net.UDPConn, error) {
 	}
 	var serr error
 	if cerr := raw.Control(func(fd uintptr) {
-		serr = setsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl)
+		if serr = setsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_TTL, ttl); serr != nil {
+			return
+		}
+		serr = bindSocketToDevice(fd, dev)
 	}); cerr != nil {
 		_ = conn.Close()
 		return nil, cerr
@@ -756,6 +780,23 @@ func listenProbeSocket(ttl int) (*net.UDPConn, error) {
 		return nil, serr
 	}
 	return conn, nil
+}
+
+// bindConnToDevice pins a socket to one interface. It runs on the socket's own
+// descriptor, so the same helper covers the raw ICMP socket and the probe
+// sockets.
+func bindConnToDevice(conn interface {
+	SyscallConn() (syscall.RawConn, error)
+}, dev string) error {
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var serr error
+	if cerr := raw.Control(func(fd uintptr) { serr = bindSocketToDevice(fd, dev) }); cerr != nil {
+		return cerr
+	}
+	return serr
 }
 
 func (p *FakeIPNatPlugin) stopICMPRelay() {
@@ -838,11 +879,6 @@ func (p *FakeIPNatPlugin) handleICMPEcho(st *tunStack, pkt []byte) bool {
 }
 
 func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Addr, clientID, seq uint16, payload []byte) {
-	if !p.icmpRelayActive() {
-		p.L().Debug("tun icmp: echo request dropped, icmp relay is disabled",
-			zap.String("fake_ip", fakeIP.String()))
-		return
-	}
 	target, err := p.realTarget(fakeIP.String(), 0)
 	if err != nil {
 		p.L().Debug("tun icmp: no route for fake ip",
@@ -866,6 +902,20 @@ func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Add
 			zap.String("fake_ip", fakeIP.String()), zap.String("real_ip", realIP.String()))
 		return
 	}
+	if p.proxyActive {
+		// A proxy outlet carries no ICMP: socks5 offers CONNECT, BIND and UDP
+		// ASSOCIATE, http only CONNECT, trojan only CONNECT and UDP ASSOCIATE.
+		// The echo can never leave through the proxy, so forwarding it would
+		// only time out; the device answers as the destination it stands in for.
+		// This needs no raw socket, so ping keeps working without CAP_NET_RAW.
+		p.answerEchoLocally(st, client, fakeIP, clientID, seq, payload)
+		return
+	}
+	if !p.icmpRelayActive() {
+		p.L().Debug("tun icmp: echo request dropped, icmp relay is disabled",
+			zap.String("fake_ip", fakeIP.String()))
+		return
+	}
 	r := p.icmp
 	id := r.newEchoID()
 	r.addEcho(id, &echoPending{
@@ -882,6 +932,22 @@ func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Add
 	}
 	p.L().Debug("tun icmp: echo forwarded",
 		zap.String("fake_ip", fakeIP.String()), zap.String("real_ip", realIP.String()), zap.Uint16("seq", seq))
+}
+
+// answerEchoLocally replies to an echo request on behalf of the destination.
+// It is what a proxied outlet needs: no proxy protocol carries ICMP, so there
+// is no way to learn whether the real host would answer. The reply keeps the
+// client's identifier, sequence number and payload, so ping reports a round
+// trip of this device rather than of an unreachable host.
+func (p *FakeIPNatPlugin) answerEchoLocally(st *tunStack, client, fakeIP netip.Addr, clientID, seq uint16, payload []byte) {
+	pkt := buildICMPEchoIPv4(icmpEchoReply, fakeIP, client, clientID, seq, payload)
+	if err := st.writeOut(pkt); err != nil {
+		p.L().Warn("tun icmp: write local echo reply failed", zap.Error(err))
+		return
+	}
+	p.L().Debug("tun icmp: echo answered locally, a proxy carries no icmp",
+		zap.String("fake_ip", fakeIP.String()), zap.String("client", client.String()),
+		zap.Uint16("seq", seq), zap.String("outlet", "proxy"))
 }
 
 // buildICMPEchoPacket builds a bare ICMP echo message (the raw socket adds the

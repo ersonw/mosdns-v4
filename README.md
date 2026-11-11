@@ -52,8 +52,13 @@ TCP 走 CONNECT；UDP 上 socks5 用 RFC 1928 UDP ASSOCIATE、trojan 用流内 u
 `udp_protocols`，为空则直接走宿主机网络（http/https 只有 CONNECT，本来就不承载 UDP）。某个协议这次
 连不上就换下一个，整张列表都失败则直接走宿主机网络（等同没配代理）。若五种全部探测失败，启动日志
 仍然是 `proxy is not usable, falling back to direct egress`。
-ICMP echo 不经过任何代理协议（socks5 / trojan / http 都不承载 ICMP），一律由宿主机的原始套接字发出，
-因此 gost 的协议选择只影响 TCP 与 UDP。
+ICMP echo 不经过任何代理协议（socks5 / trojan / http 都不承载 ICMP）。配了代理时，发往假 IP 的
+echo 请求**由插件本地合成 echo reply**（保留客户端的 id、序列号和 payload），因为转发出去只可能超时：
+这一跳的 `ping` 反映的是本设备而不是真实主机。没有代理时，echo 走宿主机的原始套接字，并把该
+socket 与每次逐跳探测的 UDP socket 一起绑定到 `next_hop_dev`（Linux `SO_BINDTODEVICE`、
+macOS `IP_BOUND_IF`），因此 `ping` 和 `traceroute` 都走 `next_hop`/`next_hop_dev` 指定的路径而不是
+系统默认路由；平台没有这种绑定能力时（例如 FreeBSD/Windows）保持 socket 不绑定，启动日志
+`tun icmp: icmp socket stays on the system route` 说明这一点，不会静默忽略配置。
 
 TUN 数据面没有代理时，出口 socket 需要自己选路并改写源地址。Linux 上插件新建一张专用路由表
 （`tun_route_table`，默认 `100`），写入 `default via <next_hop> dev <next_hop_dev>`，再加一条
@@ -152,9 +157,11 @@ TCP、UDP、ICMP echo 三者都按 **SNAT（地址翻译）** 处理，而不是
 `ECONNREFUSED → type 3 code 3`、`EHOSTUNREACH → 3/1`、`ENETUNREACH → 3/0`；即使 raw socket
 不可用也会注入这一条，客户端不会一直等到超时。
 
-**ICMP echo**：发往假 IP 的 echo request 由 `handleICMPEcho` 拦下（不进栈），用 raw ICMP
-socket 以真实 IP 为源重新发出去，标识/序列号改写并登记在 `echoes` 表（10s 过期）。
-回包（echo reply）按表项改回假 IP 后注入 tun，所以 `ping <假 IP>` 得到的是真实主机的回包。
+**ICMP echo**：发往假 IP 的 echo request 由 `handleICMPEcho` 拦下（不进栈）。配了代理时**本地
+合成 echo reply**（见上文）：代理协议不承载 ICMP，转发出去只会超时。没有代理时才用 raw ICMP
+socket 以真实 IP 为源重新发出去（socket 绑定 `next_hop_dev`），标识/序列号改写并登记在 `echoes`
+表（10s 过期）；回包（echo reply）按表项改回假 IP 后注入 tun，所以 `ping <假 IP>` 得到的是真实
+主机的回包。未分配映射的假 IP 在任何模式下都不回。
 
 **ICMP 错误**：真实路由器返回的 port unreachable / time exceeded 由 raw socket 读回，按其
 引用的传输头定位客户端流。**time exceeded 来自路上的路由器，按跳虚拟化**（源地址换成段内
@@ -164,9 +171,9 @@ unreachable 来自目的地本身，保留真实地址不动。引用报文必�
 macOS/XNU 的 `icmp_input` 会按 `bad length` 丢弃——这正是早期 traceroute 全 `*` 的原因。
 
 **逐跳探测（让 traceroute 全路径都进 tun）**：客户端 TTL 2..30 的 UDP 探针不由本设备代答，
-也不进 netstack 建流。插件取回该探针的 TTL，用同样 TTL 的独立 UDP socket（`IP_TTL`）向真实
-IP 再发一个 32 字节探针，在 `probes` 表里以探测 socket 的本地端口为键记录客户端、引用报文和
-deadline（1.2s）。真实那一跳回的 ICMP time exceeded 由 `probeReply` 命中后：
+也不进 netstack 建流。插件取回该探针的 TTL，用同样 TTL 的独立 UDP socket（`IP_TTL`，同时绑定
+`next_hop_dev`）向真实 IP 再发一个 32 字节探针，在 `probes` 表里以探测 socket 的本地端口为键
+记录客户端、引用报文和 deadline（1.2s）。真实那一跳回的 ICMP time exceeded 由 `probeReply` 命中后：
 1. 给该真实跳分配一个 **段内虚拟地址**（从段尾往下取，跳过已分配给域名的 fake IP，
    同一真实地址复用同一个虚拟地址，上限 256 条）；
 2. 用这个虚拟地址做回包源地址、客户端原探针做引用，构造 ICMP time exceeded 注入 tun。
