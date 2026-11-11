@@ -363,3 +363,34 @@ func TestHopNameSuffixDefaultAndValidation(t *testing.T) {
 		t.Fatalf("hop suffix = %q, want my-pfx", got)
 	}
 }
+
+// TestHopFakeIsStableAcrossProbes pins the deterministic hop mapping: a real hop
+// must get the same virtual address again after its PTR answer consumed the
+// entry, otherwise every traceroute round shows different numbers.
+func TestHopFakeIsStableAcrossProbes(t *testing.T) {
+	p := newTestPlugin(t, "198.18.0.0/16")
+	realA := netip.MustParseAddr("203.0.113.5")
+
+	first, ok := p.hopFakeFor(realA)
+	if !ok {
+		t.Fatalf("no virtual address was handed out")
+	}
+	if _, ok := p.takeHop(first); !ok {
+		t.Fatalf("reverse lookup for %s missed", first)
+	}
+	second, ok := p.hopFakeFor(realA)
+	if !ok {
+		t.Fatalf("no virtual address was handed out on the second probe")
+	}
+	if second != first {
+		t.Fatalf("hop %s moved from %s to %s between probes", realA, first, second)
+	}
+
+	other, ok := p.hopFakeFor(netip.MustParseAddr("203.0.113.6"))
+	if !ok {
+		t.Fatalf("no virtual address was handed out for the second hop")
+	}
+	if other == first {
+		t.Fatalf("two different hops share virtual address %s", first)
+	}
+}

@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"strconv"
@@ -432,9 +433,11 @@ const (
 	hopViewMax = 256
 )
 
-// hopFakeFor returns the virtual address that stands for this real hop. It is
-// picked from the tail of the range so the allocator, which fills from the
-// head, never hands the same address to a domain. The entry expires on its own.
+// hopFakeFor returns the virtual address that stands for this real hop. The
+// offset comes from a hash of the real address, so repeated traceroutes show
+// the same virtual hop for the same real hop and a cached PTR answer keeps
+// matching. A collision (an address owned by a domain, or one another live hop
+// already holds) walks the scan towards lower addresses instead.
 func (p *FakeIPNatPlugin) hopFakeFor(real netip.Addr) (netip.Addr, bool) {
 	if !real.Is4() {
 		return netip.Addr{}, false
@@ -454,7 +457,12 @@ func (p *FakeIPNatPlugin) hopFakeFor(real netip.Addr) (netip.Addr, bool) {
 	}
 	base := p.prefix.Addr().As4()
 	baseUint := uint64(binary.BigEndian.Uint32(base[:]))
-	for off := uint64(0); off+1 < p.maxHosts; off++ {
+	// Offsets 0..maxHosts-2 cover base+maxHosts down to base+2, i.e. every
+	// usable host except the range head that the tun device owns.
+	span := p.maxHosts - 1
+	start := hopOffsetFor(real, span)
+	for i := uint64(0); i < span; i++ {
+		off := (start + i) % span
 		var a [4]byte
 		binary.BigEndian.PutUint32(a[:], uint32(baseUint+p.maxHosts-off))
 		cand := netip.AddrFrom4(a)
@@ -470,6 +478,17 @@ func (p *FakeIPNatPlugin) hopFakeFor(real netip.Addr) (netip.Addr, bool) {
 		return cand, true
 	}
 	return netip.Addr{}, false
+}
+
+// hopOffsetFor maps a real hop address to a stable offset inside the pool.
+func hopOffsetFor(real netip.Addr, span uint64) uint64 {
+	if span == 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	b := real.As4()
+	_, _ = h.Write(b[:])
+	return uint64(h.Sum32()) % span
 }
 
 // trimHops bounds the table: the oldest entries go first.
