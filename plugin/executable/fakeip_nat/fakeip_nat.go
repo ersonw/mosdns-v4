@@ -169,7 +169,10 @@ type FakeIPNatPlugin struct {
 	// socks5 / http / trojan proxy when `proxy` is configured and reachable.
 	egress egressDialer
 	// proxyActive reports whether egress is a proxied outlet. It decides the
-	// target handed to it: the domain when proxied, the real IP when direct.
+	// target handed to it (the domain when proxied, the real IP when direct),
+	// whether the tun SNAT table is installed, and how an echo request is
+	// answered: a proxy cannot carry ICMP, so a proxied outlet answers it
+	// locally and a direct one forwards it to the real host.
 	proxyActive bool
 
 	// Tun outlet routing: a dedicated table keeps the fake range out of the
