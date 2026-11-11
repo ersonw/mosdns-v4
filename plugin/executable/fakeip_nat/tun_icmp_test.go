@@ -261,7 +261,7 @@ func TestProbeReplyRewritesHopAddress(t *testing.T) {
 	if !from.IsValid() || !p.prefix.Contains(from) {
 		t.Fatalf("source = %s, want a virtual address of the range", from)
 	}
-	if real, ok := p.takeHop(from); !ok || real != hop {
+	if real, ok := p.hopOf(from); !ok || real != hop {
 		t.Fatalf("reverse lookup of %s = %s/%v, want the hop %s", from, real, ok, hop)
 	}
 	if got := netip.AddrFrom4([4]byte{written[16], written[17], written[18], written[19]}); got != client {
@@ -314,17 +314,17 @@ func TestHopFakeForSkipsAllocatedAddresses(t *testing.T) {
 	if fake == last {
 		t.Fatalf("virtual address %s was already allocated to a domain", fake)
 	}
-	if real, ok := p.takeHop(fake); !ok || real != hop {
+	if real, ok := p.hopOf(fake); !ok || real != hop {
 		t.Fatalf("reverse lookup = %s/%v, want %s", real, ok, hop)
 	}
-	// The entry is gone after its answer, so a second lookup must miss.
-	if _, ok := p.takeHop(fake); ok {
-		t.Fatalf("hop view survived its answer")
+	// The view must survive the answer: the next probe of the same hop has to
+	// keep the same address so its reverse lookup and the client's line agree.
+	if _, ok := p.hopOf(fake); !ok {
+		t.Fatalf("hop view was dropped by its own answer")
 	}
-	// A later probe gets a fresh entry, and the sweep drops it when nobody
-	// asks for the name.
-	if _, ok := p.hopFakeFor(hop); !ok {
-		t.Fatalf("no virtual address was handed out on the second probe")
+	again, ok := p.hopFakeFor(hop)
+	if !ok || again != fake {
+		t.Fatalf("second probe got %s/%v, want the same %s", again, ok, fake)
 	}
 	if n := p.sweepHops(time.Now().Add(hopViewTTL + time.Second)); n != 1 {
 		t.Fatalf("swept %d hop views, want 1", n)
@@ -375,7 +375,7 @@ func TestHopFakeIsStableAcrossProbes(t *testing.T) {
 	if !ok {
 		t.Fatalf("no virtual address was handed out")
 	}
-	if _, ok := p.takeHop(first); !ok {
+	if _, ok := p.hopOf(first); !ok {
 		t.Fatalf("reverse lookup for %s missed", first)
 	}
 	second, ok := p.hopFakeFor(realA)
@@ -392,5 +392,34 @@ func TestHopFakeIsStableAcrossProbes(t *testing.T) {
 	}
 	if other == first {
 		t.Fatalf("two different hops share virtual address %s", first)
+	}
+}
+
+func TestProbeRoundDropsPreviousHops(t *testing.T) {
+	p := newTestPlugin(t, "198.18.0.0/16")
+	realA := netip.MustParseAddr("203.0.113.5")
+	fake, ok := p.hopFakeFor(realA)
+	if !ok {
+		t.Fatalf("no virtual address was handed out")
+	}
+	start := time.Now()
+	p.beginProbeRoundAt(10, start)
+	p.beginProbeRoundAt(12, start.Add(time.Second))
+	// A longer TTL inside the same round keeps the view.
+	if _, ok := p.hopOf(fake); !ok {
+		t.Fatalf("view was dropped inside the round")
+	}
+	// A shorter TTL after the pause starts the next round and drops it.
+	p.beginProbeRoundAt(2, start.Add(4*time.Second))
+	if _, ok := p.hopOf(fake); ok {
+		t.Fatalf("view of the previous round survived into the next one")
+	}
+	// The same real hop gets a fresh, stable view in the new round.
+	again, ok := p.hopFakeFor(realA)
+	if !ok {
+		t.Fatalf("no virtual address was handed out in the new round")
+	}
+	if _, ok := p.hopOf(again); !ok {
+		t.Fatalf("reverse lookup for %s missed", again)
 	}
 }

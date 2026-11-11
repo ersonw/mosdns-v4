@@ -431,11 +431,40 @@ type hopView struct {
 }
 
 const (
-	// hopViewTTL is only a backstop: the entry is deleted as soon as the
-	// reverse lookup that shows the hop to the client has been answered.
-	hopViewTTL = 5 * time.Second
-	hopViewMax = 256
+	// hopViewTTL is only a backstop: a finished round is dropped as soon as the
+	// next one starts, and this only catches a traceroute that stops without
+	// another following. Long enough that a reply to the client's reverse
+	// lookup, which can lag the probe, still finds the view.
+	hopViewTTL   = 30 * time.Second
+	hopViewMax   = 256
+	// probeRoundGap separates two rounds that walk back to a shorter TTL: a
+	// round climbs from probeMinTTL to probeMaxTTL, so a shorter TTL after a
+	// pause means traceroute started again.
+	probeRoundGap = 2 * time.Second
 )
+
+// beginProbeRound tracks the trace in flight and drops every hop view of the
+// previous round as soon as a new one starts. The client never announces the
+// end of a traceroute, but its probe TTL does: it climbs inside one round and
+// falls back to a shorter value when the next round begins.
+func (p *FakeIPNatPlugin) beginProbeRound(ttl int) {
+	p.beginProbeRoundAt(ttl, time.Now())
+}
+
+func (p *FakeIPNatPlugin) beginProbeRoundAt(ttl int, now time.Time) {
+	p.hopMu.Lock()
+	defer p.hopMu.Unlock()
+	if p.probeTTL > 0 && ttl < p.probeTTL && now.Sub(p.probeAt) > probeRoundGap {
+		// A new round: nothing of the previous one is worth keeping.
+		p.hops = make(map[netip.Addr]hopView)
+		p.hopByReal = make(map[netip.Addr]netip.Addr)
+		p.probeTTL = 0
+	}
+	if ttl > p.probeTTL || now.Sub(p.probeAt) > probeRoundGap {
+		p.probeTTL = ttl
+	}
+	p.probeAt = now
+}
 
 // hopFakeFor returns the virtual address that stands for this real hop. The
 // offset comes from a hash of the real address, so repeated traceroutes show
@@ -516,23 +545,23 @@ func (p *FakeIPNatPlugin) trimHops() {
 	}
 }
 
-// takeHop resolves a virtual hop address back to the real one and drops the
-// entry: the reverse lookup is the last thing a traceroute needs from it, so
-// nothing stays booked once the probe is over.
-func (p *FakeIPNatPlugin) takeHop(addr netip.Addr) (netip.Addr, bool) {
+// hopOf resolves a virtual hop address back to the real one. The view stays
+// booked until hopViewTTL expires: traceroute sends several probes per hop and
+// the reverse lookup may arrive after them, so dropping the entry on the first
+// lookup would hand the next probe a different address and leave the client
+// with a bare address and no name for that hop.
+func (p *FakeIPNatPlugin) hopOf(addr netip.Addr) (netip.Addr, bool) {
 	p.hopMu.Lock()
 	defer p.hopMu.Unlock()
 	v, ok := p.hops[addr]
 	if !ok {
 		return netip.Addr{}, false
 	}
-	delete(p.hops, addr)
-	if p.hopByReal[v.real] == addr {
-		delete(p.hopByReal, v.real)
-	}
 	if time.Since(v.at) > hopViewTTL {
 		return netip.Addr{}, false
 	}
+	// Keep the view alive while the client still asks about it.
+	p.hops[addr] = hopView{real: v.real, at: time.Now()}
 	return v.real, true
 }
 
@@ -591,6 +620,7 @@ func (p *FakeIPNatPlugin) shouldProbe(ttl uint8) bool {
 // the ICMP error that names the hop. The entry is removed when the answer
 // arrives (probeReply) or when the probe times out.
 func (p *FakeIPNatPlugin) probeHop(flow icmpFlow, realIP netip.Addr, ttl int) {
+	p.beginProbeRound(ttl)
 	r := p.currentICMP()
 	if r == nil {
 		return

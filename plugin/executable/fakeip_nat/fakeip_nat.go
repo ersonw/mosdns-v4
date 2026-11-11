@@ -150,11 +150,14 @@ type FakeIPNatPlugin struct {
 
 	// Hop views: a traceroute hop is handed to the client with a virtual
 	// address of this range, and the reverse lookup of that address answers
-	// with the real hop address. Entries expire: the data never outlives the
-	// probe that produced it.
+	// with the real hop address. Views live for one traceroute round: the
+	// probe TTL climbs inside a round and falls back when a new one starts,
+	// which is when the previous round's views are dropped.
 	hopMu     sync.Mutex
 	hops      map[netip.Addr]hopView
 	hopByReal map[netip.Addr]netip.Addr
+	probeTTL  int
+	probeAt   time.Time
 	hopSuffix string
 	// conn tracks the flows of the tun data path so replies can be mapped back
 	// to the client.
@@ -530,7 +533,7 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	// "<real hop> (<virtual ip>)" instead of a bare address.
 	if question.Qtype == dns.TypePTR {
 		if addr, ok := ptrAddr(question.Name); ok {
-			if real, ok := p.takeHop(addr); ok {
+			if real, ok := p.hopOf(addr); ok {
 				resp := new(dns.Msg)
 				resp.SetReply(q)
 				resp.RecursionAvailable = true
