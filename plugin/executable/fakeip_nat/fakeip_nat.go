@@ -490,11 +490,11 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 				resp.RecursionAvailable = true
 				resp.Answer = []dns.RR{&dns.PTR{
 					Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: uint32(hopViewTTL.Seconds())},
-					// A dotted quad is not a valid host name, so the
-					// resolver would throw the answer away and traceroute
-					// would print the bare address. Dashes keep the real hop
-					// readable in the same order as the address.
-					Ptr: strings.ReplaceAll(real.String(), ".", "-") + ".",
+					// A dotted quad on its own is not a valid host name, so
+					// the resolver would throw the answer away and traceroute
+					// would print the bare address. The suffix makes it a
+					// domain while keeping the address readable as-is.
+					Ptr: real.String() + ".mosdns.",
 				}}
 				p.L().Debug("fakeip nat: hop reverse lookup answered",
 					zap.String("name", question.Name), zap.String("virtual_ip", addr.String()), zap.String("real_ip", real.String()))
