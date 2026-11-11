@@ -70,7 +70,13 @@ func (p *FakeIPNatPlugin) listManagedRoutes(ctx context.Context, hop, dev string
 			if !hasField(fields, "via", hop) {
 				continue
 			}
-		} else if !haveField(fields, "via") {
+		} else if dev == "" && !haveField(fields, "via") {
+			// Nothing to filter by: only routes with an explicit gateway count
+			// as managed, so an operator's connected subnet is never touched.
+			// With a device configured the dev match below is the filter, and a
+			// route the plugin wrote without a gateway ("... dev wg0") still
+			// has to be recognised, otherwise it is neither aggregated nor
+			// removed again.
 			continue
 		}
 		if dev != "" && !hasField(fields, "dev", dev) {

@@ -110,11 +110,16 @@ type Args struct {
 
 type FakeIPNatPlugin struct {
 	*coremain.BP
-	db            *sql.DB
-	dbPath        string
-	tablePrefix   string
-	mapTable      string
-	ipTable       string
+	db          *sql.DB
+	dbPath      string
+	tablePrefix string
+	mapTable    string
+	ipTable     string
+	// routesTable is the durable ledger of the prefixes this plugin installed.
+	// A route written by a stopped process is removed again from that record,
+	// not from a scan filtered by hop/device, so cleanup survives a crash and a
+	// configuration change.
+	routesTable   string
 	cidr          string
 	prefix        netip.Prefix
 	maxHosts      uint64 // usable address count inside prefix, broadcast and network excluded
@@ -331,6 +336,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 
 	mapTable := cfg.TablePrefix + "_mapping"
 	ipTable := cfg.TablePrefix + "_real_ips"
+	routesTable := cfg.TablePrefix + "_routes"
 	idxName := "idx_" + cfg.TablePrefix + "_real_ips_domain"
 
 	initSQL := fmt.Sprintf(`
@@ -347,8 +353,15 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		last_seen INTEGER DEFAULT 0,
 		PRIMARY KEY (domain, real_ip)
 	);
+	CREATE TABLE IF NOT EXISTS %s (
+		prefix TEXT PRIMARY KEY,
+		next_hop TEXT DEFAULT '',
+		dev TEXT DEFAULT '',
+		route_table TEXT DEFAULT '',
+		created_at INTEGER DEFAULT 0
+	);
 	CREATE INDEX IF NOT EXISTS %s ON %s(domain);`,
-		mapTable, ipTable, idxName, ipTable,
+		mapTable, ipTable, routesTable, idxName, ipTable,
 	)
 
 	if _, err := db.Exec(initSQL); err != nil {
@@ -383,6 +396,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		tablePrefix:  cfg.TablePrefix,
 		mapTable:     mapTable,
 		ipTable:      ipTable,
+		routesTable:  routesTable,
 		cidr:         cfg.IPv4Range,
 		prefix:       prefix,
 		maxHosts:     maxHosts,
@@ -507,6 +521,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			p.setupTunEgress()
 		}
 	}
+
+	// A previous process may have stopped without cleaning up: a crash, a SIGKILL
+	// or a configuration change all leave host routes behind. They are removed
+	// before the first route of this run is written, so the two never mix.
+	p.sweepResidualRoutes()
 
 	// The NAT data path writes one host route per resolution. A periodic scan
 	// folds them into CIDR blocks; the tun path needs none of that.

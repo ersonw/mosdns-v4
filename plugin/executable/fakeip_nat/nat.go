@@ -39,6 +39,9 @@ const (
 	// is a periodic scan rather than a per-write debounce: routes written before
 	// a restart, or by a resolution that already left memory, are folded too.
 	routeAggInterval = 30 * time.Second
+	// knownRealIPLimit caps the addresses read back from sqlite when a route
+	// sweep needs to recognise the prefixes this plugin owns.
+	knownRealIPLimit = 20000
 )
 
 // nftElementRe extracts "fake : real" pairs from `nft list map` output.
@@ -264,6 +267,9 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 			return
 		}
 	}
+	// The route exists now, so it also has to be on record: this row is what a
+	// later stop, crash or reload deletes.
+	p.rememberManagedRoute(ctx, ip+"/32", hop, dev)
 	p.L().Debug("fakeip nat: host route applied",
 		zap.String("real_ip", ip), zap.String("next_hop", hop), zap.String("dev", dev),
 		zap.String("route_table", p.routeTable))
@@ -289,6 +295,33 @@ func (p *FakeIPNatPlugin) aggregateManagedRoutes() {
 
 	original := p.listManagedRoutes(ctx, hop, dev)
 	p.collapseManagedRoutes(ctx, original, hop, dev)
+	// Aggregation alone only merges: a block whose addresses are no longer
+	// resolved anywhere would stay forever. The prune pass drops exactly those,
+	// so the table converges instead of growing with every expired answer.
+	p.pruneManagedRoutes(ctx, hop, dev)
+}
+
+// pruneManagedRoutes deletes managed routes that no longer cover any address the
+// plugin is responsible for. An empty known set (database and DNAT map both
+// unreadable) skips the pass: deleting on missing evidence would tear down
+// routes that are still in use.
+func (p *FakeIPNatPlugin) pruneManagedRoutes(ctx context.Context, hop, dev string) {
+	known := p.knownRealIPs(ctx)
+	if len(known) == 0 {
+		p.L().Debug("route prune: no known real ip, scan skipped")
+		return
+	}
+
+	pruned := 0
+	for _, prefix := range p.listManagedRoutes(ctx, hop, dev) {
+		if !manageablePrefix(prefix) || prefixCoversAny(prefix, known) {
+			continue
+		}
+		pruned += p.deleteManagedRoutes(ctx, []string{prefix})
+	}
+	if pruned > 0 {
+		p.L().Info("fakeip nat: stale managed routes pruned", zap.Int("routes", pruned), zap.Int("known_real_ips", len(known)))
+	}
 }
 
 // collapseManagedRoutes installs the aggregated blocks of the given route list
@@ -350,6 +383,7 @@ func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []
 		}
 		if _, err := p.runner.Run(ctx, "ip", withTable(args)...); err == nil {
 			added++
+			p.rememberManagedRoute(ctx, pfx.String(), hop, dev)
 		}
 	}
 
@@ -363,6 +397,7 @@ func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []
 		args := []string{"route", "delete", pfx.String()}
 		if _, err := p.runner.Run(ctx, "ip", withTable(args)...); err == nil {
 			deleted++
+			p.forgetManagedRoute(ctx, pfx.String())
 		}
 	}
 
@@ -388,6 +423,9 @@ func (p *FakeIPNatPlugin) deleteManagedRoutes(ctx context.Context, prefixes []st
 				deleted++
 			}
 		}
+		// Gone from the routing table means gone from the ledger too, so a
+		// later sweep does not replay a delete that can no longer succeed.
+		p.forgetManagedRoute(ctx, prefix)
 	}
 	return deleted
 }
@@ -408,6 +446,11 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	p.natMu.Lock()
 	defer p.natMu.Unlock()
 
+	// The ledger is the exact record of what this plugin wrote, so it goes
+	// first: those prefixes are removed even when the configuration changed and
+	// the scan below no longer matches them.
+	ledgerDeleted := p.sweepLedgerRoutes(ctx)
+
 	// Only routes that cover an address this plugin is responsible for are
 	// removed. A plain gateway/dev filter would also match routes the operator
 	// configured by hand, and deleting those on shutdown would break the host.
@@ -415,7 +458,7 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	routesDeleted := 0
 	if hop != "" || dev != "" {
 		for _, prefix := range p.listManagedRoutes(ctx, hop, dev) {
-			if !prefixCoversAny(prefix, known) {
+			if !manageablePrefix(prefix) || !prefixCoversAny(prefix, known) {
 				continue
 			}
 			routesDeleted += p.deleteManagedRoutes(ctx, []string{prefix})
@@ -430,36 +473,78 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	}
 
 	p.L().Info("fakeip nat: data path cleaned up",
-		zap.Int("routes_deleted", routesDeleted), zap.Bool("nft_table_deleted", tableDeleted),
+		zap.Int("ledger_deleted", ledgerDeleted), zap.Int("routes_deleted", routesDeleted),
+		zap.Bool("nft_table_deleted", tableDeleted),
 		zap.String("next_hop", hop), zap.String("dev", dev))
 }
 
 // knownRealIPs returns the real addresses this plugin is responsible for: the
 // ones it routed in realip mode, or the DNAT targets of the fake-ip map.
 func (p *FakeIPNatPlugin) knownRealIPs(ctx context.Context) []netip.Addr {
+	// The database is the durable record: a route written by a previous process
+	// covers an address that only the database still remembers, and without it a
+	// startup sweep would see an empty set and delete nothing.
+	known := make(map[netip.Addr]struct{})
+	add := func(addr netip.Addr) {
+		if addr.IsValid() && addr.Is4() && !p.isFakeAddr(addr) {
+			known[addr] = struct{}{}
+		}
+	}
+	if dbIPs, err := p.dbKnownRealIPs(ctx); err != nil {
+		p.L().Debug("fakeip nat: load known real ips from sqlite failed", zap.Error(err))
+	} else {
+		for _, addr := range dbIPs {
+			add(addr)
+		}
+	}
+
 	if p.realIP {
-		var out []netip.Addr
 		p.realMu.Lock()
 		for ip := range p.realRoutes {
-			if addr, err := netip.ParseAddr(ip); err == nil && !p.isFakeAddr(addr) {
-				out = append(out, addr)
+			if addr, err := netip.ParseAddr(ip); err == nil {
+				add(addr)
 			}
 		}
 		p.realMu.Unlock()
-		return out
+	} else if !p.useTun {
+		for _, real := range p.nftMappings(ctx, p.nftTableName()) {
+			// Only real targets matter for cleanup: a fake ip stored as the value
+			// must not extend the set of prefixes the cleanup step may remove.
+			if addr, err := netip.ParseAddr(real); err == nil {
+				add(addr)
+			}
+		}
 	}
-	if p.useTun {
-		return nil
+
+	out := make([]netip.Addr, 0, len(known))
+	for addr := range known {
+		out = append(out, addr)
 	}
+	return out
+}
+
+// dbKnownRealIPs reads the addresses the plugin recorded while answering. The
+// read is capped: a sweep only needs enough addresses to recognise its own
+// prefixes, and an unbounded scan would stall startup on a large database.
+func (p *FakeIPNatPlugin) dbKnownRealIPs(ctx context.Context) ([]netip.Addr, error) {
+	rows, err := p.db.QueryContext(ctx,
+		fmt.Sprintf("SELECT DISTINCT real_ip FROM %s LIMIT %d", p.ipTable, knownRealIPLimit))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
 	var out []netip.Addr
-	for _, real := range p.nftMappings(ctx, p.nftTableName()) {
-		// Only real targets matter for cleanup: a fake ip stored as the value
-		// must not extend the set of prefixes the cleanup step may remove.
-		if addr, err := netip.ParseAddr(real); err == nil && !p.isFakeAddr(addr) {
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		if addr, err := netip.ParseAddr(raw); err == nil && addr.Is4() {
 			out = append(out, addr)
 		}
 	}
-	return out
+	return out, rows.Err()
 }
 
 // prefixCoversAny reports whether the prefix contains at least one of the
@@ -475,6 +560,19 @@ func prefixCoversAny(prefix string, ips []netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+// manageablePrefix narrows a scanned prefix to the shapes this plugin can have
+// written: a host route, or a block produced by collapsing host routes, which
+// never goes wider than /8. A hand-configured route such as 0.0.0.0/1 through
+// the same gateway covers the same addresses but was not written here and has
+// to stay.
+func manageablePrefix(prefix string) bool {
+	pfx, err := netip.ParsePrefix(prefix)
+	if err != nil || !pfx.Addr().Is4() {
+		return false
+	}
+	return pfx.Bits() >= 8
 }
 
 // syncRealRoutes installs a /32 host route for every real ip of a resolution
