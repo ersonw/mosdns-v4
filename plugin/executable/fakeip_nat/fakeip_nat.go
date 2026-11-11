@@ -102,6 +102,7 @@ type FakeIPNatPlugin struct {
 	ttl           uint32
 	recordTTL     time.Duration
 	retentionStop chan struct{}
+	retentionOnce sync.Once
 	nextHop       string
 	nextHopDev    string
 	mu            sync.Mutex // serializes fake ip allocation

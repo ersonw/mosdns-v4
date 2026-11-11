@@ -2,8 +2,13 @@ package fakeipnat
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/ersonw/mosdns-v4/coremain"
+	"go.uber.org/zap"
 )
 
 func TestParseRecordTTL(t *testing.T) {
@@ -156,5 +161,74 @@ func TestSweptOffsetIsReused(t *testing.T) {
 	}
 	if c != a {
 		t.Fatalf("new domain got %s, want the freed address %s", c, a)
+	}
+}
+
+// TestSweepAgainstSecondWriter exercises the cross-process case: two independent
+// SQLite connections on the same file (which is what two mosdns instances, or a
+// TUI/admin tool, look like), one sweeping while the other allocates. WAL +
+// busy_timeout have to absorb the write lock contention, and the sweep must not
+// lose or delete rows the other connection just created.
+func TestSweepAgainstSecondWriter(t *testing.T) {
+	p := newTestPlugin(t, "198.18.0.0/24")
+	p.recordTTL = 7 * 24 * time.Hour
+
+	bp := coremain.NewBP("test_fakeip_other", PluginType, zap.NewNop(), nil)
+	raw, err := Init(bp, &Args{DBPath: p.dbPath, TablePrefix: "test", IPv4Range: "198.18.0.0/24", RecordTTL: "0"})
+	if err != nil {
+		t.Fatalf("second instance on %s: %v", p.dbPath, err)
+	}
+	other := raw.(*FakeIPNatPlugin)
+	t.Cleanup(func() { _ = other.Close() })
+
+	const stale = 10
+	const fresh = 40
+	old := time.Now().Add(-10 * 24 * time.Hour).Unix()
+	for i := 0; i < stale; i++ {
+		insertRetentionMapping(t, p, fmt.Sprintf("stale%d.example", i),
+			fmt.Sprintf("198.18.0.%d", i+2), old, old)
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() { // the other "process" keeps allocating
+		defer wg.Done()
+		for i := 0; i < fresh; i++ {
+			if _, err := other.db.Exec(
+				"INSERT INTO test_mapping (domain, fake_ip, created_at, last_seen) VALUES (?, ?, ?, ?)",
+				fmt.Sprintf("fresh%d.example", i), fmt.Sprintf("198.18.1.%d", i+2),
+				time.Now().Unix(), time.Now().Unix()); err != nil {
+				t.Errorf("concurrent insert %d: %v", i, err)
+			}
+		}
+		close(done)
+	}()
+
+	go func() { // while the sweep runs in a loop
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				p.sweepRecords(context.Background())
+			}
+		}
+	}()
+
+	wg.Wait()
+	p.sweepRecords(context.Background())
+
+	if n := mappingCount(t, p); n != fresh {
+		t.Fatalf("mapping rows after concurrent sweep = %d, want %d", n, fresh)
+	}
+	for i := 0; i < fresh; i++ {
+		var domain string
+		if err := p.db.QueryRow("SELECT domain FROM test_mapping WHERE fake_ip = ?",
+			fmt.Sprintf("198.18.1.%d", i+2)).Scan(&domain); err != nil {
+			t.Fatalf("row %d created by the other connection is missing: %v", i, err)
+		}
 	}
 }

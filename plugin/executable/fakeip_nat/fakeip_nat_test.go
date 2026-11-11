@@ -15,10 +15,13 @@ func newTestPlugin(t *testing.T, ipv4Range string) *FakeIPNatPlugin {
 	t.Helper()
 	bp := coremain.NewBP("test_fakeip", PluginType, zap.NewNop(), nil)
 	dbPath := filepath.Join(t.TempDir(), "fakeip.db")
+	// RecordTTL "0" keeps the background sweep off in unit tests; a test that
+	// needs it sets p.recordTTL itself and calls sweepRecords directly.
 	p, err := Init(bp, &Args{
 		DBPath:      dbPath,
 		TablePrefix: "test",
 		IPv4Range:   ipv4Range,
+		RecordTTL:   "0",
 	})
 	if err != nil {
 		t.Fatalf("Init(%s) failed: %v", ipv4Range, err)

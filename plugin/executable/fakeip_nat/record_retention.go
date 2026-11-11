@@ -42,18 +42,22 @@ func (p *FakeIPNatPlugin) startRecordRetention() {
 		p.L().Info("fakeip nat: record retention disabled", zap.String("record_ttl", "0"))
 		return
 	}
-	p.retentionStop = make(chan struct{})
-	go p.recordRetentionLoop()
+	stop := make(chan struct{})
+	p.retentionStop = stop
+	go p.recordRetentionLoop(stop)
 	p.L().Info("fakeip nat: record retention started",
 		zap.Duration("record_ttl", p.recordTTL), zap.Duration("interval", p.retentionInterval()))
 }
 
+// stopRecordRetention closes the stop channel exactly once. The loop gets the
+// channel as an argument instead of re-reading the field, otherwise Close racing
+// the loop is a data race.
 func (p *FakeIPNatPlugin) stopRecordRetention() {
-	if p.retentionStop == nil {
-		return
-	}
-	close(p.retentionStop)
-	p.retentionStop = nil
+	p.retentionOnce.Do(func() {
+		if p.retentionStop != nil {
+			close(p.retentionStop)
+		}
+	})
 }
 
 func (p *FakeIPNatPlugin) retentionInterval() time.Duration {
@@ -67,7 +71,7 @@ func (p *FakeIPNatPlugin) retentionInterval() time.Duration {
 	return interval
 }
 
-func (p *FakeIPNatPlugin) recordRetentionLoop() {
+func (p *FakeIPNatPlugin) recordRetentionLoop(stop <-chan struct{}) {
 	// The first pass runs shortly after startup so a long downtime is cleaned
 	// up right away, without blocking Init on a large table.
 	timer := time.NewTimer(5 * time.Second)
@@ -77,7 +81,7 @@ func (p *FakeIPNatPlugin) recordRetentionLoop() {
 
 	for {
 		select {
-		case <-p.retentionStop:
+		case <-stop:
 			return
 		case <-timer.C:
 			p.sweepRecords(context.Background())
