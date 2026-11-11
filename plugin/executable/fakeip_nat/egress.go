@@ -181,6 +181,11 @@ type socks5Egress struct {
 	user      string
 	pass      string
 	remoteDNS bool
+	// fakeRange is the address range this plugin hands out itself. A local
+	// lookup that lands inside it was answered by the plugin's own DNS, so
+	// connecting to that address is pointless: the name is kept and the proxy
+	// resolves it on the far side.
+	fakeRange netip.Prefix
 }
 
 func (e *socks5Egress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -192,8 +197,10 @@ func (e *socks5Egress) DialContext(ctx context.Context, network, addr string) (n
 	}
 
 	// socks5 resolves the target locally, socks5h lets the server resolve it.
+	// The local answer is dropped when it names one of this plugin's own fake
+	// addresses: the proxy would only try to reach a host that does not exist.
 	if !e.remoteDNS {
-		addr = resolveLocally(ctx, addr)
+		addr = e.targetAddr(ctx, addr)
 	}
 
 	var d net.Dialer
@@ -380,6 +387,54 @@ func resolveLocally(ctx context.Context, addr string) string {
 		return addr
 	}
 	return net.JoinHostPort(ips[0].IP.String(), port)
+}
+
+// targetAddr is the address a socks5 CONNECT carries. Local resolution is only
+// trusted when it names something reachable outside this plugin; in fake-ip
+// mode the host resolver is the plugin itself, so a lookup hands back one of
+// its own fake addresses and the domain has to be left for the proxy to
+// resolve.
+func (e *socks5Egress) targetAddr(ctx context.Context, addr string) string {
+	return chooseProxyTarget(addr, resolveLocally(ctx, addr), e.fakeRange)
+}
+
+// chooseProxyTarget prefers the locally resolved address unless it names one of
+// the plugin's own fake addresses, in which case the original name is kept so
+// the proxy resolves it on the far side.
+func chooseProxyTarget(addr, resolved string, fake netip.Prefix) string {
+	if fakeAddressInRange(resolved, fake) {
+		return addr
+	}
+	return resolved
+}
+
+// fakeAddressInRange reports whether target is a literal ip inside the plugin's
+// own range. A name that does not parse as an ip never counts.
+func fakeAddressInRange(target string, fake netip.Prefix) bool {
+	if !fake.IsValid() {
+		return false
+	}
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil || !addr.Is4() {
+		return false
+	}
+	return fake.Contains(addr)
+}
+
+// setFakeRange teaches the socks5 outlet which addresses it must never dial.
+// Only socks5 resolves locally, so the other outlets report false and keep
+// sending the domain unchanged.
+func setFakeRange(d egressDialer, prefix netip.Prefix) bool {
+	e, ok := d.(*socks5Egress)
+	if !ok {
+		return false
+	}
+	e.fakeRange = prefix
+	return true
 }
 
 // httpEgress dials through an HTTP CONNECT proxy.

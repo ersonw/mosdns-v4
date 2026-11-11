@@ -620,6 +620,13 @@ func (p *FakeIPNatPlugin) shouldProbe(ttl uint8) bool {
 // the ICMP error that names the hop. The entry is removed when the answer
 // arrives (probeReply) or when the probe times out.
 func (p *FakeIPNatPlugin) probeHop(flow icmpFlow, realIP netip.Addr, ttl int) {
+	if p.isFakeAddr(realIP) {
+		// Probing an address that only exists inside this plugin cannot name a
+		// real hop, so the probe is skipped instead of waiting for a timeout.
+		p.L().Debug("tun icmp: hop probe target is inside the fake range",
+			zap.String("fake_ip", flow.fakeIP.String()), zap.String("real_ip", realIP.String()))
+		return
+	}
 	p.beginProbeRound(ttl)
 	r := p.currentICMP()
 	if r == nil {
@@ -827,6 +834,13 @@ func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Add
 			p.L().Warn("tun icmp: invalid real ip", zap.String("target", target), zap.Error(err))
 			return
 		}
+	}
+	if p.isFakeAddr(realIP) {
+		// A stale row resolved a fake ip back to another fake ip; echoing there
+		// can only time out, so the request is dropped with a reason.
+		p.L().Debug("tun icmp: echo target is inside the fake range",
+			zap.String("fake_ip", fakeIP.String()), zap.String("real_ip", realIP.String()))
+		return
 	}
 	r := p.icmp
 	id := r.newEchoID()

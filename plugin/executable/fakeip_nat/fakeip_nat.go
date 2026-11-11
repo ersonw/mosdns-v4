@@ -438,6 +438,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		if err != nil {
 			return nil, err
 		}
+		// A socks5 link resolves the target with the host resolver. When this
+		// plugin is also the host's DNS the answer is a fake ip of its own
+		// range, so those answers are dropped and the domain is resolved on the
+		// proxy side instead.
+		if setFakeRange(dialer, prefix) {
+			p.L().Debug("fakeip nat: socks5 outlet keeps the domain when local resolution returns a fake ip",
+				zap.String("range", cfg.IPv4Range))
+		}
 		p.L().Debug("fakeip nat: proxy link parsed",
 			zap.String("proxy", redactProxy(cfg.Proxy)),
 			zap.String("outlet", describeEgress(dialer)),
@@ -930,6 +938,14 @@ func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, real
 			continue
 		}
 		seen[ip] = struct{}{}
+		// An upstream that answered with one of this plugin's own fake
+		// addresses must not be stored as a real ip: every later lookup would
+		// hand that address to an outlet and turn into a dead dial.
+		if p.isFakeAddrString(ip) {
+			p.L().Debug("fakeip nat: dropping fake ip from the real ip list",
+				zap.String("domain", domain), zap.String("real_ip", ip))
+			continue
+		}
 		if n > 0 {
 			b.WriteString(",")
 		}

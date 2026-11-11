@@ -423,6 +423,9 @@ func (p *FakeIPNatPlugin) dialTarget(localAddr string, port uint16) (string, err
 	}
 	if p.proxyActive {
 		target := net.JoinHostPort(domain, strconv.Itoa(int(port)))
+		if p.fakeTarget(target) {
+			return "", fmt.Errorf("outlet target %s is inside the fake range", target)
+		}
 		p.L().Debug("fakeip nat: target resolved via proxy",
 			zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
 		return target, nil
@@ -432,9 +435,48 @@ func (p *FakeIPNatPlugin) dialTarget(localAddr string, port uint16) (string, err
 		return "", err
 	}
 	target := net.JoinHostPort(real.String(), strconv.Itoa(int(port)))
+	if p.fakeTarget(target) {
+		return "", fmt.Errorf("outlet target %s is inside the fake range", target)
+	}
 	p.L().Debug("fakeip nat: target resolved to real ip",
 		zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
 	return target, nil
+}
+
+// isFakeAddr reports whether addr is one of the addresses this plugin itself
+// hands out. Anything stored or resolved that lands inside this range is
+// unusable as a destination: it only exists inside this plugin's own table.
+func (p *FakeIPNatPlugin) isFakeAddr(addr netip.Addr) bool {
+	if !addr.IsValid() || !addr.Is4() {
+		return false
+	}
+	return p.prefix.IsValid() && p.prefix.Contains(addr)
+}
+
+// isFakeAddrString is isFakeAddr for a textual address. A name never counts,
+// even one that cannot be resolved.
+func (p *FakeIPNatPlugin) isFakeAddrString(raw string) bool {
+	addr, err := netip.ParseAddr(raw)
+	if err != nil {
+		return false
+	}
+	return p.isFakeAddr(addr)
+}
+
+// fakeTarget reports whether an outlet target ("host:port") points inside the
+// fake range. Such a target can only come from a broken or stale mapping row,
+// and every outlet fails on it, so it is refused with a reason instead of being
+// dialed.
+func (p *FakeIPNatPlugin) fakeTarget(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return p.isFakeAddr(addr)
 }
 
 // realTarget resolves the fake IP to the most recent real IP. UDP uses it even
@@ -457,6 +499,9 @@ func (p *FakeIPNatPlugin) realTarget(localAddr string, port uint16) (string, err
 		return "", err
 	}
 	target := net.JoinHostPort(real.String(), strconv.Itoa(int(port)))
+	if p.fakeTarget(target) {
+		return "", fmt.Errorf("udp target %s is inside the fake range", target)
+	}
 	p.L().Debug("fakeip nat: udp target resolved to real ip",
 		zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
 	return target, nil

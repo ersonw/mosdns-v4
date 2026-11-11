@@ -186,7 +186,14 @@ func (c *conntrack) allocPortLocked() (uint16, error) {
 func (p *FakeIPNatPlugin) domainForFakeIP(ctx context.Context, fakeIP string) (string, error) {
 	if p.runtime != nil {
 		if domain, ok := p.runtime.domainOf(fakeIP); ok {
-			return domain, nil
+			// A row written by an older build, or by an upstream that answered
+			// with a fake address, can name an address of this range as the
+			// "domain". Handing that to an outlet makes it dial the fake ip.
+			if !p.isFakeAddrString(domain) {
+				return domain, nil
+			}
+			p.L().Warn("fakeip nat: mapping names a fake ip as its domain",
+				zap.String("fake_ip", fakeIP), zap.String("domain", domain))
 		}
 	}
 	var domain string
@@ -200,6 +207,11 @@ func (p *FakeIPNatPlugin) domainForFakeIP(ctx context.Context, fakeIP string) (s
 		p.L().Debug("fakeip nat: lookup fake ip failed", zap.String("fake_ip", fakeIP), zap.Error(err))
 		return "", fmt.Errorf("lookup fake ip %s: %w", fakeIP, err)
 	}
+	if p.isFakeAddrString(domain) {
+		p.L().Warn("fakeip nat: stored mapping names a fake ip as its domain",
+			zap.String("fake_ip", fakeIP), zap.String("domain", domain))
+		return "", fmt.Errorf("%w: %s (domain is inside the fake range)", errNoFakeIPMapping, fakeIP)
+	}
 	if p.runtime != nil {
 		p.runtime.put(domain, fakeIP)
 	}
@@ -207,26 +219,50 @@ func (p *FakeIPNatPlugin) domainForFakeIP(ctx context.Context, fakeIP string) (s
 	return domain, nil
 }
 
-// primaryRealIP picks the most recently observed real ip of a domain.
+// primaryRealIP picks the most recently observed real ip of a domain. Rows
+// inside the plugin's own range are skipped: an upstream that answered with a
+// fake address, or a row written before this guard existed, would otherwise
+// become the destination every outlet is told to reach.
 func (p *FakeIPNatPlugin) primaryRealIP(ctx context.Context, domain string) (netip.Addr, error) {
-	var raw string
-	err := p.db.QueryRowContext(ctx,
-		"SELECT real_ip FROM "+p.ipTable+" WHERE domain = ? ORDER BY last_seen DESC LIMIT 1", domain).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		p.L().Debug("fakeip nat: domain has no recorded real ip", zap.String("domain", domain))
-		return netip.Addr{}, fmt.Errorf("%w: %s", errNoRealIP, domain)
-	}
+	const scanLimit = 64
+	rows, err := p.db.QueryContext(ctx,
+		"SELECT real_ip FROM "+p.ipTable+" WHERE domain = ? ORDER BY last_seen DESC LIMIT ?",
+		domain, scanLimit)
 	if err != nil {
 		p.L().Debug("fakeip nat: lookup real ip failed", zap.String("domain", domain), zap.Error(err))
 		return netip.Addr{}, fmt.Errorf("lookup real ip of %s: %w", domain, err)
 	}
-	addr, err := netip.ParseAddr(raw)
-	if err != nil || !addr.Is4() {
-		p.L().Debug("fakeip nat: stored real ip is invalid", zap.String("domain", domain), zap.String("real_ip", raw))
-		return netip.Addr{}, fmt.Errorf("invalid real ip %q for %s", raw, domain)
+	defer rows.Close()
+
+	var skipped []string
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			p.L().Debug("fakeip nat: scan real ip failed", zap.String("domain", domain), zap.Error(err))
+			return netip.Addr{}, fmt.Errorf("scan real ip of %s: %w", domain, err)
+		}
+		if p.isFakeAddrString(raw) {
+			skipped = append(skipped, raw)
+			continue
+		}
+		addr, err := netip.ParseAddr(raw)
+		if err != nil || !addr.Is4() {
+			p.L().Debug("fakeip nat: stored real ip is invalid",
+				zap.String("domain", domain), zap.String("real_ip", raw))
+			continue
+		}
+		p.L().Debug("fakeip nat: real ip selected", zap.String("domain", domain), zap.String("real_ip", addr.String()))
+		return addr, nil
 	}
-	p.L().Debug("fakeip nat: real ip selected", zap.String("domain", domain), zap.String("real_ip", addr.String()))
-	return addr, nil
+	if err := rows.Err(); err != nil {
+		return netip.Addr{}, fmt.Errorf("iterate real ips of %s: %w", domain, err)
+	}
+	if len(skipped) > 0 {
+		p.L().Warn("fakeip nat: every recorded real ip is inside the fake range",
+			zap.String("domain", domain), zap.Strings("fake_ips", skipped))
+	}
+	p.L().Debug("fakeip nat: domain has no recorded real ip", zap.String("domain", domain))
+	return netip.Addr{}, fmt.Errorf("%w: %s", errNoRealIP, domain)
 }
 
 // forwardPacket turns a client -> fake ip packet into the outbound packet:

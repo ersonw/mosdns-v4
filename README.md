@@ -40,6 +40,9 @@ FreeBSD 取空闲的 `/dev/tun<N>`；Windows 用 Wintun。utun/tun 都是点对�
 `proxy` 传入 socks5 / http / trojan 链接时作为该数据面的出站代理；探测不通过会回退直连并报错日志。
 TCP 走 CONNECT；UDP 上 socks5 用 RFC 1928 UDP ASSOCIATE、trojan 用流内 udp-associate 请求行 +
 长度前缀数据帧，两者都能承载 UDP，只有 `http`/`https` 因为协议本身只有 CONNECT 而回落直连。
+`socks5://` 默认在本地解析目标，但本机解析器往往就是本插件自己，答复会是本段的伪 IP；插件会识别这种
+答复并保留域名交给代理去解析（等价于 `socks5h://`），所以配置成 `socks5://` 也不会把 `198.18.x.x`
+发给代理。其余出口（`http`/`https`/`trojan`）始终原样传域名。
 
 TUN 数据面没有代理时，出口 socket 需要自己选路并改写源地址。Linux 上插件新建一张专用路由表
 （`tun_route_table`，默认 `100`），写入 `default via <next_hop> dev <next_hop_dev>`，再加一条

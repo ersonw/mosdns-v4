@@ -179,7 +179,7 @@ func (p *FakeIPNatPlugin) restoreRuntimeMappings(ctx context.Context) error {
 	}
 	defer rows.Close()
 
-	restored, pending := 0, 0
+	restored, pending, poisoned := 0, 0, 0
 	for rows.Next() {
 		var domain, fakeIP string
 		if err := rows.Scan(&domain, &fakeIP); err != nil {
@@ -189,11 +189,22 @@ func (p *FakeIPNatPlugin) restoreRuntimeMappings(ctx context.Context) error {
 			pending++
 			continue
 		}
+		// A row whose "domain" is actually an address of this range would
+		// poison the reverse lookup for that fake ip: every connection would
+		// be told to reach an address that only exists here.
+		if p.isFakeAddrString(domain) {
+			poisoned++
+			continue
+		}
 		p.runtime.put(domain, fakeIP)
 		restored++
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate mappings: %w", err)
+	}
+	if poisoned > 0 {
+		p.L().Warn("fakeip nat: mappings naming a fake ip as their domain were skipped",
+			zap.Int("rows", poisoned), zap.String("table", p.mapTable))
 	}
 	p.L().Info("fakeip nat: runtime mapping table restored",
 		zap.Int("entries", restored), zap.Int("pending", pending), zap.String("source", "sqlite"))

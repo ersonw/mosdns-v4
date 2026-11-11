@@ -94,6 +94,13 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 	// Fast path: keep an existing mapping that still works, which is what
 	// prevents churn on every re-resolution of the same domain.
 	current := p.nftMappings(ctx, table)[fakeIP]
+	if p.isFakeAddrString(current) {
+		// A mapping that points at a fake ip can only fail: drop it so the
+		// candidate selection below replaces it.
+		p.L().Warn("nat mapping points at a fake ip, replacing it",
+			zap.String("fake_ip", fakeIP), zap.String("real_ip", current))
+		current = ""
+	}
 	if current != "" {
 		p.applyHostRoute(ctx, current, hop, dev)
 		if p.probe(ctx, current) {
@@ -113,6 +120,15 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 		}
 		candidates = ips
 	}
+	// An upstream that answered with one of this plugin's own fake addresses
+	// must never become the DNAT target: the kernel would rewrite the request
+	// to an address that only exists here.
+	kept, fake := p.realCandidates(candidates)
+	if len(fake) > 0 {
+		p.L().Warn("candidate real ips inside the fake range were dropped",
+			zap.String("domain", domain), zap.Strings("fake_ips", fake))
+	}
+	candidates = kept
 	if len(candidates) == 0 {
 		p.L().Warn("no candidate real ip, nat mapping skipped",
 			zap.String("fake_ip", fakeIP), zap.String("domain", domain))
@@ -425,7 +441,7 @@ func (p *FakeIPNatPlugin) knownRealIPs(ctx context.Context) []netip.Addr {
 		var out []netip.Addr
 		p.realMu.Lock()
 		for ip := range p.realRoutes {
-			if addr, err := netip.ParseAddr(ip); err == nil {
+			if addr, err := netip.ParseAddr(ip); err == nil && !p.isFakeAddr(addr) {
 				out = append(out, addr)
 			}
 		}
@@ -437,7 +453,9 @@ func (p *FakeIPNatPlugin) knownRealIPs(ctx context.Context) []netip.Addr {
 	}
 	var out []netip.Addr
 	for _, real := range p.nftMappings(ctx, p.nftTableName()) {
-		if addr, err := netip.ParseAddr(real); err == nil {
+		// Only real targets matter for cleanup: a fake ip stored as the value
+		// must not extend the set of prefixes the cleanup step may remove.
+		if addr, err := netip.ParseAddr(real); err == nil && !p.isFakeAddr(addr) {
 			out = append(out, addr)
 		}
 	}
@@ -482,6 +500,12 @@ func (p *FakeIPNatPlugin) syncRealRoutes(ctx context.Context, ips []string) {
 	for _, ip := range ips {
 		addr, err := netip.ParseAddr(ip)
 		if err != nil || !addr.Is4() {
+			continue
+		}
+		// A fake ip is not a real target: installing a host route for it would
+		// add a route to an address the plugin already owns.
+		if p.isFakeAddr(addr) {
+			p.L().Debug("fakeip nat: fake ip skipped when installing real routes", zap.String("ip", addr.String()))
 			continue
 		}
 		p.applyHostRoute(ctx, addr.String(), hop, dev)
@@ -604,6 +628,21 @@ func parseCandidateIPs(raw string) []string {
 		ips = append(ips, key)
 	}
 	return ips
+}
+
+// realCandidates splits candidate real ips into the usable ones and the ones
+// that fall inside the plugin's own range. A fake address can never be a DNAT
+// target or the destination of a host route.
+func (p *FakeIPNatPlugin) realCandidates(ips []string) (kept, fake []string) {
+	kept = make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if p.isFakeAddrString(ip) {
+			fake = append(fake, ip)
+			continue
+		}
+		kept = append(kept, ip)
+	}
+	return kept, fake
 }
 
 // collapsePrefixes merges only perfectly aligned sibling networks, so it never
