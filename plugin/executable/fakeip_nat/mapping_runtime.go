@@ -24,12 +24,14 @@ type runtimeMap struct {
 	mu       sync.RWMutex
 	byDomain map[string]string // domain -> fake ip
 	byFake   map[string]string // fake ip -> domain ("" means reserved, owner unknown)
+	lastSeen map[string]int64  // domain -> last query (unix seconds, memory only)
 }
 
 func newRuntimeMap() *runtimeMap {
 	return &runtimeMap{
 		byDomain: make(map[string]string),
 		byFake:   make(map[string]string),
+		lastSeen: make(map[string]int64),
 	}
 }
 
@@ -61,6 +63,7 @@ func (m *runtimeMap) clear() {
 	defer m.mu.Unlock()
 	m.byDomain = make(map[string]string)
 	m.byFake = make(map[string]string)
+	m.lastSeen = make(map[string]int64)
 }
 
 func (m *runtimeMap) remove(domain string) {
@@ -74,9 +77,29 @@ func (m *runtimeMap) remove(domain string) {
 		return
 	}
 	delete(m.byDomain, domain)
+	delete(m.lastSeen, domain)
 	if m.byFake[fakeIP] == domain {
 		delete(m.byFake, fakeIP)
 	}
+}
+
+// touch records the last time a domain was answered. It stays in memory until
+// the retention sweep flushes it, so a query never costs a database write.
+func (m *runtimeMap) touch(domain string, now int64) {
+	if domain == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if now > m.lastSeen[domain] {
+		m.lastSeen[domain] = now
+	}
+}
+
+func (m *runtimeMap) lastSeenOf(domain string) int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.lastSeen[domain]
 }
 
 // reserve keeps a fake ip that only the firewall map knows about: it is in use,

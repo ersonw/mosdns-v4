@@ -46,8 +46,12 @@ type Args struct {
 	TablePrefix string `yaml:"table_prefix"` // 数据库表名前缀，默认: "default"
 	IPv4Range   string `yaml:"ipv4_range"`   // 虚拟 IP 段，默认: "198.18.0.0/15"
 	TTL         uint32 `yaml:"ttl"`          // 返回的 DNS TTL，默认: 60
-	NextHop     string `yaml:"next_hop"`     // 可选：NAT 模式下真实目标 IP 的下一跳网关（不填则用系统默认路由）
-	NextHopDev  string `yaml:"next_hop_dev"` // 可选：NAT 模式下下一跳出站网卡名称（不填则不指定 dev）
+	// RecordTTL 是域名映射的保留时长，默认 "168h"（7 天）。超过该时长没有被查询过的
+	// 记录会被后台任务从 SQLite 和内存中删除，释放的虚拟地址重新进入可分配池。
+	// 填 "0" 关闭清理（记录一直保留）。支持 Go 时长语法：168h、24h、30m。
+	RecordTTL  string `yaml:"record_ttl"`
+	NextHop    string `yaml:"next_hop"`     // 可选：NAT 模式下真实目标 IP 的下一跳网关（不填则用系统默认路由）
+	NextHopDev string `yaml:"next_hop_dev"` // 可选：NAT 模式下下一跳出站网卡名称（不填则不指定 dev）
 
 	// Script 已废弃：脚本回调已移除，保留字段只是为了让带 script 的旧配置仍能启动。
 	Script string `yaml:"script"`
@@ -87,18 +91,20 @@ type Args struct {
 
 type FakeIPNatPlugin struct {
 	*coremain.BP
-	db          *sql.DB
-	dbPath      string
-	tablePrefix string
-	mapTable    string
-	ipTable     string
-	cidr        string
-	prefix      netip.Prefix
-	maxHosts    uint64 // usable address count inside prefix, broadcast and network excluded
-	ttl         uint32
-	nextHop     string
-	nextHopDev  string
-	mu          sync.Mutex // serializes fake ip allocation
+	db            *sql.DB
+	dbPath        string
+	tablePrefix   string
+	mapTable      string
+	ipTable       string
+	cidr          string
+	prefix        netip.Prefix
+	maxHosts      uint64 // usable address count inside prefix, broadcast and network excluded
+	ttl           uint32
+	recordTTL     time.Duration
+	retentionStop chan struct{}
+	nextHop       string
+	nextHopDev    string
+	mu            sync.Mutex // serializes fake ip allocation
 
 	taskSem      chan struct{}       // bounds concurrently running NAT tasks
 	taskMu       sync.Mutex          // guards taskInFlight
@@ -183,6 +189,10 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if cfg.TTL == 0 {
 		cfg.TTL = 60
 	}
+	recordTTL, err := parseRecordTTL(cfg.RecordTTL)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.RouteTable == "" {
 		cfg.RouteTable = "main"
 	}
@@ -215,6 +225,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("table_prefix", cfg.TablePrefix),
 		zap.String("ipv4_range", cfg.IPv4Range),
 		zap.Uint32("ttl", cfg.TTL),
+		zap.Duration("record_ttl", recordTTL),
 		zap.String("route_table", cfg.RouteTable),
 		zap.Bool("route_aggregation", aggregateRoutes),
 		zap.Bool("use_tun", cfg.UseTun),
@@ -268,7 +279,8 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		domain TEXT UNIQUE NOT NULL,
 		fake_ip TEXT UNIQUE NOT NULL,
-		created_at INTEGER DEFAULT 0
+		created_at INTEGER DEFAULT 0,
+		last_seen INTEGER DEFAULT 0
 	);
 	CREATE TABLE IF NOT EXISTS %s (
 		domain TEXT NOT NULL,
@@ -283,6 +295,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if _, err := db.Exec(initSQL); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("init tables failed: %w", err)
+	}
+	// Databases created before record_ttl was added have no last_seen column;
+	// "duplicate column name" means the schema is already current.
+	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN last_seen INTEGER DEFAULT 0", mapTable)); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			_ = db.Close()
+			return nil, fmt.Errorf("add last_seen column failed: %w", err)
+		}
 	}
 	bp.L().Debug("fakeip nat: schema ready",
 		zap.String("map_table", mapTable), zap.String("real_ip_table", ipTable), zap.String("index", idxName))
@@ -308,6 +328,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		prefix:       prefix,
 		maxHosts:     maxHosts,
 		ttl:          cfg.TTL,
+		recordTTL:    recordTTL,
 		nextHop:      strings.TrimSpace(cfg.NextHop),
 		nextHopDev:   strings.TrimSpace(cfg.NextHopDev),
 		taskSem:      make(chan struct{}, defaultTaskConcurrency),
@@ -338,6 +359,10 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		p.reconcileFirewallMappings(restoreCtx)
 	}
 	restoreCancel()
+
+	// Stale mappings are dropped in the background, so a database that has been
+	// growing for months does not need a manual vacuum.
+	p.startRecordRetention()
 
 	// The proxy is the outlet of the tun data path only: the NAT data path is
 	// kernel DNAT and never sees the connection. An unusable proxy degrades to
@@ -479,6 +504,7 @@ func (p *FakeIPNatPlugin) stopTunDataPath() {
 // database file stays locked for the lifetime of the process.
 func (p *FakeIPNatPlugin) Close() error {
 	p.L().Debug("fakeip nat: closing plugin")
+	p.stopRecordRetention()
 	p.stopTunDataPath()
 	p.stopTunEgress()
 	if p.db != nil {
@@ -608,43 +634,111 @@ func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	insertSQL := fmt.Sprintf("INSERT INTO %s (domain, fake_ip, created_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO NOTHING", p.mapTable)
-	if _, err := p.db.ExecContext(ctx, insertSQL, domain, pendingFakeIP, now); err != nil {
+	insertSQL := fmt.Sprintf("INSERT INTO %s (domain, fake_ip, created_at, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO NOTHING", p.mapTable)
+	if _, err := p.db.ExecContext(ctx, insertSQL, domain, pendingFakeIP, now, now); err != nil {
 		return "", fmt.Errorf("insert mapping: %w", err)
 	}
 
-	// The first read returns the existing mapping in the common case. A second
-	// round is only needed when this (or another) process still has to flip the
-	// row from pending to a real fake ip.
-	for attempt := 0; attempt < 2; attempt++ {
-		var (
-			id     int64
-			fakeIP string
-		)
-		querySQL := fmt.Sprintf("SELECT id, fake_ip FROM %s WHERE domain = ?", p.mapTable)
-		if err := p.db.QueryRowContext(ctx, querySQL, domain).Scan(&id, &fakeIP); err != nil {
-			return "", fmt.Errorf("query mapping: %w", err)
+	var (
+		id     int64
+		fakeIP string
+	)
+	querySQL := fmt.Sprintf("SELECT id, fake_ip FROM %s WHERE domain = ?", p.mapTable)
+	if err := p.db.QueryRowContext(ctx, querySQL, domain).Scan(&id, &fakeIP); err != nil {
+		return "", fmt.Errorf("query mapping: %w", err)
+	}
+	if fakeIP != pendingFakeIP {
+		// Keep the runtime table in step with what was just allocated.
+		if p.runtime != nil {
+			p.runtime.put(domain, fakeIP)
+			p.runtime.touch(domain, now)
 		}
-		if fakeIP != pendingFakeIP {
-			// Keep the runtime table in step with what was just allocated.
-			if p.runtime != nil {
-				p.runtime.put(domain, fakeIP)
-			}
-			return fakeIP, nil
-		}
+		return fakeIP, nil
+	}
 
-		allocated, err := p.allocateFakeIP(uint64(id))
+	// The row exists but has no address yet. Take the lowest free offset instead
+	// of deriving one from the row id: ids never shrink, so an id-based offset
+	// would keep walking towards the end of the range even after the retention
+	// sweep has freed addresses behind it.
+	updateSQL := fmt.Sprintf("UPDATE %s SET fake_ip = ?, last_seen = ? WHERE id = ? AND fake_ip = ?", p.mapTable)
+	skip := make(map[string]bool)
+	for attempt := 0; attempt < 16; attempt++ {
+		allocated, err := p.nextFreeFakeIP(skip)
 		if err != nil {
 			return "", err
 		}
-		// Only one process can flip the row; the loser re-reads the winner's
-		// value on the next iteration.
-		updateSQL := fmt.Sprintf("UPDATE %s SET fake_ip = ? WHERE id = ? AND fake_ip = ?", p.mapTable)
-		if _, err := p.db.ExecContext(ctx, updateSQL, allocated, id, pendingFakeIP); err != nil {
+		res, err := p.db.ExecContext(ctx, updateSQL, allocated, now, id, pendingFakeIP)
+		if err != nil {
+			// Another process took this offset between the scan and the write.
+			if isUniqueViolation(err) {
+				skip[allocated] = true
+				continue
+			}
 			return "", fmt.Errorf("update mapping: %w", err)
 		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// Another process flipped this row first; its address wins.
+			if err := p.db.QueryRowContext(ctx, querySQL, domain).Scan(&id, &fakeIP); err != nil {
+				return "", fmt.Errorf("query mapping: %w", err)
+			}
+			if fakeIP != pendingFakeIP {
+				if p.runtime != nil {
+					p.runtime.put(domain, fakeIP)
+					p.runtime.touch(domain, now)
+				}
+				return fakeIP, nil
+			}
+			continue
+		}
+		if p.runtime != nil {
+			p.runtime.put(domain, allocated)
+			p.runtime.touch(domain, now)
+		}
+		p.L().Debug("fakeip nat: address allocated",
+			zap.String("domain", domain), zap.String("fake_ip", allocated), zap.Int64("row_id", id))
+		return allocated, nil
 	}
-	return "", fmt.Errorf("fake ip for %q is still pending after allocation", domain)
+	return "", fmt.Errorf("fake ip for %q could not be allocated after retries", domain)
+}
+
+// nextFreeFakeIP returns the lowest offset that is neither held by the runtime
+// table, a firewall reservation, nor a live traceroute hop. skip carries
+// addresses another process won while this allocation was retrying.
+func (p *FakeIPNatPlugin) nextFreeFakeIP(skip map[string]bool) (string, error) {
+	usable := p.maxHosts - reservedHostOffset
+	if p.maxHosts <= reservedHostOffset {
+		return "", fmt.Errorf("ipv4_range %s has no allocatable address: first host is reserved for the tun device", p.cidr)
+	}
+	base := p.prefix.Addr().As4()
+	baseUint := uint64(binary.BigEndian.Uint32(base[:]))
+
+	p.hopMu.Lock()
+	defer p.hopMu.Unlock()
+	for i := uint64(0); i < usable; i++ {
+		offset := i + reservedHostOffset + 1
+		target := baseUint + offset
+		if target > 0xFFFFFFFF {
+			break
+		}
+		var a [4]byte
+		binary.BigEndian.PutUint32(a[:], uint32(target))
+		addr := netip.AddrFrom4(a)
+		s := addr.String()
+		if skip[s] || p.runtime.taken(s) {
+			continue
+		}
+		if v, ok := p.hops[addr]; ok && time.Since(v.at) <= hopViewTTL {
+			continue
+		}
+		return s, nil
+	}
+	return "", fmt.Errorf("no free fake ip left in %s (%d allocatable addresses in use)", p.cidr, usable)
+}
+
+// isUniqueViolation reports whether SQLite refused a write because an address
+// was taken by another process between the scan and the update.
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 // allocateFakeIP maps a monotonic row id into the configured prefix. The first
