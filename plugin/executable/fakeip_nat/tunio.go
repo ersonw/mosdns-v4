@@ -154,6 +154,14 @@ func (p *FakeIPNatPlugin) readFromTun(ctx context.Context, d tunDevice, st *tunS
 			p.L().Debug("fakeip nat: short packet dropped", zap.Int("len", n))
 			continue
 		}
+		// A freshly created device still has IPv6 enabled, and the kernel feeds
+		// its own neighbour discovery traffic into the tun. Only IPv4 is
+		// proxied, so everything else is dropped before it reaches the stack.
+		if v := buf[0] >> 4; v != 4 {
+			p.L().Debug("fakeip nat: non-ipv4 packet dropped",
+				zap.Int("len", n), zap.Uint8("version", v))
+			continue
+		}
 		// Parsing is only needed for the log line, so it is gated by the level:
 		// the hot path stays allocation free when debug logging is off.
 		if ce := p.L().Check(zap.DebugLevel, "fakeip nat: packet from tun"); ce != nil {

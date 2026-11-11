@@ -19,8 +19,8 @@ func TestLinuxTunCommandPlan(t *testing.T) {
 	plan := linuxConfigureTunCommands("mth3", "198.18.0.1", "198.18.0.0/16")
 	want := []string{
 		"ip link set dev mth3 up",
-		"ip addr replace 198.18.0.1/32 dev mth3",
-		"ip route replace 198.18.0.0/16 dev mth3",
+		"ip addr replace 198.18.0.1/16 dev mth3",
+		"sysctl -w net.ipv6.conf.mth3.disable_ipv6=1",
 	}
 	if len(plan) != len(want) {
 		t.Fatalf("plan has %d steps, want %d: %v", len(plan), len(want), plan)
@@ -29,6 +29,11 @@ func TestLinuxTunCommandPlan(t *testing.T) {
 		if got := strings.Join(plan[i].args, " "); got != w {
 			t.Fatalf("step %d = %q, want %q", i, got, w)
 		}
+	}
+	// IPv6 goes off on a best effort basis: a restricted netns may refuse it and
+	// that must not abort the setup.
+	if !plan[len(plan)-1].optional {
+		t.Fatal("the ipv6 sysctl step must be optional")
 	}
 }
 

@@ -46,7 +46,7 @@ func (p *FakeIPNatPlugin) installTunEgressRoute(ctx context.Context) (func(), bo
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 		defer cancel()
-		_, _ = p.runner.Run(ctx, "ip", "rule", "del", "from", p.cidr, "lookup", table)
+		_, _ = p.runner.Run(ctx, "ip", "rule", "del", "from", p.cidr, "to", "!", p.cidr, "lookup", table)
 		_, _ = p.runner.Run(ctx, "ip", "route", "del", "default", "table", table)
 		p.L().Debug("tun egress: routing table removed", zap.String("table", table), zap.String("from", p.cidr))
 	}, true

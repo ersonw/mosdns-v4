@@ -11,17 +11,20 @@ import (
 
 func TestTunRoutePlan(t *testing.T) {
 	plan := tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100")
-	if len(plan) != 3 {
-		t.Fatalf("plan has %d steps, want 3", len(plan))
+	if len(plan) != 4 {
+		t.Fatalf("plan has %d steps, want 4", len(plan))
 	}
 	want := "ip route replace default via 192.168.1.1 dev en0 table 100"
 	if got := strings.Join(plan[0], " "); got != want {
 		t.Fatalf("route step = %q, want %q", got, want)
 	}
 	if got := strings.Join(plan[1], " "); got != "ip rule del from 198.18.0.0/15 lookup 100" {
+		t.Fatalf("stale rule delete step = %q", got)
+	}
+	if got := strings.Join(plan[2], " "); got != "ip rule del from 198.18.0.0/15 to ! 198.18.0.0/15 lookup 100" {
 		t.Fatalf("rule delete step = %q", got)
 	}
-	if got := strings.Join(plan[2], " "); got != "ip rule add from 198.18.0.0/15 lookup 100" {
+	if got := strings.Join(plan[3], " "); got != "ip rule add from 198.18.0.0/15 to ! 198.18.0.0/15 lookup 100" {
 		t.Fatalf("rule add step = %q", got)
 	}
 

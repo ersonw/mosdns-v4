@@ -1,5 +1,10 @@
 package fakeipnat
 
+import (
+	"net/netip"
+	"strconv"
+)
+
 // This file translates "give this device the reserved address and route the
 // whole range into it" into the command line of each supported platform. The
 // plans are pure data, so they are unit tested on any host; the per-platform
@@ -13,14 +18,43 @@ func linuxCreateTunCommands(dev string) []tunCommand {
 	}
 }
 
-// linuxConfigureTunCommands brings the device up, assigns the reserved address
-// as a single host and routes the range into the device.
+// linuxConfigureTunCommands brings the device up and assigns the reserved
+// address with the mask of the configured range. With that mask the kernel
+// derives the connected route for the whole range on its own, so "ip r" shows
+//
+//	198.18.0.0/15 dev mth0 proto kernel scope link src 198.18.0.1
+//
+// and both the source selection and the next hop for the return path work
+// without any extra route command.
 func linuxConfigureTunCommands(dev, addr, cidr string) []tunCommand {
-	return []tunCommand{
+	cmds := []tunCommand{
 		{args: []string{"ip", "link", "set", "dev", dev, "up"}},
-		{args: []string{"ip", "addr", "replace", addr + "/32", "dev", dev}},
-		{args: []string{"ip", "route", "replace", cidr, "dev", dev}},
+		{args: []string{"ip", "addr", "replace", addr + tunAddrMask(cidr), "dev", dev}},
 	}
+	// A host mask has no connected route, so the range is named explicitly.
+	if tunAddrMask(cidr) == "/32" {
+		cmds = append(cmds, tunCommand{args: []string{"ip", "route", "replace", cidr, "dev", dev, "src", addr}})
+	}
+	// The kernel keeps IPv6 enabled on a new interface and then sends its
+	// own MLD/DAD packets into the device, which the IPv4-only stack can
+	// only drop. Turning it off removes that noise; the failure is ignored
+	// because a restricted netns may refuse sysctl writes.
+	cmds = append(cmds, tunCommand{
+		args:     []string{"sysctl", "-w", "net.ipv6.conf." + dev + ".disable_ipv6=1"},
+		optional: true,
+	})
+	return cmds
+}
+
+// tunAddrMask returns the "/prefix" part of the configured range so the
+// interface address carries the same mask. Init already validated the range;
+// an unparsable value falls back to a host mask.
+func tunAddrMask(cidr string) string {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil || !prefix.IsValid() {
+		return "/32"
+	}
+	return "/" + strconv.Itoa(prefix.Bits())
 }
 
 // bsdConfigureTunCommands is shared by darwin and freebsd: ifconfig for the

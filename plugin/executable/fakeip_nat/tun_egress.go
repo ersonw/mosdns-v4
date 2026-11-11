@@ -129,8 +129,15 @@ func (p *FakeIPNatPlugin) stopTunEgress() {
 // installTunEgressRoute only has to run it.
 //
 //	ip route replace default via <hop> dev <dev> table <table>
-//	ip rule del  from <cidr> lookup <table>   (best effort, drops a stale rule)
-//	ip rule add  from <cidr> lookup <table>
+//	ip rule del  from <cidr> lookup <table>            (drops the older shape)
+//	ip rule del  from <cidr> to !<cidr> lookup <table> (best effort)
+//	ip rule add  from <cidr> to !<cidr> lookup <table>
+//
+// The rule must skip packets that are aimed at the range itself: the client
+// connecting to a fake ip leaves its socket with the reserved source address,
+// and without the destination check that packet would be pulled into the
+// egress table and sent straight out of the physical interface, bypassing the
+// tun entirely.
 func tunRoutePlan(cidr, hop, dev, table string) [][]string {
 	var route []string
 	switch {
@@ -146,7 +153,8 @@ func tunRoutePlan(cidr, hop, dev, table string) [][]string {
 	return [][]string{
 		route,
 		{"ip", "rule", "del", "from", cidr, "lookup", table},
-		{"ip", "rule", "add", "from", cidr, "lookup", table},
+		{"ip", "rule", "del", "from", cidr, "to", "!", cidr, "lookup", table},
+		{"ip", "rule", "add", "from", cidr, "to", "!", cidr, "lookup", table},
 	}
 }
 
