@@ -5,9 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"net/netip"
-	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
@@ -23,7 +21,18 @@ import (
 
 const PluginType = "fakeip_nat"
 
+// pendingFakeIP marks a mapping row that has an id but no allocated address yet.
+// It is only visible between the INSERT and the UPDATE inside recordAndAllocate,
+// or after a crash in that window.
+const pendingFakeIP = "pending"
+
+// defaultTaskConcurrency caps how many NAT tasks run at the same time.
+const defaultTaskConcurrency = 8
+
 var validTableName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
+// route tables are either a name (main, oversea) or an iproute2 id.
+var validRouteTable = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
 func init() {
 	coremain.RegNewPluginFunc(PluginType, Init, func() interface{} { return new(Args) })
@@ -33,10 +42,38 @@ type Args struct {
 	DBPath      string `yaml:"db_path"`      // SQLite 路径，默认: "/config/mosdns/fakeip.db"
 	TablePrefix string `yaml:"table_prefix"` // 数据库表名前缀，默认: "default"
 	IPv4Range   string `yaml:"ipv4_range"`   // 虚拟 IP 段，默认: "198.18.0.0/15"
-	Script      string `yaml:"script"`       // 回调脚本路径，默认: "/config/mosdns/nat_map.sh"
 	TTL         uint32 `yaml:"ttl"`          // 返回的 DNS TTL，默认: 60
-	NextHop     string `yaml:"next_hop"`     // 可选：指定真实目标 IP 的默认路由下一跳网关（不填则使用系统默认路由）
-	NextHopDev  string `yaml:"next_hop_dev"` // 可选：指定下一跳出站网卡名称（不填则不指定 dev 参数）
+	NextHop     string `yaml:"next_hop"`     // 可选：NAT 模式下真实目标 IP 的下一跳网关（不填则用系统默认路由）
+	NextHopDev  string `yaml:"next_hop_dev"` // 可选：NAT 模式下下一跳出站网卡名称（不填则不指定 dev）
+
+	// Script 已废弃：脚本回调已移除，保留字段只是为了让带 script 的旧配置仍能启动。
+	Script string `yaml:"script"`
+
+	// NAT 数据面（默认）：插件直接管理 nftables DNAT 与 host route。
+	RouteTable      string `yaml:"route_table"`       // host route 写入的路由表，默认: "main"
+	AggregateRoutes *bool  `yaml:"route_aggregation"` // 是否把 /32 host route 做严格 CIDR 聚合，默认: true
+
+	// UseTun 打开 TUN 数据面：向系统申请 tun 网卡，并在主表把 ipv4_range 路由到
+	// 该网卡。默认 false，即使用内置 NAT。
+	UseTun bool `yaml:"use_tun"`
+	// TunDev 指定 tun 设备名。留空则由插件自己申请，按 mth0、mth1… 的顺序取第一个
+	// 空闲名字（上次遗留且地址仍是段首地址的同名设备会被复用）；非空时优先复用
+	// 同名设备，不存在才创建。
+	TunDev string `yaml:"tun_dev"`
+
+	// Proxy 是 tun 数据面的出站代理链接，例如
+	// socks5://user:pass@host:1080、http://host:8080、trojan://pass@host:443?sni=host。
+	// 留空则直连；传入且探测通过才作为出口，探测失败会回退直连并报错日志。
+	Proxy string `yaml:"proxy"`
+	// ProxyInsecure 跳过 https / trojan 代理的证书校验，供自签证书使用。
+	ProxyInsecure bool `yaml:"proxy_insecure"`
+
+	// TunRouteTable 是 tun 数据面直连时新建的路由表，默认 "100"。插件在该表里
+	// 写一条 default 路由（via next_hop / dev next_hop_dev），并用
+	// `ip rule from <ipv4_range> lookup <table>` 把段内源地址的流量导进去。
+	// 配了代理时不会建表。仅 Linux 支持独立路由表；darwin 改为把出口 socket
+	// 绑定到 next_hop_dev。
+	TunRouteTable string `yaml:"tun_route_table"`
 }
 
 type FakeIPNatPlugin struct {
@@ -48,18 +85,72 @@ type FakeIPNatPlugin struct {
 	ipTable     string
 	cidr        string
 	prefix      netip.Prefix
-	script      string
+	maxHosts    uint64 // usable address count inside prefix, broadcast and network excluded
 	ttl         uint32
 	nextHop     string
 	nextHopDev  string
-	mu          sync.Mutex
+	mu          sync.Mutex // serializes fake ip allocation
+
+	taskSem      chan struct{}       // bounds concurrently running NAT tasks
+	taskMu       sync.Mutex          // guards taskInFlight
+	taskInFlight map[string]struct{} // domains whose NAT task is running
+
+	// NAT data path: the plugin owns the nftables map and host routes.
+	routeTable      string
+	aggregateRoutes bool
+	natMu           sync.Mutex // serializes nft / ip command sequences
+	runner          cmdRunner
+	probe           func(ctx context.Context, ip string) bool
+
+	// TUN data path: the whole ipv4_range is routed to a device requested from
+	// the system instead of being DNAT-ed hop by hop.
+	useTun bool
+	tunDev string
+	// egress is the outlet of the tun data path: direct by default, or a
+	// socks5 / http / trojan proxy when `proxy` is configured and reachable.
+	egress egressDialer
+	// proxyActive reports whether egress is a proxied outlet. It decides the
+	// target handed to it: the domain when proxied, the real IP when direct.
+	proxyActive bool
+
+	// Tun outlet routing: a dedicated table keeps the fake range out of the
+	// host default route, so only the new sockets opened for a flow leave
+	// through next_hop, and the host's own traffic is untouched.
+	tunRouteTable    string
+	tunEgressHop     string
+	tunEgressDev     string
+	tunEgressCleanup func()
+
+	// ICMP relay of the tun data path: echo requests are forwarded to the real
+	// ip, and the errors the outlet receives go back to the client with the
+	// address they came from.
+	icmpMu sync.Mutex
+	icmp   *icmpRelay
+
+	// quote cache: the tun read loop keeps the header of recently sent UDP
+	// packets so an ICMP error can quote the exact bytes the client sent.
+	quoteMu sync.Mutex
+	quotes  map[quoteKey]clientQuote
+	// conn tracks the flows of the tun data path so replies can be mapped back
+	// to the client.
+	conn *conntrack
+	// runtime is the in-memory mirror of the mapping table. It is restored at
+	// startup from SQLite and, on the NAT path, reconciled against the nft map.
+	runtime *runtimeMap
+
+	// tunStack is the userspace stack that terminates the traffic arriving on
+	// the device; tunCancel stops the device read/write loops on shutdown.
+	tunStack   *tunStack
+	tunCancel  context.CancelFunc
+	tunMu      sync.Mutex // guards tunStarted
+	tunStarted bool
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	cfg := args.(*Args)
 
 	if cfg.DBPath == "" {
-		cfg.DBPath = "/config/mosdns/fakeip.db"
+		cfg.DBPath = "/etc/mosdns/fakeip.db"
 	}
 	if cfg.TablePrefix == "" {
 		cfg.TablePrefix = "default"
@@ -67,12 +158,44 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if cfg.IPv4Range == "" {
 		cfg.IPv4Range = "198.18.0.0/15"
 	}
-	if cfg.Script == "" {
-		cfg.Script = "/config/mosdns/nat_map.sh"
+	if cfg.Script != "" {
+		bp.L().Warn("script callback has been removed and is ignored; the plugin now manages nat itself or, with use_tun, routes to a tun device",
+			zap.String("script", cfg.Script))
 	}
 	if cfg.TTL == 0 {
 		cfg.TTL = 60
 	}
+	if cfg.RouteTable == "" {
+		cfg.RouteTable = "main"
+	}
+	if !validRouteTable.MatchString(cfg.RouteTable) {
+		return nil, fmt.Errorf("invalid route_table %q: only alphanumeric, underscore, dot and dash allowed", cfg.RouteTable)
+	}
+	if cfg.TunRouteTable == "" {
+		cfg.TunRouteTable = "100"
+	}
+	if !validRouteTable.MatchString(cfg.TunRouteTable) {
+		return nil, fmt.Errorf("invalid tun_route_table %q: only alphanumeric, underscore, dot and dash allowed", cfg.TunRouteTable)
+	}
+	// route_aggregation defaults to true, so it is a pointer to tell "unset"
+	// from an explicit false.
+	aggregateRoutes := true
+	if cfg.AggregateRoutes != nil {
+		aggregateRoutes = *cfg.AggregateRoutes
+	}
+
+	bp.L().Debug("fakeip nat: config resolved",
+		zap.String("db_path", cfg.DBPath),
+		zap.String("table_prefix", cfg.TablePrefix),
+		zap.String("ipv4_range", cfg.IPv4Range),
+		zap.Uint32("ttl", cfg.TTL),
+		zap.String("route_table", cfg.RouteTable),
+		zap.Bool("route_aggregation", aggregateRoutes),
+		zap.Bool("use_tun", cfg.UseTun),
+		zap.String("tun_dev", strings.TrimSpace(cfg.TunDev)),
+		zap.String("next_hop", cfg.NextHop),
+		zap.String("next_hop_dev", cfg.NextHopDev),
+		zap.Bool("proxy_configured", strings.TrimSpace(cfg.Proxy) != ""))
 
 	if !validTableName.MatchString(cfg.TablePrefix) {
 		return nil, fmt.Errorf("invalid table_prefix %q: only alphanumeric and underscore allowed", cfg.TablePrefix)
@@ -82,6 +205,17 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid ipv4_range: %w", err)
 	}
+	// prefix.Addr().As4() panics on IPv6 inputs, so reject them at startup
+	// instead of crashing on the first A query.
+	if !prefix.Addr().Is4() {
+		return nil, fmt.Errorf("invalid ipv4_range %q: must be an IPv4 prefix", cfg.IPv4Range)
+	}
+	ones, bits := prefix.Bits(), prefix.Addr().BitLen()
+	if ones > bits-2 {
+		return nil, fmt.Errorf("invalid ipv4_range %q: need at least 2 usable addresses", cfg.IPv4Range)
+	}
+	// Network and broadcast addresses are excluded.
+	maxHosts := (uint64(1) << uint(bits-ones)) - 2
 
 	if cfg.NextHop != "" {
 		if _, err := netip.ParseAddr(cfg.NextHop); err != nil {
@@ -93,6 +227,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite failed: %w", err)
 	}
+	bp.L().Debug("fakeip nat: sqlite opened", zap.String("db_path", cfg.DBPath))
+	// SQLite allows a single writer. Serializing at the pool level turns
+	// concurrent writes into a Go-side queue instead of SQLITE_BUSY errors.
+	db.SetMaxOpenConns(1)
+	db.SetConnMaxIdleTime(time.Minute)
 
 	mapTable := cfg.TablePrefix + "_mapping"
 	ipTable := cfg.TablePrefix + "_real_ips"
@@ -116,23 +255,213 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	)
 
 	if _, err := db.Exec(initSQL); err != nil {
+		_ = db.Close()
 		return nil, fmt.Errorf("init tables failed: %w", err)
 	}
+	bp.L().Debug("fakeip nat: schema ready",
+		zap.String("map_table", mapTable), zap.String("real_ip_table", ipTable), zap.String("index", idxName))
 
-	return &FakeIPNatPlugin{
-		BP:          bp,
-		db:          db,
-		dbPath:      cfg.DBPath,
-		tablePrefix: cfg.TablePrefix,
-		mapTable:    mapTable,
-		ipTable:     ipTable,
-		cidr:        cfg.IPv4Range,
-		prefix:      prefix,
-		script:      cfg.Script,
-		ttl:         cfg.TTL,
-		nextHop:     strings.TrimSpace(cfg.NextHop),
-		nextHopDev:  strings.TrimSpace(cfg.NextHopDev),
-	}, nil
+	// Surface unusable paths (missing directory, bad permissions) at startup
+	// instead of on the first query.
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("sqlite %q is not usable: %w", cfg.DBPath, err)
+	}
+	bp.L().Debug("fakeip nat: sqlite reachable", zap.String("db_path", cfg.DBPath))
+
+	p := &FakeIPNatPlugin{
+		BP:           bp,
+		db:           db,
+		dbPath:       cfg.DBPath,
+		tablePrefix:  cfg.TablePrefix,
+		mapTable:     mapTable,
+		ipTable:      ipTable,
+		cidr:         cfg.IPv4Range,
+		prefix:       prefix,
+		maxHosts:     maxHosts,
+		ttl:          cfg.TTL,
+		nextHop:      strings.TrimSpace(cfg.NextHop),
+		nextHopDev:   strings.TrimSpace(cfg.NextHopDev),
+		taskSem:      make(chan struct{}, defaultTaskConcurrency),
+		taskInFlight: make(map[string]struct{}),
+
+		routeTable:      cfg.RouteTable,
+		tunRouteTable:   cfg.TunRouteTable,
+		aggregateRoutes: aggregateRoutes,
+		useTun:          cfg.UseTun,
+		tunDev:          strings.TrimSpace(cfg.TunDev),
+	}
+	p.runner = execRunner{}
+	p.probe = p.probeReachable
+	p.egress = &directEgress{}
+	p.conn = newConntrack(defaultConntrackSize, defaultConntrackTTL)
+	p.runtime = newRuntimeMap()
+
+	// Restore what earlier runs already mapped before any traffic arrives, so
+	// the first query for a known domain is answered from memory.
+	restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := p.restoreRuntimeMappings(restoreCtx); err != nil {
+		p.L().Warn("fakeip nat: restore runtime mappings failed", zap.Error(err))
+	}
+	// The nft path has a second source of truth: the dnat map survives restarts
+	// even when a database row did not. Swap the differences into both.
+	if !p.useTun {
+		p.reconcileFirewallMappings(restoreCtx)
+	}
+	restoreCancel()
+
+	// The proxy is the outlet of the tun data path only: the NAT data path is
+	// kernel DNAT and never sees the connection. An unusable proxy degrades to
+	// direct egress instead of blocking startup, but it is logged as an error.
+	if cfg.Proxy != "" {
+		dialer, err := newEgress(cfg.Proxy, cfg.ProxyInsecure)
+		if err != nil {
+			return nil, err
+		}
+		p.L().Debug("fakeip nat: proxy link parsed",
+			zap.String("proxy", redactProxy(cfg.Proxy)),
+			zap.String("outlet", describeEgress(dialer)),
+			zap.Bool("insecure", cfg.ProxyInsecure))
+		if !cfg.UseTun {
+			p.L().Warn("proxy is configured but use_tun is false; it only applies to the tun data path",
+				zap.String("proxy", redactProxy(cfg.Proxy)))
+		} else {
+			probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			p.L().Debug("fakeip nat: probing proxy egress", zap.String("proxy", redactProxy(cfg.Proxy)))
+			if err := probeEgress(probeCtx, dialer); err != nil {
+				p.L().Warn("proxy is not usable, falling back to direct egress",
+					zap.String("proxy", redactProxy(cfg.Proxy)), zap.Error(err))
+			} else {
+				p.egress = dialer
+				p.proxyActive = true
+				p.L().Info("proxy egress ready", zap.String("proxy", redactProxy(cfg.Proxy)))
+			}
+			probeCancel()
+		}
+	}
+
+	// The tun data path is the alternative to per-domain DNAT: it asks the
+	// system for a device and routes the whole ipv4_range into it.
+	if p.useTun {
+		p.L().Debug("fakeip nat: starting tun data path", zap.String("range", p.cidr))
+		if err := p.startTunDataPath(); err != nil {
+			p.L().Error("use_tun is enabled but the tun data path could not start; the plugin has no outlet", zap.Error(err))
+		} else {
+			// The outlet is pinned only after the device exists: the range
+			// address has to be assigned before it can be bound as a source.
+			p.setupTunEgress()
+		}
+	}
+
+	// coremain never iterates plugins to close them, so the sqlite handle has
+	// to ride on the shutdown channel that RunMosdns waits on.
+	if m := bp.M(); m != nil {
+		if sc := m.GetSafeClose(); sc != nil {
+			sc.Attach(func(done func(), closeSignal <-chan struct{}) {
+				defer done()
+				<-closeSignal
+				_ = p.Close()
+			})
+		}
+	}
+
+	plane := "nft"
+	if p.useTun {
+		plane = "tun"
+	}
+	p.L().Info("fakeip nat plugin initialized",
+		zap.String("range", p.cidr),
+		zap.Uint32("ttl", p.ttl),
+		zap.String("data_plane", plane),
+		zap.String("tun_dev", p.tunDev),
+		zap.String("route_table", p.routeTable),
+		zap.Bool("route_aggregation", p.aggregateRoutes),
+		zap.Bool("proxy_active", p.proxyActive))
+
+	return p, nil
+}
+
+// startTunDataPath brings up the userspace stack and the device loops. It runs
+// as a goroutine because the socket layer must never block Init: coremain only
+// waits for Init, and a failure here is degraded, not fatal.
+func (p *FakeIPNatPlugin) startTunDataPath() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dev, err := p.setupTun(ctx)
+	if err != nil {
+		return err
+	}
+	st, err := newTunStack(defaultTunMTU, p.reservedAddr())
+	if err != nil {
+		_ = dev.Close()
+		return err
+	}
+	st.dev = dev
+	p.L().Debug("fakeip nat: userspace stack created",
+		zap.Uint32("mtu", st.mtu), zap.Int("nic_id", int(st.nicID)))
+	p.startStack(st)
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	p.tunMu.Lock()
+	p.tunStack = st
+	p.tunCancel = runCancel
+	p.tunStarted = true
+	p.tunMu.Unlock()
+
+	devName := p.tunDev
+	p.L().Info("tun data path started", zap.String("dev", devName), zap.String("range", p.cidr))
+	// ICMP relay needs the device for replies and the mapping table for echo
+	// forwarding, so it starts once both exist.
+	p.startICMPRelay(runCtx, st)
+	go func() {
+		if err := p.runTunDevice(runCtx, dev, st); err != nil {
+			p.L().Warn("tun device loop stopped", zap.String("dev", devName), zap.Error(err))
+		}
+	}()
+	return nil
+}
+
+// stopTunDataPath stops the device loops and the stack. It is idempotent.
+func (p *FakeIPNatPlugin) stopTunDataPath() {
+	p.tunMu.Lock()
+	cancel := p.tunCancel
+	st := p.tunStack
+	started := p.tunStarted
+	p.tunStarted = false
+	p.tunCancel = nil
+	p.tunStack = nil
+	p.tunMu.Unlock()
+
+	if !started {
+		p.L().Debug("fakeip nat: tun data path not running, nothing to stop")
+		return
+	}
+	p.L().Debug("fakeip nat: stopping tun data path", zap.String("dev", p.tunDev))
+	p.stopICMPRelay()
+	if cancel != nil {
+		cancel()
+	}
+	if st != nil {
+		st.close()
+	}
+}
+
+// Close stops the data path and releases the SQLite handle. Without it the
+// database file stays locked for the lifetime of the process.
+func (p *FakeIPNatPlugin) Close() error {
+	p.L().Debug("fakeip nat: closing plugin")
+	p.stopTunDataPath()
+	p.stopTunEgress()
+	if p.db != nil {
+		if err := p.db.Close(); err != nil {
+			p.L().Warn("fakeip nat: close sqlite failed", zap.String("db_path", p.dbPath), zap.Error(err))
+			return err
+		}
+		p.L().Info("fakeip nat plugin closed")
+	}
+	return nil
 }
 
 func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
@@ -142,7 +471,11 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	}
 
 	question := q.Question[0]
+	p.L().Debug("fakeip nat: query in",
+		zap.String("name", question.Name), zap.Uint16("qtype", question.Qtype),
+		zap.Bool("has_response", qCtx.R() != nil))
 	if question.Qtype == dns.TypeAAAA {
+		p.L().Debug("fakeip nat: aaaa answered with empty response", zap.String("name", question.Name))
 		emptyResp := new(dns.Msg)
 		emptyResp.SetReply(q)
 		emptyResp.RecursionAvailable = true
@@ -155,6 +488,8 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 		if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 			return err
 		}
+	} else {
+		p.L().Debug("fakeip nat: response already present, skip next", zap.String("name", question.Name))
 	}
 
 	resp := qCtx.R()
@@ -168,13 +503,20 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 
 		if len(realIPs) > 0 {
 			domain := strings.TrimSuffix(question.Name, ".")
-			fakeIP, err := p.recordAndAllocate(domain, realIPs)
+			p.L().Debug("fakeip nat: real ips collected",
+				zap.String("domain", domain), zap.Int("count", len(realIPs)), zap.Strings("real_ips", realIPs))
+			fakeIP, err := p.recordAndAllocate(ctx, domain, realIPs)
 			if err != nil {
 				p.L().Error("sqlite record fakeip failed", zap.String("domain", domain), zap.Error(err))
+			} else if fakeAddr, err := netip.ParseAddr(fakeIP); err != nil {
+				// A leftover "pending" row or a corrupted value must never
+				// produce an A record with a nil IP.
+				p.L().Error("invalid allocated fake ip", zap.String("domain", domain), zap.String("fake_ip", fakeIP), zap.Error(err))
 			} else {
-				if p.script != "" {
-					go p.runHookScript(fakeIP, domain, strings.Join(realIPs, ","))
-				}
+				p.dispatchNAT(fakeIP, domain, strings.Join(realIPs, ","))
+				p.L().Debug("fakeip nat: fake ip answered",
+					zap.String("domain", domain), zap.String("fake_ip", fakeIP),
+					zap.Uint32("ttl", p.ttl), zap.Bool("data_plane_tun", p.useTun))
 
 				newResp := new(dns.Msg)
 				newResp.SetReply(q)
@@ -187,7 +529,7 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 							Class:  dns.ClassINET,
 							Ttl:    p.ttl,
 						},
-						A: net.ParseIP(fakeIP),
+						A: fakeAddr.AsSlice(),
 					},
 				}
 				qCtx.SetResponse(newResp)
@@ -201,69 +543,155 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	return nil
 }
 
-func (p *FakeIPNatPlugin) recordAndAllocate(domain string, realIPs []string) (string, error) {
+// recordAndAllocate returns a stable fake ip for domain and records the
+// currently resolved real ips. It is idempotent across processes: concurrent
+// instances race on INSERT ... ON CONFLICT DO NOTHING instead of UNIQUE errors.
+func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, realIPs []string) (string, error) {
+	now := time.Now().Unix()
+
+	// Real ips are idempotent upserts, so they do not need the allocation lock.
+	if err := p.upsertRealIPs(ctx, domain, realIPs, now); err != nil {
+		p.L().Warn("upsert real ips failed", zap.String("domain", domain), zap.Int("ip_count", len(realIPs)), zap.Error(err))
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	now := time.Now().Unix()
-	var fakeIP string
-	querySQL := fmt.Sprintf("SELECT fake_ip FROM %s WHERE domain = ?", p.mapTable)
-	err := p.db.QueryRow(querySQL, domain).Scan(&fakeIP)
+	insertSQL := fmt.Sprintf("INSERT INTO %s (domain, fake_ip, created_at) VALUES (?, ?, ?) ON CONFLICT(domain) DO NOTHING", p.mapTable)
+	if _, err := p.db.ExecContext(ctx, insertSQL, domain, pendingFakeIP, now); err != nil {
+		return "", fmt.Errorf("insert mapping: %w", err)
+	}
 
-	if err == sql.ErrNoRows {
-		insertSQL := fmt.Sprintf("INSERT INTO %s (domain, fake_ip, created_at) VALUES (?, 'pending', ?)", p.mapTable)
-		res, err := p.db.Exec(insertSQL, domain, now)
+	// The first read returns the existing mapping in the common case. A second
+	// round is only needed when this (or another) process still has to flip the
+	// row from pending to a real fake ip.
+	for attempt := 0; attempt < 2; attempt++ {
+		var (
+			id     int64
+			fakeIP string
+		)
+		querySQL := fmt.Sprintf("SELECT id, fake_ip FROM %s WHERE domain = ?", p.mapTable)
+		if err := p.db.QueryRowContext(ctx, querySQL, domain).Scan(&id, &fakeIP); err != nil {
+			return "", fmt.Errorf("query mapping: %w", err)
+		}
+		if fakeIP != pendingFakeIP {
+			// Keep the runtime table in step with what was just allocated.
+			if p.runtime != nil {
+				p.runtime.put(domain, fakeIP)
+			}
+			return fakeIP, nil
+		}
+
+		allocated, err := p.allocateFakeIP(uint64(id))
 		if err != nil {
 			return "", err
 		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			return "", err
+		// Only one process can flip the row; the loser re-reads the winner's
+		// value on the next iteration.
+		updateSQL := fmt.Sprintf("UPDATE %s SET fake_ip = ? WHERE id = ? AND fake_ip = ?", p.mapTable)
+		if _, err := p.db.ExecContext(ctx, updateSQL, allocated, id, pendingFakeIP); err != nil {
+			return "", fmt.Errorf("update mapping: %w", err)
 		}
-
-		base := p.prefix.Addr().As4()
-		baseUint := binary.BigEndian.Uint32(base[:])
-		ones, bits := p.prefix.Bits(), p.prefix.Addr().BitLen()
-		maxHosts := uint32(1<<(bits-ones)) - 2
-		offset := uint32(id)%maxHosts + 1
-		targetUint := baseUint + offset
-		fakeIP = fmt.Sprintf("%d.%d.%d.%d", byte(targetUint>>24), byte(targetUint>>16), byte(targetUint>>8), byte(targetUint))
-
-		updateSQL := fmt.Sprintf("UPDATE %s SET fake_ip = ? WHERE id = ?", p.mapTable)
-		if _, err := p.db.Exec(updateSQL, fakeIP, id); err != nil {
-			return "", err
-		}
-	} else if err != nil {
-		return "", err
 	}
-
-	upsertIPSQL := fmt.Sprintf(`
-		INSERT INTO %s (domain, real_ip, last_seen)
-		VALUES (?, ?, ?)
-		ON CONFLICT(domain, real_ip) DO UPDATE SET last_seen = excluded.last_seen`,
-		p.ipTable,
-	)
-	for _, ip := range realIPs {
-		_, _ = p.db.Exec(upsertIPSQL, domain, ip, now)
-	}
-
-	return fakeIP, nil
+	return "", fmt.Errorf("fake ip for %q is still pending after allocation", domain)
 }
 
-func (p *FakeIPNatPlugin) runHookScript(fakeIP, domain, latestIPs string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	// 传参顺序:
-	// $1 = 虚拟IP
-	// $2 = 域名
-	// $3 = 数据库路径
-	// $4 = 本次解析到的全部真实IP (逗号分隔)
-	// $5 = 配置的网段 (如 198.18.0.0/16)
-	// $6 = 表名前缀 (如 oversea)
-	// $7 = 默认路由下一跳网关 (未配置为空字符串 "")
-	// $8 = 下一跳出站网卡 (未配置为空字符串 "")
-	cmd := exec.CommandContext(ctx, "/bin/sh", p.script, fakeIP, domain, p.dbPath, latestIPs, p.cidr, p.tablePrefix, p.nextHop, p.nextHopDev)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		p.L().Error("hook script failed", zap.String("fake_ip", fakeIP), zap.String("domain", domain), zap.ByteString("output", out), zap.Error(err))
+// allocateFakeIP maps a monotonic row id into the configured prefix. The first
+// host of the range is owned by the tun device (see reservedFakeIP), so
+// allocation starts after it and hands out only the remaining addresses.
+func (p *FakeIPNatPlugin) allocateFakeIP(id uint64) (string, error) {
+	if id == 0 {
+		id = 1
 	}
+	usable := p.maxHosts - reservedHostOffset
+	if p.maxHosts <= reservedHostOffset {
+		return "", fmt.Errorf("ipv4_range %s has no allocatable address: first host is reserved for the tun device", p.cidr)
+	}
+	base := p.prefix.Addr().As4()
+	baseUint := uint64(binary.BigEndian.Uint32(base[:]))
+	offset := (id-1)%usable + reservedHostOffset + 1
+	targetUint := baseUint + offset
+	if targetUint > 0xFFFFFFFF {
+		return "", fmt.Errorf("allocated address out of range for %s (row id %d)", p.cidr, id)
+	}
+	var a [4]byte
+	binary.BigEndian.PutUint32(a[:], uint32(targetUint))
+	addr := netip.AddrFrom4(a)
+	p.L().Debug("fakeip nat: address allocated",
+		zap.Uint64("row_id", id), zap.Uint64("offset", offset), zap.String("fake_ip", addr.String()))
+	return addr.String(), nil
+}
+
+// upsertRealIPs stores all real ips of domain in one round trip.
+func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, realIPs []string, now int64) error {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(p.ipTable)
+	b.WriteString(" (domain, real_ip, last_seen) VALUES ")
+
+	args := make([]interface{}, 0, len(realIPs)*3)
+	seen := make(map[string]struct{}, len(realIPs))
+	n := 0
+	for _, ip := range realIPs {
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		if n > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(?,?,?)")
+		args = append(args, domain, ip, now)
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	b.WriteString(" ON CONFLICT(domain, real_ip) DO UPDATE SET last_seen = excluded.last_seen")
+	_, err := p.db.ExecContext(ctx, b.String(), args...)
+	return err
+}
+
+// dispatchNAT starts the data plane work for one fake ip without blocking the
+// query path. The NAT path maps the fake ip to a reachable real ip; the tun
+// path routes the whole range instead, so there is nothing per-domain to do.
+func (p *FakeIPNatPlugin) dispatchNAT(fakeIP, domain, latestIPs string) {
+	if p.useTun {
+		p.L().Debug("fakeip nat: nat dispatch skipped, tun data plane owns the range",
+			zap.String("domain", domain), zap.String("fake_ip", fakeIP))
+		return
+	}
+	p.enqueueTask(domain, func() {
+		p.syncNAT(context.Background(), fakeIP, domain, latestIPs)
+	})
+}
+
+// enqueueTask runs fn in the background: at most one task per domain and at
+// most defaultTaskConcurrency tasks overall.
+func (p *FakeIPNatPlugin) enqueueTask(domain string, fn func()) {
+	p.taskMu.Lock()
+	if _, ok := p.taskInFlight[domain]; ok {
+		p.taskMu.Unlock()
+		p.L().Debug("nat task already running for domain", zap.String("domain", domain))
+		return
+	}
+	select {
+	case p.taskSem <- struct{}{}:
+		p.taskInFlight[domain] = struct{}{}
+		p.taskMu.Unlock()
+	default:
+		p.taskMu.Unlock()
+		p.L().Warn("nat task concurrency limit reached, skip", zap.String("domain", domain), zap.Int("limit", cap(p.taskSem)))
+		return
+	}
+
+	go func() {
+		defer func() {
+			<-p.taskSem
+			p.taskMu.Lock()
+			delete(p.taskInFlight, domain)
+			p.taskMu.Unlock()
+		}()
+		fn()
+	}()
 }

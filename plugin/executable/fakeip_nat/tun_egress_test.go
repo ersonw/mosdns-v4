@@ -1,0 +1,106 @@
+package fakeipnat
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ersonw/mosdns-v4/coremain"
+	"go.uber.org/zap"
+)
+
+func TestTunRoutePlan(t *testing.T) {
+	plan := tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100")
+	if len(plan) != 3 {
+		t.Fatalf("plan has %d steps, want 3", len(plan))
+	}
+	want := "ip route replace default via 192.168.1.1 dev en0 table 100"
+	if got := strings.Join(plan[0], " "); got != want {
+		t.Fatalf("route step = %q, want %q", got, want)
+	}
+	if got := strings.Join(plan[1], " "); got != "ip rule del from 198.18.0.0/15 lookup 100" {
+		t.Fatalf("rule delete step = %q", got)
+	}
+	if got := strings.Join(plan[2], " "); got != "ip rule add from 198.18.0.0/15 lookup 100" {
+		t.Fatalf("rule add step = %q", got)
+	}
+
+	// Without a device the gateway alone still describes the table.
+	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "", "100")
+	if got := strings.Join(plan[0], " "); got != "ip route replace default via 192.168.1.1 table 100" {
+		t.Fatalf("gateway-only route = %q", got)
+	}
+
+	// Without a gateway the device alone carries the default route.
+	plan = tunRoutePlan("198.18.0.0/15", "", "en0", "100")
+	if got := strings.Join(plan[0], " "); got != "ip route replace default dev en0 table 100" {
+		t.Fatalf("device-only route = %q", got)
+	}
+
+	// Neither one: nothing can be installed.
+	if plan := tunRoutePlan("198.18.0.0/15", "", "", "100"); plan != nil {
+		t.Fatalf("plan without gateway or device = %v, want nil", plan)
+	}
+}
+
+func newRouteTestPlugin(t *testing.T, extra *Args) *FakeIPNatPlugin {
+	t.Helper()
+	args := &Args{
+		DBPath:      filepath.Join(t.TempDir(), "fakeip.db"),
+		TablePrefix: "tunroute",
+		IPv4Range:   "198.18.0.0/16",
+		UseTun:      true,
+	}
+	if extra != nil {
+		*args = *extra
+		args.DBPath = filepath.Join(t.TempDir(), "fakeip.db")
+	}
+	bp := coremain.NewBP("test_tun_egress", PluginType, zap.NewNop(), nil)
+	plugin, err := Init(bp, args)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	fp := plugin.(*FakeIPNatPlugin)
+	t.Cleanup(func() { _ = fp.Close() })
+	return fp
+}
+
+func TestTunRouteTableDefault(t *testing.T) {
+	fp := newRouteTestPlugin(t, nil)
+	if fp.tunRouteTable != "100" {
+		t.Fatalf("tunRouteTable = %q, want 100", fp.tunRouteTable)
+	}
+}
+
+func TestTunRouteTableRejectsBadName(t *testing.T) {
+	bp := coremain.NewBP("test_tun_egress", PluginType, zap.NewNop(), nil)
+	_, err := Init(bp, &Args{
+		DBPath:        filepath.Join(t.TempDir(), "fakeip.db"),
+		TablePrefix:   "tunroute",
+		IPv4Range:     "198.18.0.0/16",
+		UseTun:        true,
+		TunRouteTable: "bad name!",
+	})
+	if err == nil {
+		t.Fatalf("an invalid tun_route_table must be rejected")
+	}
+}
+
+func TestParseIPRouteDefault(t *testing.T) {
+	hop, dev := parseIPRouteDefault("default via 192.168.1.1 dev eth0 proto dhcp metric 100\n")
+	if hop != "192.168.1.1" || dev != "eth0" {
+		t.Fatalf("got hop=%q dev=%q", hop, dev)
+	}
+	hop, dev = parseIPRouteDefault("")
+	if hop != "" || dev != "" {
+		t.Fatalf("empty output must stay empty, got hop=%q dev=%q", hop, dev)
+	}
+}
+
+func TestParseBSDDefaultRoute(t *testing.T) {
+	out := "   route to: default\ndestination: default\n      gateway: 192.168.88.1\n  interface: en0\n      flags: <UP,GATEWAY,DONE,STATIC,PRCLONING,GLOBAL>\n"
+	hop, dev := parseBSDDefaultRoute(out)
+	if hop != "192.168.88.1" || dev != "en0" {
+		t.Fatalf("got hop=%q dev=%q", hop, dev)
+	}
+}

@@ -1,0 +1,1054 @@
+# =============================================================================
+# mosdns v4 configuration (customized build: fakeip_nat / TUN / NAT data plane)
+# =============================================================================
+# This file has two parts:
+#
+#   1. The uncommented block below is the MINIMAL WORKING CONFIG. It only
+#      contains log + one forwarder + one sequence + one server, which is
+#      enough to start the daemon and answer queries.
+#
+#   2. After the "REFERENCE" banner, every configurable option of every
+#      registered plugin and of the top-level schema is listed, fully
+#      commented out, with an English description: purpose, default value,
+#      accepted values and how to use it.
+#
+# How to enable a commented option:
+#   - remove the leading "# " (hash + one space) from the lines of the
+#     fragment; the remaining indentation is already correct;
+#   - move the block under the matching top-level key ("plugins:", "servers:"...);
+#   - reload/restart mosdns.
+#
+# Notes:
+#   - Plugin args are decoded with mapstructure using ErrorUnused: true.
+#     An unknown key or a typo in a field name makes startup FAIL, so keep
+#     the exact names shown here.
+#   - Values marked "required" must be present; everything else is optional.
+#   - Three packages (padding, query_summary, misc_optm) only expose preset
+#     plugins (tags starting with "_"); they cannot be declared with a
+#     "type:" entry. See "PRESET PLUGINS" at the bottom.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# MINIMAL WORKING CONFIG (active)
+# - data_providers: two v2dat files (geosite + geoip) and one plain-text list,
+#   all auto-reloaded when the file changes.
+# - two forwarders: a local upstream and a pinned public pair (1.1.1.1/8.8.8.8).
+# - one workflow branch: CN domains go to the local upstream and stop;
+#   everything else goes to the public pair and is then rewritten to a fake IP
+#   by fakeip_nat.
+#
+# IMPORTANT: the provider files must exist before startup, otherwise the
+# process aborts while loading data_providers. Point them at your own copies
+# if the paths differ. fakeip_nat's db_path directory must also exist.
+# Change 127.0.0.1 to 0.0.0.0 to serve the LAN, and add a tcp listener if
+# plain-TCP DNS is needed (see the reference section).
+# -----------------------------------------------------------------------------
+log:
+  level: debug
+
+data_providers:
+  # v2dat, v2ray geosite format. Referenced as "provider:<tag>:<code>",
+  # where <code> is the country code inside the dat (cn here).
+  - tag: geosite
+    file: etc/mosdns/rule/geosite.dat
+    auto_reload: true
+
+  # v2dat, v2ray geoip format. Same "provider:<tag>:<code>" referencing.
+  - tag: geoip
+    file: etc/mosdns/rule/geoip.dat
+    auto_reload: true
+
+  # Plain text: one domain / keyword / regexp per line.
+  # Referenced as "provider:<tag>" without a code suffix.
+  - tag: cn_domains_text
+    file: etc/mosdns/rule/cn_domains.txt
+    auto_reload: true
+
+plugins:
+  # 1) Local forwarder: the resolver reachable from this host / LAN.
+  #    Pinned to a fixed IP so no bootstrap lookup is needed.
+  - tag: forward_local
+    type: fast_forward
+    args:
+      upstream:
+        - addr: 192.168.1.1
+          enable_pipeline: true
+
+  # 2) Public forwarder: explicitly pinned public resolvers.
+  #    Both upstreams are queried in parallel; the first valid answer wins.
+  - tag: forward_public
+    type: fast_forward
+    args:
+      upstream:
+        - addr: 1.1.1.1
+          enable_pipeline: true
+        - addr: 8.8.8.8
+          enable_pipeline: true
+
+  # 3) Domain matcher: CN domains from the geosite dat plus the text list.
+  #    Do NOT put the geoip dat here: it stores CIDRs, not domains, and the
+  #    domain parser turns it into a bogus rule instead of failing loudly.
+  #    Verified: with "provider:geoip:cn" in this list every name matched the
+  #    CN branch, so fakeip never ran and clients got real IPs.
+  #    geoip belongs in a response_matcher "ip" field, see match_cn_ip below.
+  - tag: match_cn_domain
+    type: query_matcher
+    args:
+      domain:
+        - "provider:geosite:cn"
+        - "provider:cn_domains_text"
+
+  # 4) Response IP matcher over the geoip dat. Not used by the workflow below;
+  #    uncomment it when you want a branch such as
+  #      - if: match_cn_ip
+  #        exec: [...]
+  #    Note: the dat must actually contain the "cn" category, otherwise
+  #    startup fails with "tag cn does not exist".
+  # - tag: match_cn_ip
+  #   type: response_matcher
+  #   args:
+  #     ip:
+  #       - "provider:geoip:cn"
+
+  # 5) fake-IP + data plane. Answers A queries inside ipv4_range with a fake
+  #    IP and records domain -> fake IP -> real IP in SQLite. use_tun: false
+  #    keeps the built-in nftables NAT data plane (Linux); on macOS the nft
+  #    commands fail with an error log but DNS rewriting still works.
+  - tag: fakeip
+    type: fakeip_nat
+    args:
+      # Keep this path inside the directory tree that actually exists: SQLite
+      # reports a missing directory as "unable to open database file: out of
+      # memory (14)" (SQLITE_CANTOPEN), and mosdns does not create it.
+      # Relative to the process working directory, same style as the
+      # data_providers above. Use /etc/mosdns/fakeip.db on a Linux deploy where
+      # the process runs from /.
+      db_path: etc/mosdns/fakeip.db
+      table_prefix: default
+      ipv4_range: 198.18.0.0/15
+      ttl: 60
+      use_tun: true
+
+  # 6) Workflow: CN -> local (stop), otherwise public -> fake IP.
+  - tag: main
+    type: sequence
+    args:
+      exec:
+        - if: match_cn_domain
+          exec:
+            - forward_local
+            - _return
+        - forward_public
+        - fakeip
+
+servers:
+  - exec: main
+    listeners:
+      # Local debug port. 53 is a privileged port (a normal user gets
+      # "bind: permission denied"), and 5353 is already taken by mDNS
+      # responders such as Chrome on this Mac. 1053 is free.
+      # On a Linux deploy change this to 0.0.0.0:53 and run as root (or grant
+      # CAP_NET_BIND_SERVICE). Add a second listener with protocol: tcp if
+      # plain-TCP DNS is needed.
+      - protocol: udp
+        addr: 127.0.0.1:53
+
+
+# =============================================================================
+# REFERENCE - TOP-LEVEL OPTIONS
+# =============================================================================
+
+# log - process logging (zap).
+# The logger is shared by the whole process; a plugin's logs inherit this
+# level, so "level: debug" is also the only way to see fakeip_nat's per-packet,
+# per-command and per-connection logs.
+# -----------------------------------------------------------------------------
+# log:
+#   level: info        # debug | info | warn | error. Default: info.
+#                      #   debug - per-packet / per-connection detail (very verbose)
+#                      #   info  - lifecycle events only
+#                      #   warn  - recoverable anomalies
+#                      #   error - a feature can no longer work
+#   file: ""           # Optional. Write ALL logs to this file instead of stderr.
+#                      #   Example: /etc/mosdns/mosdns.log
+#   err_file: ""       # Optional. Additionally write error-level logs to this file.
+#   info_file: ""      # Optional. Additionally write info-level logs to this file.
+
+# include - split the configuration into several files.
+# Each file uses exactly the same schema; entries are merged with the main file.
+# -----------------------------------------------------------------------------
+# include:
+#   - /etc/mosdns/rules/local.yaml
+#   - /etc/mosdns/rules/upstreams.yaml
+
+# data_providers - named files that matchers / hosts / redirect reference.
+# Two file families are supported; the file itself must exist at startup.
+#   * plain text  - one domain / keyword / regexp ("domain ip" for hosts)
+#                   per line. Referenced as "provider:<tag>".
+#   * v2dat       - v2ray geosite (domains) or geoip (CIDR) protobuf.
+#                   Referenced as "provider:<tag>:<category>", where
+#                   <category> is the country code stored inside the dat
+#                   (for example "cn"). Using the plain form on a dat file
+#                   makes the plugin try to parse it as text and fail, and a
+#                   missing category fails with "tag <code> does not exist".
+# auto_reload - watch the file with fsnotify and rebuild every matcher that
+#               uses this provider on change ("reloading file" / "file
+#               reloaded" at info level). Default: false.
+# -----------------------------------------------------------------------------
+# data_providers:
+#   - tag: oversea_domains                      # required, unique provider name
+#     file: /etc/mosdns/rule/oversea_domains.txt# required, plain text list:
+#                                               #   one domain / keyword / regexp per line
+#     auto_reload: true                         # optional, watch the file and reload it
+#
+#   - tag: geosite_cn                           # v2dat, geosite format
+#     file: /etc/mosdns/rule/geosite_cn.dat     # use "provider:geosite_cn:cn"
+#     auto_reload: true
+#
+#   - tag: geoip_cn                             # v2dat, geoip format
+#     file: /etc/mosdns/rule/geoip_cn.dat       # use "provider:geoip_cn:cn"
+#     auto_reload: true
+#
+#   - tag: my_hosts
+#     file: /etc/mosdns/rule/my_hosts.txt       # "domain ip" per line, for hosts plugin
+#     auto_reload: true
+
+# api - HTTP endpoint for Prometheus metrics and pprof profiling.
+# metrics_collector exports to this endpoint; without it nothing is exposed.
+# -----------------------------------------------------------------------------
+# api:
+#   http: "127.0.0.1:8080"   # listen address; empty string disables the endpoint
+
+# security - experimental bad-client observer.
+# client_limiter reports refused clients here; the observer aggregates them and
+# optionally calls an exec_script plugin when the set changes.
+# -----------------------------------------------------------------------------
+# security:
+#   bad_ip_observer:
+#     threshold: 0          # required to enable: 0 disables, >0 = bad events
+#                           # within "interval" before an IP is marked bad
+#     interval: 10          # seconds, sampling window. Default: 10
+#     ttl: 600              # seconds an IP stays marked. Default: 600
+#     on_update_callback: ""# optional exec_script plugin tag invoked on every update
+#     ipv4_mask: 32         # aggregate IPv4 clients into prefixes. Default: 32
+#     ipv6_mask: 48         # aggregate IPv6 clients into prefixes. Default: 48
+
+# servers - entry points that accept client queries and hand them to a sequence.
+# -----------------------------------------------------------------------------
+# servers:
+#   - exec: main            # required, tag of the sequence (or executable) to run
+#     timeout: 5            # optional, per-query timeout in seconds. Default: 5
+#     listeners:
+#       - protocol: udp     # "", "udp"  -> plain UDP
+#                           # "tcp"         -> plain TCP
+#                           # "dot","tls"   -> DNS over TLS (needs cert + key)
+#                           # "doh","https" -> DNS over HTTPS (needs cert + key)
+#                           # "http"        -> DoH without TLS (behind a reverse proxy)
+#         addr: 0.0.0.0:53  # required, host:port to listen on
+#         cert: ""          # optional, certificate path (dot / doh)
+#         key: ""           # optional, private key path (dot / doh)
+#         url_path: ""      # optional, DoH path. Empty = accept any path
+#         get_user_ip_from_header: "" # optional, DoH/HTTP header carrying the real
+#                                     # client IP, e.g. X-Forwarded-For
+#         proxy_protocol: false       # optional, accept PROXY protocol v1/v2
+#         idle_timeout: 0             # optional, seconds for tcp/dot/doh idle
+#                                     # connections. Default: 10
+#         unix: false                 # optional, addr is a unix socket path
+
+
+# =============================================================================
+# REFERENCE - EXECUTABLE PLUGINS (24 types can be declared with "type:")
+# =============================================================================
+# Order below is alphabetical. Every plugin is declared as:
+#
+#   - tag: <unique-name>     # required, referenced from sequences / args
+#     type: <plugin-type>    # required, one of the types below
+#     args: {...}            # required or optional depending on the plugin
+#
+# Tip: a plugin that fails to initialize aborts startup, so uncomment one
+# block at a time and check the log.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# type: arbitrary - answer queries from static DNS records.
+# Use it: place it before a forwarder in a sequence to serve small zones
+# locally (lab hosts, sinkholes, pinned records).
+# Args:
+#   rr - list of DNS records in RFC 1035 zone-file text. Each element may
+#        contain several lines. Matching name+type is answered directly and
+#        the chain stops for that query.
+# Default: empty list (the plugin does nothing).
+# -----------------------------------------------------------------------------
+#   - tag: local_zone
+#     type: arbitrary
+#     args:
+#       rr:
+#         - "nas.lan. 60 IN A 192.168.1.10"
+#         - "nas.lan. 60 IN AAAA fd00::10"
+#         - "*.lab.lan. 60 IN A 192.168.1.20"
+
+# -----------------------------------------------------------------------------
+# type: blackhole - block queries by answering a fixed IP or a fixed rcode.
+# Use it: put it in a sequence branch for ad/tracker domains.
+# Args:
+#   ipv4 - list of IPv4 addresses returned for A queries (e.g. 0.0.0.0).
+#   ipv6 - list of IPv6 addresses returned for AAAA queries (e.g. ::).
+#   rcode - answer with this DNS rcode instead of an IP (3 = NXDOMAIN,
+#           0 = NOERROR with empty answer, 2 = SERVFAIL).
+# If both an IP list and rcode are set, the rcode wins; set only one of them.
+# Default: all empty (no blocking).
+# -----------------------------------------------------------------------------
+#   - tag: block_ads
+#     type: blackhole
+#     args:
+#       ipv4:
+#         - 0.0.0.0
+#       ipv6:
+#         - "::"
+#       rcode: 3
+
+# -----------------------------------------------------------------------------
+# type: bufsize - declare the maximum UDP response size advertised to clients.
+# Use it: first step of the entry sequence, before cache/forward, when clients
+# must be told a smaller EDNS0 UDP payload than the default.
+# Args:
+#   size - uint16, valid range 512-4096. Default: 512.
+# -----------------------------------------------------------------------------
+#   - tag: bufsize
+#     type: bufsize
+#     args:
+#       size: 1232
+
+# -----------------------------------------------------------------------------
+# type: cache - cache DNS responses (memory, or Redis for sharing).
+# Use it: first executable in the main sequence; it answers repeats and lets
+# the rest of the chain run only on a miss.
+# Args:
+#   size - total number of entries in the in-memory cache, split across
+#          shards. Default: 0 (minimum cache, 16 entries per shard).
+#          Typical: 10240 - 102400. Ignored when "redis" is set.
+#   redis - optional Redis URL for a shared cache, e.g.
+#           redis://127.0.0.1:6379/0 or redis://user:pass@host:6379/1.
+#           Empty = in-memory cache.
+#   redis_timeout - Redis command timeout in MILLISECONDS. Default: 0
+#                   (driver default). Only used with "redis".
+#   lazy_cache_ttl - seconds. >0 enables lazy caching: expired entries are
+#                    still served (for up to this long) while the chain
+#                    refreshes them in the background. Default: 0 (disabled).
+#   lazy_cache_reply_ttl - TTL written into stale answers, seconds.
+#                          Values <=0 are replaced by 5. Default: 5.
+#   cache_everything - cache responses even for queries that are not a single
+#                      simple question. Default: false.
+#   compress_resp - store/decompress compressed responses (saves memory).
+#                   Default: false.
+#   when_hit - optional tag of an executable to run on a cache HIT before the
+#              cached answer is returned (e.g. a metrics or logging plugin).
+# -----------------------------------------------------------------------------
+#   - tag: cache
+#     type: cache
+#     args:
+#       size: 20480
+#       redis: ""
+#       redis_timeout: 100
+#       lazy_cache_ttl: 60
+#       lazy_cache_reply_ttl: 5
+#       cache_everything: true
+#       compress_resp: false
+#       when_hit: ""
+
+# -----------------------------------------------------------------------------
+# type: client_limiter - per-client-IP query rate limit.
+# Use it: at the very beginning of the entry sequence to protect upstreams.
+# Args:
+#   max_qps - allowed queries per second per client prefix. Set a positive
+#             value; clients above it get REFUSED and are reported to
+#             security.bad_ip_observer.
+#   v4_mask - IPv4 prefix length used to group clients. Default: 32
+#             (one bucket per address).
+#   v6_mask - IPv6 prefix length. Default: 48 (one bucket per /48).
+# -----------------------------------------------------------------------------
+#   - tag: limiter
+#     type: client_limiter
+#     args:
+#       max_qps: 50
+#       v4_mask: 32
+#       v6_mask: 48
+
+# -----------------------------------------------------------------------------
+# type: dual_selector - prefer an address family when both A and AAAA exist.
+# Use it: after a forwarder, before cache/response processing, so clients see
+# only the preferred family when both are usable.
+# Args:
+#   mode - 0 = prefer IPv4, 1 = prefer IPv6. Default: 0.
+#   wait_timeout - milliseconds to wait for the preferred family sub-query
+#                  before falling back to the other one. Default: 250.
+# Presets "_prefer_ipv4" / "_prefer_ipv6" give the same behavior without args.
+# -----------------------------------------------------------------------------
+#   - tag: prefer_v4
+#     type: dual_selector
+#     args:
+#       mode: 0
+#       wait_timeout: 250
+
+# -----------------------------------------------------------------------------
+# type: ecs - add/replace EDNS Client Subnet.
+# Use it: before a forwarder when the upstream can use subnet information
+# (CDN accuracy), or to strip client subnets by forcing a fixed one.
+# Args:
+#   auto - true = derive ECS from the client address and ignore ipv4/ipv6.
+#          Default: false.
+#   force_overwrite - true = replace an ECS option already present in the
+#                     query. Default: false (keep the client's option).
+#   mask4 - IPv4 prefix length for the generated ECS. Default: 24.
+#   mask6 - IPv6 prefix length. Default: 48.
+#   ipv4 - fixed IPv4 subnet to advertise when auto is false, e.g. 1.2.3.0.
+#   ipv6 - fixed IPv6 subnet to advertise when auto is false.
+# -----------------------------------------------------------------------------
+#   - tag: ecs
+#     type: ecs
+#     args:
+#       auto: true
+#       force_overwrite: false
+#       mask4: 24
+#       mask6: 48
+#       ipv4: ""
+#       ipv6: ""
+
+# -----------------------------------------------------------------------------
+# type: edns0_filter - keep or remove EDNS0 options.
+# Use it: before a forwarder to sanitize queries (drop unknown options, or
+# keep only the ones an upstream understands).
+# Args:
+#   no_edns - true removes the whole OPT record. Highest priority.
+#   accept - list of EDNS0 option codes to KEEP; all others are removed.
+#   discard - list of EDNS0 option codes to REMOVE; all others are kept.
+# Priority: no_edns > accept > discard. If neither accept nor discard is set,
+# every EDNS0 option is discarded (OPT record itself is kept).
+# Presets: "_edns0_filter_no_edns0", "_edns0_filter_ecs_only", "_no_ecs".
+# -----------------------------------------------------------------------------
+#   - tag: edns0_filter
+#     type: edns0_filter
+#     args:
+#       no_edns: false
+#       accept: [8, 10]        # 8 = ECS, 10 = COOKIE
+#       discard: [12]          # 12 = PADDING
+
+# -----------------------------------------------------------------------------
+# type: exec_script - run an external program per query and let it rewrite the
+# query/response.
+# Use it: custom routing, logging to a file, or integration with an existing
+# Python/Bash workflow (the nat_map.py style scripts).
+# Args:
+#   script_path - required. Program to execute; it receives the query context
+#                 over stdin/stdout as JSON (see plugin docs).
+#   dedup_ttl - seconds to suppress repeated executions for the same client IP.
+#               Default: 300.
+#   async - true = run the script without blocking the query chain;
+#           false = wait for the script result. Default: true.
+# -----------------------------------------------------------------------------
+#   - tag: my_script
+#     type: exec_script
+#     args:
+#       script_path: /etc/mosdns/nat_map.py
+#       dedup_ttl: 300
+#       async: true
+
+# -----------------------------------------------------------------------------
+# type: fakeip_nat - fake-IP DNS + NAT/TUN data plane (this branch's main
+# feature). It answers A queries inside ipv4_range with a fake IP, stores the
+# domain -> fake IP -> real IP mapping in SQLite, and then either:
+#   - NAT mode (use_tun: false, default): installs nftables DNAT rules and
+#     /32 host routes so packets to the fake IP reach the real server;
+#   - TUN mode (use_tun: true): creates a TUN device, routes ipv4_range into
+#     it, terminates TCP/UDP with a gVisor stack and dials the real target
+#     (directly, or through "proxy" if it is configured and reachable).
+# Place it AFTER the forwarder in the sequence so real IPs are already known.
+# Args:
+#   db_path - SQLite file holding the mapping tables.
+#             Default: /config/mosdns/fakeip.db
+#   table_prefix - prefix of the two tables: <prefix>_mapping (domain <-> fake
+#                  IP) and <prefix>_real_ips (recent real IPs per domain).
+#                  Default: "default". Use one prefix per independent range.
+#   ipv4_range - fake IP CIDR. The first address of the range is reserved for
+#                the gateway/TUN device and is never allocated.
+#                Default: 198.18.0.0/15
+#   ttl - TTL in seconds for fake-IP answers. Default: 60
+#   next_hop - gateway for the real destination when it is not on a directly
+#              connected network. Empty = system default route. In NAT mode it
+#              only affects the /32 host routes; in TUN mode (direct outlet) it
+#              becomes the default route of the dedicated table below.
+#   next_hop_dev - outbound interface for that gateway. Empty = route lookup
+#                  decides. In TUN mode it also binds the outlet socket
+#                  (SO_BINDTODEVICE / IP_BOUND_IF).
+#   script - DEPRECATED compatibility slot; script callbacks were removed.
+#            Keeping it lets old configs start, but it only logs a warning
+#            and has no effect. Omit it in new configs.
+#   route_table - NAT mode: routing table that receives the host routes.
+#                 Default: "main"
+#   route_aggregation - NAT mode: aggregate /32 host routes into strict
+#                       supernets to shrink the route table. Default: true
+#   tun_route_table - TUN mode, direct outlet only: dedicated routing table.
+#                     The plugin writes "default via next_hop dev next_hop_dev"
+#                     into it and adds
+#                       ip rule from <ipv4_range> lookup <table>
+#                     so the sockets opened for a flow leave through the
+#                     configured gateway with the range address as source.
+#                     Skipped when a proxy is configured. Linux only: darwin has
+#                     one table, so it binds the outlet to next_hop_dev instead.
+#                     Default: "100"
+#   use_tun - false = built-in nftables NAT (default); true = TUN data plane.
+#             TUN mode needs root/CAP_NET_ADMIN and a working TUN driver
+#             (Linux /dev/net/tun, macOS utun, Windows wintun.dll).
+#   tun_dev - TUN mode device name. Empty = auto-allocate the first free
+#             name in the mth0, mth1, ... sequence (a leftover device whose
+#             address is still the first address of the range is reused).
+#             Non-empty = reuse that device, create it if missing.
+#   proxy - TUN mode outbound proxy URL used for TCP, e.g.
+#           socks5://user:pass@host:1080, socks5h://host:1080,
+#           http://host:8080, trojan://pass@host:443?sni=host
+#           Empty = direct dial. The proxy is probed at startup; on failure
+#           the plugin logs a warning and falls back to direct.
+#   proxy_insecure - skip certificate verification for https/trojan proxies
+#                    (self-signed certificates). Default: false
+# -----------------------------------------------------------------------------
+#   - tag: fakeip
+#     type: fakeip_nat
+#     args:
+#       db_path: /config/mosdns/fakeip.db
+#       table_prefix: default
+#       ipv4_range: 198.18.0.0/15
+#       ttl: 60
+#       next_hop: ""
+#       next_hop_dev: ""
+#       route_table: main
+#       route_aggregation: true
+#       tun_route_table: 100
+#       use_tun: false
+#       tun_dev: ""
+#       proxy: ""
+#       proxy_insecure: false
+
+# -----------------------------------------------------------------------------
+# type: fast_forward - concurrent, pipelined forwarder (recommended).
+# Use it: whenever you need to send a query to one or more upstream servers.
+# It queries all upstreams concurrently and returns the first valid answer.
+# Args:
+#   upstream - required, at least one entry. Per-entry fields:
+#     addr - required. Upstream URL/address:
+#            "8.8.8.8", "8.8.8.8:53", "udp://8.8.8.8", "tcp://8.8.8.8",
+#            "tls://dns.example.com", "https://dns.example.com/dns-query",
+#            "quic://dns.example.com", "h3://dns.example.com/dns-query".
+#     dial_addr - optional. Dial this host:port instead of the address in
+#                 "addr" (keeps the TLS SNI / HTTP Host of addr).
+#     trusted - optional. true = accept and cache answers for this upstream
+#               even if they are not "legit" (useful for local resolvers).
+#     socks5 - optional. Route this upstream through a SOCKS5 proxy,
+#              e.g. 127.0.0.1:1080.
+#     so_mark - optional. Linux only: SO_MARK value for policy routing.
+#     bind_to_device - optional. Linux only: bind the socket to this interface.
+#     idle_timeout - optional, seconds before an idle connection is closed.
+#     max_conns - optional, max concurrent connections per upstream.
+#     enable_pipeline - optional. Reuse one TCP/TLS connection for many
+#                       in-flight queries (lower latency). false by default.
+#     enable_http3 - optional. Use HTTP/3 for DoH when available.
+#     bootstrap - optional. Resolver used to resolve the upstream hostname
+#                 (e.g. 8.8.8.8) so the upstream URL can use a domain.
+#     insecure_skip_verify - optional. Skip TLS verification for this upstream.
+#   ca - optional list of PEM files added to the trusted roots for DoT/DoH.
+# -----------------------------------------------------------------------------
+#   - tag: forward
+#     type: fast_forward
+#     args:
+#       upstream:
+#         - addr: https://dns.alidns.com/dns-query
+#           enable_pipeline: true
+#           bootstrap: 223.5.5.5
+#         - addr: tls://dns.google
+#           dial_addr: 8.8.8.8:853
+#       ca:
+#         - /etc/mosdns/ca.pem
+
+# -----------------------------------------------------------------------------
+# type: forward - classic forwarder built on dnsproxy.
+# Use it when you need the older behavior (single upstream per query, fixed
+# timeout, no concurrent fan-out).
+# Args:
+#   upstream - required, at least one entry. Per-entry fields:
+#     addr - required, upstream URL/address (same formats as fast_forward).
+#     ip_addr - optional list of IPs to use for the upstream hostname,
+#               bypassing system DNS for the upstream itself.
+#     trusted - DEPRECATED, kept for compatibility, has no effect.
+#   timeout - optional, per-query timeout in seconds. Default: forwarder
+#             internal default when 0.
+#   insecure_skip_verify - optional. Skip TLS certificate verification for
+#                          all upstreams. Default: false.
+#   bootstrap - optional list of bootstrap resolvers used to resolve upstream
+#               hostnames. Only applied when the list has at least one entry.
+# -----------------------------------------------------------------------------
+#   - tag: forward_old
+#     type: forward
+#     args:
+#       upstream:
+#         - addr: tls://dns.google
+#           ip_addr:
+#             - 8.8.8.8
+#       timeout: 5
+#       insecure_skip_verify: false
+#       bootstrap:
+#         - 223.5.5.5
+
+# -----------------------------------------------------------------------------
+# type: hosts - static A/AAAA overrides, /etc/hosts style.
+# Use it: first executable in the entry sequence to short-circuit local names.
+# Args:
+#   hosts - list of lines "domain ip [ip...]", or "provider:<tag>" to load a
+#           data_providers file with the same line format.
+# Default: empty (no overrides).
+# -----------------------------------------------------------------------------
+#   - tag: hosts
+#     type: hosts
+#     args:
+#       hosts:
+#         - "router.lan 192.168.1.1"
+#         - "nas.lan 192.168.1.10 fd00::10"
+#         - "provider:my_hosts"
+
+# -----------------------------------------------------------------------------
+# type: ipset - add answer IPs to Linux ipset sets (policy routing/firewall).
+# Platform: Linux only (other platforms fail at startup).
+# Use it: after a forwarder, when firewall rules consume the answer IPs.
+# Args:
+#   set_name4 - required for IPv4. Target ipset set name.
+#   set_name6 - required for IPv6. Target ipset set name.
+#   mask4 - IPv4 prefix length stored in the set. Default: 24.
+#   mask6 - IPv6 prefix length stored in the set. Default: 32.
+# -----------------------------------------------------------------------------
+#   - tag: ipset
+#     type: ipset
+#     args:
+#       set_name4: mosdns4
+#       set_name6: mosdns6
+#       mask4: 24
+#       mask6: 32
+
+# -----------------------------------------------------------------------------
+# type: marker - attach an internal mark to a query, or test it as a matcher.
+# Use it: as an executable to tag a branch ("this query came from the ads
+# branch"), then reference the same tag in an "if:" to test it later.
+# Args: none. Every marker instance receives its own mark id automatically.
+# It works both as an executable (sets the mark) and as a matcher.
+# -----------------------------------------------------------------------------
+#   - tag: marked_ads
+#     type: marker
+
+# -----------------------------------------------------------------------------
+# type: metrics_collector - export Prometheus metrics.
+# Use it: once, anywhere in the entry sequence; metrics are served by
+# api.http (/metrics). Args: none.
+# -----------------------------------------------------------------------------
+#   - tag: metrics
+#     type: metrics_collector
+
+# -----------------------------------------------------------------------------
+# type: nftset - add answer IPs to Linux nftables sets.
+# Platform: Linux only (other platforms fail at startup).
+# Use it: after a forwarder, when nftables rules consume the answer IPs.
+# Args:
+#   table_family4 - nftables family for IPv4: "ip" or "inet". Default empty
+#                   means the plugin's default family.
+#   table_family6 - nftables family for IPv6: "ip6" or "inet".
+#   table_name4 - target table name for IPv4.
+#   table_name6 - target table name for IPv6.
+#   set_name4 - target set name for IPv4.
+#   set_name6 - target set name for IPv6.
+#   mask4 - IPv4 prefix length stored in the set. Default: 24.
+#   mask6 - IPv6 prefix length stored in the set. Default: 32.
+# -----------------------------------------------------------------------------
+#   - tag: nftset
+#     type: nftset
+#     args:
+#       table_family4: inet
+#       table_family6: inet
+#       table_name4: mosdns
+#       table_name6: mosdns
+#       set_name4: mosdns4
+#       set_name6: mosdns6
+#       mask4: 24
+#       mask6: 32
+
+# -----------------------------------------------------------------------------
+# type: redirect - rewrite a query name to another name for the rest of the
+# chain, then restore the original name in the response.
+# Use it: map a local name to a public name ("grafana.lan -> grafana.example"),
+# or send a blocked name to a sinkhole domain.
+# Args:
+#   rule - list of "from to" pairs, exactly two whitespace-separated fields.
+#          "from" is matched with the plugin's domain matcher (full match or
+#          the wildcard syntax supported by that matcher); "to" is the
+#          replacement FQDN. Entries may also be "provider:<tag>".
+# -----------------------------------------------------------------------------
+#   - tag: redirect
+#     type: redirect
+#     args:
+#       rule:
+#         - "grafana.lan grafana.example.com"
+#         - "*.old.lan new.lan"
+
+# -----------------------------------------------------------------------------
+# type: reverse_lookup - map an answer IP back to a domain and answer PTR
+# queries from that mapping.
+# Use it: alongside fakeip_nat so that reverse DNS of fake IPs resolves to the
+# original domain.
+# Args:
+#   size - number of entries in the in-memory LRU. Default: 65536 (64*1024).
+#   redis - optional Redis URL to share the mapping across processes.
+#           Empty = memory only.
+#   handle_ptr - true = answer PTR queries for known IPs. Default: false.
+#   ttl - TTL in seconds for generated PTR answers. Default: 1800
+#         (30 minutes).
+# -----------------------------------------------------------------------------
+#   - tag: reverse_lookup
+#     type: reverse_lookup
+#     args:
+#       size: 65536
+#       redis: ""
+#       handle_ptr: true
+#       ttl: 1800
+
+# -----------------------------------------------------------------------------
+# type: ocserv_ctl - map the DNS client address to the ocserv user that owns it
+# and mark the query when they match. This is a query-chain step, not a control
+# interface: it runs occtl once per cache window and never exposes commands.
+# Requires the occtl binary (package ocserv) on the same host.
+# Args:
+#   socket - occtl socket file, e.g. /run/ocserv/occtl.socket.
+#   addr   - TCP endpoint ("host:port") for an occtl that speaks TCP.
+#            At most one of socket and addr may be set. Leave both empty and
+#            the plugin stays disabled: no occtl call, no mark, queries pass
+#            straight through.
+#   occtl_path - occtl binary. Default: "occtl" from PATH.
+#   timeout - upper bound for one occtl call, in seconds. Default: 3.
+#   cache_ttl - reuse the user list for this many seconds. Default: 15.
+#   mark - mark id added to the query when the client address belongs to a
+#          connected user; match it later with a marker plugin.
+#          Default: 0 (log only, no mark).
+# -----------------------------------------------------------------------------
+#   - tag: ocserv_user
+#     type: ocserv_ctl
+#     args:
+#       socket: /run/ocserv/occtl.socket
+#       addr: ""
+#       occtl_path: occtl
+#       timeout: 3
+#       cache_ttl: 15
+#       mark: 0
+
+# -----------------------------------------------------------------------------
+# type: telegram_bot - long-polling Telegram bot that manages this process.
+# It is not a DNS step. Declare it here and it stays loaded even when no
+# sequence calls it: plugin startup is independent of the execution chain.
+# Permissions are role based. Every administrator chat gets one role, a role
+# holds permissions and may inherit other roles, and the inherited set is
+# unioned. Permission names:
+#   status      - /status /plugins /plugin /perm
+#   fakeip      - /fip plus /list /stats /lookup /rev /del /clear
+#   ocserv      - /vpn (occtl passthrough, including kick/term)
+#   config      - /config show|get|set|add|del|validate
+#   reload      - /reload confirm
+#   exec_script - /exec <tag> <ip> <domain>, runs an already configured script
+#   admin       - every permission, built in for role "admin"
+# Args:
+#   token - bot token from @BotFather. Required; empty disables the plugin.
+#   chat_ids - administrator chat ids that use default_role. An old config
+#              that only lists chat_ids keeps full admin access.
+#   admins - chat_id plus role pairs, for fine grained access.
+#   roles - named permission sets. inherits pulls in another role, allow adds
+#           its own permissions.
+#   default_role - role for a chat listed only in chat_ids. Default "admin".
+#   fakeip_tags - fakeip_nat tags this bot may manage; the first one is the
+#                 default target of /fip. Default [fakeip].
+#   ocserv_tags - ocserv_ctl tags used by /vpn. Default [ocserv].
+#   config_path - config file /config edits. Default: -c from the command line,
+#                 else etc/mosdns/config.yaml.
+#   proxy - optional HTTP(S) or SOCKS5 proxy for api.telegram.org.
+#   api_base - Telegram API root, for a mirror or tests.
+#   poll_timeout - long-polling timeout in seconds. Default 30.
+# -----------------------------------------------------------------------------
+#   - tag: admin_bot
+#     type: telegram_bot
+#     args:
+#       token: "123456:replace-with-your-token"
+#       chat_ids: []
+#       admins:
+#         - chat_id: 100000001
+#           role: ops
+#         - chat_id: 100000002
+#           role: senior
+#       roles:
+#         ops:
+#           allow: [fakeip, ocserv]
+#         senior:
+#           inherits: [ops]
+#           allow: [exec_script, config, reload]
+#       default_role: admin
+#       fakeip_tags: [fakeip]
+#       ocserv_tags: [ocserv]
+#       config_path: etc/mosdns/config.yaml
+#       proxy: ""
+#       api_base: https://api.telegram.org
+#       poll_timeout: 30
+
+# -----------------------------------------------------------------------------
+# type: sequence - ordered execution of plugins, the core of every config.
+# Args:
+#   exec - the program. It can be:
+#     * a plugin/matcher tag string:
+#         exec: forward
+#     * a list (runs entries in order; a plugin that ends the chain, such as
+#       _return or a cache hit, stops the list):
+#         exec: [cache, forward, fakeip]
+#     * an if block (runs exec when the matcher matches, else_exec otherwise):
+#         exec:
+#           - if: match_ads
+#             exec: [block_ads, _return]
+#             else_exec: [forward]
+#       "if_and" behaves like "if" but requires ALL matcher tags listed in a
+#       list to match (use a list value instead of a single tag).
+#     * parallel (runs all branches concurrently, waits for all):
+#         exec:
+#           - parallel: [cache, forward]
+#     * load_balance (runs exactly one branch, chosen round-robin):
+#         exec:
+#           - load_balance: [forward_a, forward_b]
+#     * fallback (primary, switch to secondary on failure/slow responses):
+#         exec:
+#           - primary: [forward_primary]
+#             secondary: [forward_backup]
+#             stat_length: 10       # samples used to compute the failure rate
+#             threshold: 5          # switch when failures exceed this rate (%)
+#             fast_fallback: 300    # ms; 0 disables fast fallback
+#             always_standby: false # true = also send to secondary during fast fallback
+#   Preset "_return" ends the current sequence branch immediately.
+# -----------------------------------------------------------------------------
+#   - tag: main
+#     type: sequence
+#     args:
+#       exec:
+#         - cache
+#         - if: match_oversea
+#           exec:
+#             - forward_oversea
+#             - fakeip_oversea
+#             - _return
+#         - forward_local
+#         - fakeip_local
+
+# -----------------------------------------------------------------------------
+# type: sleep - delay the chain.
+# Use it: rate-limit a branch, or wait briefly before retrying upstream.
+# Args:
+#   duration - milliseconds to sleep. Required to have any effect; 0 = no-op.
+# -----------------------------------------------------------------------------
+#   - tag: sleep
+#     type: sleep
+#     args:
+#       duration: 500
+
+# -----------------------------------------------------------------------------
+# type: ttl - clamp response TTLs.
+# Use it: after a forwarder, before cache, to keep answers fresh.
+# Args:
+#   maximum_ttl - seconds. Responses with a larger TTL are lowered. 0 = no cap.
+#   minimal_ttl - seconds. Responses with a smaller TTL are raised. 0 = no floor.
+# Default: both 0 (no change).
+# -----------------------------------------------------------------------------
+#   - tag: ttl
+#     type: ttl
+#     args:
+#       maximum_ttl: 3600
+#       minimal_ttl: 60
+
+
+# =============================================================================
+# REFERENCE - MATCHER PLUGINS (2 types, used in "if:" / "if_and:")
+# =============================================================================
+# A matcher entry looks like a normal plugin entry but is only referenced by
+# name from sequence conditions; it never runs on its own.
+# All list fields accept plain values, "provider:<tag>" (text file) and
+# "provider:<tag>:<category>" (v2dat file, e.g. "provider:geosite_cn:cn").
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# type: query_matcher - match the query.
+# Args:
+#   client_ip - source address/prefix of the client, e.g. 192.168.1.0/24.
+#   ecs - EDNS Client Subnet address/prefix carried by the query.
+#   domain - query name; "full:example.com", "domain:example.com",
+#            "keyword:ads", "regexp:^ad[0-9]+\\." and "provider:<tag>"
+#            or "provider:<tag>:<category>" (v2dat) are supported forms.
+#   qtype - list of numeric DNS types (1=A, 28=AAAA, 5=CNAME, 65=HTTPS...).
+#   qclass - list of numeric DNS classes (1=IN, 3=CH).
+# All fields empty = matches nothing.
+# -----------------------------------------------------------------------------
+#   - tag: match_oversea
+#     type: query_matcher
+#     args:
+#       client_ip:
+#         - 192.168.0.0/16
+#       domain:
+#         - "provider:oversea_domains"
+#       qtype: [1, 28]
+
+# -----------------------------------------------------------------------------
+# type: response_matcher - match the response.
+# Args:
+#   rcode - list of DNS rcodes (0=NOERROR, 2=SERVFAIL, 3=NXDOMAIN).
+#   ip - list of address/prefix values found in A/AAAA answers; a v2dat geoip
+#        file is referenced as "provider:<tag>:<category>", e.g.
+#        "provider:geoip_cn:cn".
+#   cname - list of CNAME targets.
+# All fields empty = matches nothing.
+# -----------------------------------------------------------------------------
+#   - tag: match_servfail
+#     type: response_matcher
+#     args:
+#       rcode: [2]
+#       ip:
+#         - 0.0.0.0/8
+#       cname: []
+
+
+# =============================================================================
+# PRESET PLUGINS
+# =============================================================================
+# Preset plugins are built into the binary, have no args, and are referenced
+# directly by their tag in a sequence. They cannot be declared under "plugins:".
+#
+#   _return                              stop the current sequence branch
+#   _prefer_ipv4                         dual_selector, prefer A answers
+#   _prefer_ipv6                         dual_selector, prefer AAAA answers
+#   _qtype_A_AAAA                        matcher: query type is A or AAAA
+#   _qtype_AAAA                          matcher: query type is AAAA
+#   _query_edns0                         matcher: query carries an EDNS0 OPT record
+#   _default_cache                       built-in default cache
+#   _drop_response                       drop the response and continue
+#   _response_valid_answer               matcher: response contains a usable answer
+#   _new_empty_response                  create an empty NOERROR response
+#   _new_nxdomain_response               create an NXDOMAIN response
+#   _new_servfail_response               create a SERVFAIL response
+#   _edns0_filter_no_edns0               remove the whole OPT record
+#   _edns0_filter_ecs_only               keep only the ECS option
+#   _no_ecs                              remove the ECS option
+#   _sleep_500ms                         sleep 500 ms
+#   _pad_query                           pad queries to a multiple of 128 bytes
+#   _enable_response_padding             pad responses
+#   _enable_conditional_response_padding pad responses only when the query was padded
+#   _query_summary                       log a one-line summary per query
+#   _misc_optm                           misc query optimizations
+# =============================================================================
+
+
+# =============================================================================
+# PREVIOUS DEPLOYMENT CONFIG (commented out, kept for reference)
+# =============================================================================
+# This is the configuration that was in this file before the template rewrite:
+# a split-horizon setup with two data_providers, three fakeip_nat instances
+# (default/oversea/local ranges) and per-branch forwarding. Re-enable the parts
+# you still need, after adjusting file paths to this machine.
+# -----------------------------------------------------------------------------
+# log:
+#   level: info
+#   file: /etc/mosdns/mosdns.log
+#
+# data_providers:
+#   - tag: oversea_domains
+#     file: /etc/mosdns/rule/oversea_domains.txt
+#     auto_reload: true
+#   - tag: domains
+#     file: /etc/mosdns/rule/domains.txt
+#     auto_reload: true
+#
+# plugins:
+#   - tag: main_cache
+#     type: cache
+#     args:
+#       size: 20480
+#       lazy_cache_ttl: 60
+#       cache_everything: true
+#
+#   - tag: match_oversea_domain
+#     type: query_matcher
+#     args:
+#       domain:
+#         - "provider:oversea_domains"
+#
+#   - tag: match_domains
+#     type: query_matcher
+#     args:
+#       domain:
+#         - "provider:domains"
+#
+#   - tag: forward_local
+#     type: fast_forward
+#     args:
+#       upstream:
+#         - addr: 172.217.27.142
+#           enable_pipeline: true
+#         - addr: "[2404:6800:4017:80c::200e]"
+#           enable_pipeline: true
+#
+#   - tag: forward_oversea
+#     type: fast_forward
+#     args:
+#       upstream:
+#         - addr: 1.1.1.1
+#           enable_pipeline: true
+#
+#   - tag: fakeip_default
+#     type: fakeip_nat
+#
+#   - tag: fakeip_oversea
+#     type: fakeip_nat
+#     args:
+#       table_prefix: "oversea"
+#       ipv4_range: "198.18.0.0/16"
+#       next_hop: "10.131.160.3"
+#       next_hop_dev: "eth0"
+#
+#   - tag: fakeip_local
+#     type: fakeip_nat
+#     args:
+#       table_prefix: "local"
+#       ipv4_range: "198.19.0.0/16"
+#       next_hop: "10.131.160.1"
+#       next_hop_dev: "eth0"
+#
+#   - tag: main_seq
+#     type: sequence
+#     args:
+#       exec:
+#         - main_cache
+#
+#         - if: match_oversea_domain
+#           exec:
+#             - forward_oversea
+#             - fakeip_oversea
+#             - _return
+#
+#         - if: match_domains
+#           exec:
+#             - forward_oversea
+#             - fakeip_local
+#             - _return
+#
+#         - forward_oversea
+#
+# servers:
+#   - exec: main_seq
+#     listeners:
+#       - addr: 0.0.0.0:53
+#         protocol: udp
+#       - addr: 0.0.0.0:53
+#         protocol: tcp

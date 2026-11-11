@@ -130,6 +130,18 @@ func (p *ExecScript) Exec(ctx context.Context, qCtx *query_context.Context, next
 	return nil
 }
 
+// AdminRun runs the configured script once and waits for it. The bot calls
+// this for its /exec command, so the argument contract stays the same as the
+// DNS path: script_path <ip> <domain>. No arbitrary command can be injected.
+func (p *ExecScript) AdminRun(ctx context.Context, ip, domain string) (string, error) {
+	cmd := exec.CommandContext(ctx, p.args.ScriptPath, ip, domain)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("run %s: %w", p.args.ScriptPath, err)
+	}
+	return string(out), nil
+}
+
 func (p *ExecScript) Close() error {
 	return nil
 }

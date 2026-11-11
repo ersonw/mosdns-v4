@@ -1,0 +1,3 @@
+/etc/mosdns/rule/geoip.dat
+/etc/mosdns/rule/geosite.dat
+/etc/mosdns/fakeip.db

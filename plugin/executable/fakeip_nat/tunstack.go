@@ -1,0 +1,480 @@
+package fakeipnat
+
+// This file is the userspace half of the tun data path. Instead of rewriting
+// packets and pushing them back into the kernel, the traffic that arrives on the
+// tun device is terminated by an in-process TCP/IP stack (gVisor netstack) and
+// dialled out through egress. Terminating the connection is what makes the proxy
+// case work at all: only then does the plugin know the domain name, and only
+// then can it send `CONNECT domain:port` to the proxy instead of a bare IP.
+//
+// Two outlet modes share this stack:
+//   - proxy configured and reachable: dial `domain:port`, the proxy resolves it;
+//   - otherwise: look the fake IP up in the mapping table, take the most recent
+//     real IP of that domain and dial `realIP:port`.
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/netip"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/metacubex/gvisor/pkg/buffer"
+	"github.com/metacubex/gvisor/pkg/tcpip"
+	"github.com/metacubex/gvisor/pkg/tcpip/adapters/gonet"
+	"github.com/metacubex/gvisor/pkg/tcpip/header"
+	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
+	"github.com/metacubex/gvisor/pkg/tcpip/network/ipv4"
+	"github.com/metacubex/gvisor/pkg/tcpip/stack"
+	"github.com/metacubex/gvisor/pkg/tcpip/transport/tcp"
+	"github.com/metacubex/gvisor/pkg/tcpip/transport/udp"
+	"github.com/metacubex/gvisor/pkg/waiter"
+	"go.uber.org/zap"
+)
+
+const (
+	// defaultTunMTU matches the MTU setupTun puts on the device.
+	defaultTunMTU = 1500
+	// tunLinkQueue is how many outbound packets may wait to be written back to
+	// the device before the stack starts dropping.
+	tunLinkQueue = 256
+	// tunTCPMaxInFlight bounds simultaneously terminated TCP connections.
+	tunTCPMaxInFlight = 1024
+	// tunTargetTimeout bounds the "fake IP -> domain -> real IP" database work.
+	tunTargetTimeout = 5 * time.Second
+	// tunDialTimeout bounds the egress handshake (proxy CONNECT included).
+	tunDialTimeout = 10 * time.Second
+	// tunRelayBuffer is the copy buffer per direction.
+	tunRelayBuffer = 32 << 10
+	// tunUDPMaxDatagram is large enough for any IPv4 UDP payload.
+	tunUDPMaxDatagram = 65535
+)
+
+// tunStack is the in-process stack attached to the tun device: packets read from
+// the device are injected here, packets the stack emits are written back.
+type tunStack struct {
+	link  *channel.Endpoint
+	stk   *stack.Stack
+	nicID tcpip.NICID
+	mtu   uint32
+	// local is the device's own address (the first host of ipv4_range). It is
+	// registered on the NIC so packets sent to it are delivered locally instead
+	// of being treated as traffic for a fake IP.
+	local netip.Addr
+	// dev is the device the write loop writes to. ICMP replies built outside
+	// the stack (echo relay, error relay) use writeOut, so both writers share
+	// one mutex.
+	dev     tunDevice
+	writeMu sync.Mutex
+}
+
+func newTunStack(mtu uint32, local netip.Addr) (*tunStack, error) {
+	if mtu == 0 {
+		mtu = defaultTunMTU
+	}
+	if !local.Is4() {
+		return nil, fmt.Errorf("tun address %q is not ipv4", local)
+	}
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+	})
+	linkEP := channel.New(tunLinkQueue, mtu, "")
+	nicID := s.NextNICID()
+	if err := s.CreateNIC(nicID, linkEP); err != nil {
+		return nil, fmt.Errorf("create tun nic: %v", err)
+	}
+	// Owning the first host address is what makes the device answer like a
+	// host: the ipv4 protocol replies to echo requests delivered locally.
+	if err := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol: ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFrom4(local.As4()),
+			PrefixLen: 32,
+		},
+	}, stack.AddressProperties{}); err != nil {
+		return nil, fmt.Errorf("add tun address %s: %v", local, err)
+	}
+	// The device only owns the first host of ipv4_range, so every other address
+	// in the range is foreign to it: promiscuous mode accepts them all and
+	// spoofing lets the stack speak as those addresses when it replies.
+	if err := s.SetPromiscuousMode(nicID, true); err != nil {
+		return nil, fmt.Errorf("enable promiscuous mode: %v", err)
+	}
+	if err := s.SetSpoofing(nicID, true); err != nil {
+		return nil, fmt.Errorf("enable spoofing: %v", err)
+	}
+	// Replies go back out the same device whatever the client address is.
+	s.SetRouteTable([]tcpip.Route{{
+		Destination: header.IPv4EmptySubnet,
+		NIC:         nicID,
+	}})
+	return &tunStack{link: linkEP, stk: s, nicID: nicID, mtu: mtu, local: local}, nil
+}
+
+// precheck inspects one packet read from the device before it reaches the
+// stack. A packet addressed to the device's own address is delivered locally
+// (the ipv4 protocol answers echo requests itself). Everything else is traffic
+// for a fake IP, which a real host would forward, so a TTL of 1 has to be
+// answered with ICMP Time Exceeded - that is what lets traceroute show this
+// device as the first hop. The returned reply must be written back to the
+// device and the original packet dropped.
+func (t *tunStack) precheck(pkt []byte) (reply []byte, drop bool) {
+	// Parsed by hand rather than with parseIPv4Packet: that helper only accepts
+	// TCP and UDP, while ICMP needs the same TTL treatment.
+	if len(pkt) < ipv4HeaderMinLen || pkt[0]>>4 != 4 {
+		return nil, false
+	}
+	total := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if total < ipv4HeaderMinLen || total > len(pkt) {
+		return nil, false
+	}
+	dst := netip.AddrFrom4([4]byte{pkt[16], pkt[17], pkt[18], pkt[19]})
+	src := netip.AddrFrom4([4]byte{pkt[12], pkt[13], pkt[14], pkt[15]})
+	if dst == t.local {
+		// The device runs no UDP services, so a probe to it has to be refused
+		// like a host without a listener would; otherwise traceroute's UDP
+		// probes reach the fake-ip allocator and log "not allocated".
+		if pkt[9] == protoUDP {
+			return buildICMPPortUnreachable(t.local, src, pkt[:total]), true
+		}
+		return nil, false
+	}
+	if pkt[8] <= 1 {
+		return buildICMPTimeExceeded(t.local, src, pkt[:total]), true
+	}
+	return nil, false
+}
+
+// inject hands one packet read from the device to the stack. Ownership of the
+// packet buffer moves to the stack, so it must not be released here.
+func (t *tunStack) inject(pkt []byte) {
+	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(pkt)})
+	t.link.InjectInbound(header.IPv4ProtocolNumber, pb)
+}
+
+// nextPacket blocks until the stack emits a packet and returns it as a
+// contiguous slice (a tun device write must carry exactly one IP packet).
+func (t *tunStack) nextPacket(ctx context.Context) []byte {
+	pb := t.link.ReadContext(ctx)
+	if pb == nil {
+		return nil
+	}
+	defer pb.DecRef()
+	return append([]byte(nil), pb.ToView().AsSlice()...)
+}
+
+// close stops the link endpoint, which unblocks nextPacket.
+func (t *tunStack) close() {
+	t.link.Close()
+}
+
+// startStack installs the TCP and UDP forwarders: connection attempts to any
+// address of ipv4_range land in handlers that dial the real destination.
+func (p *FakeIPNatPlugin) startStack(t *tunStack) {
+	tcpFwd := tcp.NewForwarder(t.stk, 0, tunTCPMaxInFlight, func(r *tcp.ForwarderRequest) {
+		go p.relayTCP(r)
+	})
+	t.stk.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
+
+	udpFwd := udp.NewForwarder(t.stk, func(r *udp.ForwarderRequest) bool {
+		go p.relayUDP(r, t)
+		return true // the forwarder owns the request once handled
+	})
+	t.stk.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
+
+	p.L().Info("fakeip nat: transport forwarders installed",
+		zap.Uint32("mtu", t.mtu),
+		zap.Int("nic_id", int(t.nicID)),
+		zap.Uint32("tcp_max_in_flight", tunTCPMaxInFlight))
+}
+
+// relayTCP terminates one TCP connection and relays it to the outlet.
+func (p *FakeIPNatPlugin) relayTCP(r *tcp.ForwarderRequest) {
+	id := r.ID()
+
+	// Resolve the target before touching the endpoint: a fake ip that is not in
+	// the mapping table has no route, and that branch must not leave the client
+	// waiting on a connection that was already accepted.
+	target, err := p.dialTarget(id.LocalAddress.String(), id.LocalPort)
+	if err != nil {
+		// The device's own address is a real host address with nothing
+		// listening on it, so it is refused like one (RST). Any other fake ip
+		// without a mapping gets no answer at all: the client times out.
+		if addr, parseErr := netip.ParseAddr(id.LocalAddress.String()); parseErr == nil && addr == p.reservedAddr() {
+			r.Complete(true)
+			p.L().Debug("tun tcp: connection to the device address refused",
+				zap.String("addr", id.LocalAddress.String()), zap.Uint16("port", id.LocalPort))
+			return
+		}
+		p.L().Debug("tun tcp: no route for fake ip",
+			zap.String("fake_ip", id.LocalAddress.String()),
+			zap.Uint16("port", id.LocalPort), zap.Error(err))
+		// Deliberately left unanswered, per the "unknown fake ip times out"
+		// rule; the forwarder drops the request when the client gives up.
+		return
+	}
+
+	var wq waiter.Queue
+	ep, epErr := r.CreateEndpoint(&wq)
+	if epErr != nil {
+		r.Complete(true) // reset the client instead of leaving it hanging
+		p.L().Warn("tun tcp: create endpoint failed, client reset", zap.Error(tunError(epErr)))
+		return
+	}
+	r.Complete(false)
+	local := gonet.NewTCPConn(&wq, ep)
+	defer local.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tunDialTimeout)
+	defer cancel()
+	remote, dialErr := p.egress.DialContext(ctx, "tcp", target)
+	if dialErr != nil {
+		p.L().Warn("tun tcp: dial failed",
+			zap.String("fake_ip", id.LocalAddress.String()), zap.String("target", target), zap.Error(dialErr))
+		return
+	}
+	defer remote.Close()
+
+	outlet := "real_ip"
+	if p.proxyActive {
+		outlet = "domain_via_proxy"
+	}
+	start := time.Now()
+	p.L().Debug("fakeip nat: tcp flow opened",
+		zap.String("fake_ip", id.LocalAddress.String()), zap.Uint16("fake_port", id.LocalPort),
+		zap.String("client", id.RemoteAddress.String()), zap.Uint16("client_port", id.RemotePort),
+		zap.String("target", target), zap.String("outlet", outlet))
+	bytesUp, bytesDown := pipeConns(local, remote)
+	p.L().Debug("fakeip nat: tcp flow closed",
+		zap.String("target", target),
+		zap.Int64("bytes_up", bytesUp), zap.Int64("bytes_down", bytesDown),
+		zap.Duration("duration", time.Since(start)))
+}
+
+// relayUDP terminates one UDP flow and relays datagrams to the outlet.
+
+// relayUDP terminates one UDP flow and relays datagrams to the outlet.
+func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
+	id := r.ID()
+
+	var wq waiter.Queue
+	ep, epErr := r.CreateEndpoint(&wq)
+	if epErr != nil {
+		p.L().Debug("tun udp: create endpoint failed", zap.Error(tunError(epErr)))
+		return
+	}
+	local := gonet.NewUDPConn(&wq, ep)
+	defer local.Close()
+
+	target, err := p.realTarget(id.LocalAddress.String(), id.LocalPort)
+	if err != nil {
+		p.L().Debug("tun udp: no route for fake ip",
+			zap.String("fake_ip", id.LocalAddress.String()),
+			zap.Uint16("port", id.LocalPort), zap.Error(err))
+		return
+	}
+	// The outlet decides: direct egress binds the range address, a proxy that
+	// cannot carry UDP falls back to a direct socket inside dialUDP.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+	remote, dialErr := p.dialUDP(dialCtx, target)
+	if dialErr != nil {
+		p.L().Warn("tun udp: dial failed",
+			zap.String("fake_ip", id.LocalAddress.String()), zap.String("target", target), zap.Error(dialErr))
+		return
+	}
+	defer remote.Close()
+
+	// Register the flow so an ICMP error quoting the upstream socket can be
+	// routed back to the client. The key is the upstream local port, which is
+	// what the quoted UDP header carries.
+	clientAddr, _ := netip.AddrFromSlice(id.RemoteAddress.AsSlice())
+	fakeAddr, _ := netip.AddrFromSlice(id.LocalAddress.AsSlice())
+	flow := icmpFlow{
+		client: clientAddr, clientPort: id.RemotePort,
+		fakeIP: fakeAddr, fakePort: id.LocalPort,
+	}
+	var clientTTL uint8
+	flow.quote, clientTTL = p.takeClientQuote(quoteKey{
+		src: clientAddr, dst: fakeAddr,
+		sport: id.RemotePort, dport: id.LocalPort,
+	})
+
+	// A traceroute probe carries a small TTL: it must be answered by the real
+	// path, not by this device. Probe the real ip with the same TTL and relay
+	// whichever hop answers; the table entry lives only until the answer.
+	if p.shouldProbe(clientTTL) {
+		if host, _, herr := net.SplitHostPort(target); herr == nil {
+			if realIP, perr := netip.ParseAddr(host); perr == nil {
+				go p.probeHop(flow, realIP, int(clientTTL))
+				return
+			}
+		}
+	}
+	var relay *icmpRelay
+	if la, ok := remote.LocalAddr().(*net.UDPAddr); ok {
+		if relay = p.currentICMP(); relay != nil {
+			upstreamPort := uint16(la.Port)
+			relay.add(upstreamPort, flow)
+			defer relay.remove(upstreamPort)
+		}
+	}
+
+	p.L().Debug("fakeip nat: udp flow opened",
+		zap.String("fake_ip", id.LocalAddress.String()), zap.Uint16("fake_port", id.LocalPort),
+		zap.String("client", id.RemoteAddress.String()), zap.Uint16("client_port", id.RemotePort),
+		zap.String("target", target), zap.String("outlet", "direct"))
+
+	var downDatagrams, downBytes, upDatagrams, upBytes int64
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, tunUDPMaxDatagram)
+		for {
+			n, err := remote.Read(buf)
+			if err != nil {
+				p.L().Debug("fakeip nat: udp upstream read stopped", zap.String("target", target), zap.Error(err))
+				// Answer immediately: the raw relay may see the same error a
+				// moment later, but the client kernel matches the socket by
+				// the address the ICMP came from, so the reply is built here
+				// from the fake ip either way.
+				if typ, code, ok := icmpErrorFromSocketError(err); ok {
+					p.sendICMPErrorFromTarget(t, flow, target, typ, code)
+				}
+				return
+			}
+			if _, err := local.Write(buf[:n]); err != nil {
+				p.L().Debug("fakeip nat: udp write to client stopped", zap.Error(err))
+				return
+			}
+			downDatagrams++
+			downBytes += int64(n)
+		}
+	}()
+
+	buf := make([]byte, tunUDPMaxDatagram)
+	for {
+		n, err := local.Read(buf)
+		if err != nil {
+			p.L().Debug("fakeip nat: udp client read stopped", zap.Error(err))
+			break
+		}
+		if _, err := remote.Write(buf[:n]); err != nil {
+			p.L().Debug("fakeip nat: udp dial write stopped", zap.String("target", target), zap.Error(err))
+			break
+		}
+		upDatagrams++
+		upBytes += int64(n)
+	}
+	_ = remote.Close()
+	<-done
+	p.L().Debug("fakeip nat: udp flow closed",
+		zap.String("target", target),
+		zap.Int64("datagrams_up", upDatagrams), zap.Int64("bytes_up", upBytes),
+		zap.Int64("datagrams_down", downDatagrams), zap.Int64("bytes_down", downBytes))
+}
+
+// dialTarget turns the destination of an intercepted connection into an address
+// the egress can dial. With a working proxy the domain goes straight to the
+// proxy, otherwise the fake IP is resolved back to the most recent real IP.
+func (p *FakeIPNatPlugin) dialTarget(localAddr string, port uint16) (string, error) {
+	fake, err := netip.ParseAddr(localAddr)
+	if err != nil {
+		return "", fmt.Errorf("unexpected destination %q: %w", localAddr, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tunTargetTimeout)
+	defer cancel()
+
+	domain, err := p.domainForFakeIP(ctx, fake.String())
+	if err != nil {
+		return "", err
+	}
+	if p.proxyActive {
+		target := net.JoinHostPort(domain, strconv.Itoa(int(port)))
+		p.L().Debug("fakeip nat: target resolved via proxy",
+			zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
+		return target, nil
+	}
+	real, err := p.primaryRealIP(ctx, domain)
+	if err != nil {
+		return "", err
+	}
+	target := net.JoinHostPort(real.String(), strconv.Itoa(int(port)))
+	p.L().Debug("fakeip nat: target resolved to real ip",
+		zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
+	return target, nil
+}
+
+// realTarget resolves the fake IP to the most recent real IP. UDP uses it even
+// when a proxy is configured: the supported proxies only carry TCP, so a UDP
+// flow must leave direct and must never be handed a domain.
+func (p *FakeIPNatPlugin) realTarget(localAddr string, port uint16) (string, error) {
+	fake, err := netip.ParseAddr(localAddr)
+	if err != nil {
+		return "", fmt.Errorf("unexpected destination %q: %w", localAddr, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), tunTargetTimeout)
+	defer cancel()
+
+	domain, err := p.domainForFakeIP(ctx, fake.String())
+	if err != nil {
+		return "", err
+	}
+	real, err := p.primaryRealIP(ctx, domain)
+	if err != nil {
+		return "", err
+	}
+	target := net.JoinHostPort(real.String(), strconv.Itoa(int(port)))
+	p.L().Debug("fakeip nat: udp target resolved to real ip",
+		zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
+	return target, nil
+}
+
+// tunError adapts the stack's error type to the standard error interface so it
+// can be logged with zap.
+func tunError(err tcpip.Error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%v", err)
+}
+
+// pipeConns copies both directions until each side is done, propagating
+// half-close where the transport supports it.
+func pipeConns(a, b net.Conn) (fromA, fromB int64) {
+	var wg sync.WaitGroup
+	copySide := func(dst, src net.Conn, counter *int64) {
+		defer wg.Done()
+		buf := make([]byte, tunRelayBuffer)
+		n, _ := io.CopyBuffer(dst, src, buf)
+		*counter = n
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+			return
+		}
+		_ = dst.Close()
+	}
+	wg.Add(2)
+	go copySide(a, b, &fromB)
+	go copySide(b, a, &fromA)
+	wg.Wait()
+	return fromA, fromB
+}
+
+// writeOut writes one packet to the device. The stack write loop and the ICMP
+// relay both use it, so a device is never written concurrently.
+func (t *tunStack) writeOut(pkt []byte) error {
+	if t.dev == nil {
+		return errors.New("tun device is not attached")
+	}
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	_, err := t.dev.Write(pkt)
+	return err
+}
