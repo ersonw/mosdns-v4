@@ -768,6 +768,31 @@ servers:
 #       cache_ttl: 15
 #       mark: 0
 
+
+# -----------------------------------------------------------------------------
+# type: radius - a RADIUS server for ocserv. ocserv with "auth = radius"
+# sends PAP Access-Requests here, and with accounting enabled it also sends
+# Accounting-Requests. Accounts live in this plugin's own SQLite database, not
+# in ocpasswd, and are managed from the bot with /user.
+# Only PAP is implemented: a client that negotiates EAP-MSCHAPv2 reaches us as
+# CHAP-Password, which is answered with an explicit Reject saying "use PAP".
+# Args:
+#   listen - authentication endpoint, UDP. Default "0.0.0.0:1812".
+#   accounting_listen - accounting endpoint, UDP. Default "0.0.0.0:1813";
+#                       "off" or "0" closes it (ocserv then logs retries).
+#   secret - shared secret, must equal the one in ocserv. Required: an empty
+#            value fails startup rather than accepting unauthenticated peers.
+#   db_path - SQLite file for accounts and sessions. Default "radius.db" next
+#             to the process working directory; a relative path follows -d.
+# -----------------------------------------------------------------------------
+#   - tag: radius
+#     type: radius
+#     args:
+#       listen: 0.0.0.0:1812
+#       accounting_listen: 0.0.0.0:1813
+#       secret: "replace-with-a-long-random-string"
+#       db_path: etc/mosdns/radius.db
+
 # -----------------------------------------------------------------------------
 # type: telegram_bot - long-polling Telegram bot that manages this process.
 # It is not a DNS step. Declare it here and it stays loaded even when no
@@ -778,6 +803,7 @@ servers:
 #   status      - /status /plugins /plugin /perm
 #   fakeip      - /fip plus /list /stats /lookup /rev /del /clear
 #   ocserv      - /vpn (occtl passthrough, including kick/term)
+#   radius      - /user (add/delete/disable RADIUS accounts, accounting sessions)
 #   config      - /config show|get|set|add|del|validate
 #   reload      - /reload confirm
 #   exec_script - /exec <tag> <ip> <domain>, runs an already configured script
@@ -793,6 +819,8 @@ servers:
 #   fakeip_tags - fakeip_nat tags this bot may manage; the first one is the
 #                 default target of /fip. Default [fakeip].
 #   ocserv_tags - ocserv_ctl tags used by /vpn. Default [ocserv].
+#   radius_tags - radius tags managed by /user; the first one is the default
+#                 target. Default [radius].
 #   config_path - config file /config edits. Default: -c from the command line,
 #                 else etc/mosdns/config.yaml.
 #   proxy - optional HTTP(S) or SOCKS5 proxy for api.telegram.org.
@@ -818,6 +846,7 @@ servers:
 #       default_role: admin
 #       fakeip_tags: [fakeip]
 #       ocserv_tags: [ocserv]
+#       radius_tags: [radius]
 #       config_path: etc/mosdns/config.yaml
 #       proxy: ""
 #       api_base: https://api.telegram.org

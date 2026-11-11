@@ -33,7 +33,8 @@
 | `reverse_lookup` | ✅ | `plugin/executable/reverse_lookup` | 记录 域名↔IP 映射，可应答 PTR，并提供 HTTP 查询接口 | — |
 | `fakeip_nat` | ✅ | `plugin/executable/fakeip_nat` | **定制**：A 记录改写成假 IP，落 SQLite；默认用内置 NAT（nftables DNAT + host route + CIDR 聚合），`use_tun` 可切到 TUN 数据面（TCP/UDP/ICMP 统一 SNAT，逐跳探测把 traceroute 全路径送回 tun） | — |
 | `ocserv_ctl` | ✅ | `plugin/executable/ocserv_ctl` | **定制**：把 DNS 请求的源地址映射到 ocserv 登录用户（`occtl show users`），命中时给查询打标记 | — |
-| `telegram_bot` | ✅ | `plugin/executable/telegram_bot` | **定制**：Telegram 长轮询管理 fakeip / ocserv / 配置 / 脚本，按角色下发权限 | — |
+| `telegram_bot` | ✅ | `plugin/executable/telegram_bot` | **定制**：Telegram 长轮询管理 fakeip / ocserv / RADIUS 账号 / 配置 / 脚本，按角色下发权限 | — |
+| `radius` | ✅ | `plugin/executable/radius` | **定制**：给 ocserv 当 RADIUS 服务端（PAP 认证 + RFC 2866 记账），账号存本机 SQLite，由 bot 的 `/user` 增删改 | — |
 | `exec_script` | ✅ | `plugin/executable/exec_script` | **定制**：答案里出现 IP 时调外部脚本（默认异步 + TTL 去重） | — |
 | `query_matcher` | ✅ | `plugin/matcher/query_matcher` | 按客户端 IP / ECS / 域名 / QType / QClass 判断 | `_qtype_A_AAAA` `_qtype_AAAA` `_query_edns0` |
 | `response_matcher` | ✅ | `plugin/matcher/response_matcher` | 按 RCode / 答案 IP / CNAME 判断 | `_response_valid_answer` |
@@ -213,7 +214,7 @@
 - **出站代理**（`egress.go`，仅 TUN 数据面使用）：`newEgress :48` 按 scheme 分派 `socks5`/`socks5h`/`http`/`https`/`trojan`；`probeEgress :122` 在 Init 探测（socks5 做完整方法协商+认证，http 只 TCP 建连，trojan 只 TLS 握手）；探测失败 → **回退直连**并打 **Warn** 日志（数据面仍可用，属降级）；不支持的 scheme 直接让启动失败。`describeEgress :131` 给日志提供不含凭据的出口描述（`socks5h://host:port` 等）。socks5 支持 RFC1928 CONNECT（`socks5ConnectRequest :307`）+ RFC1929 认证，`socks5h` 交给服务端解析域名；trojan 走 TLS + `sha256(password)[:56]` 头部（`trojanConnectRequest :475`）；UDP 方面 `egress_socks5_udp.go` 实现 RFC1928 §7 UDP ASSOCIATE（TCP 控制连接保活 + `RSV(2) FRAG(1) ATYP+ADDR+PORT PAYLOAD`，`FRAG!=0` 报错），`egress_trojan_udp.go` 实现 trojan 的 udp-associate 请求行（`hash CRLF 3 CRLF 0.0.0.0:0 CRLF`）与后续 `ATYP+ADDR+PORT LEN(2) PAYLOAD` 数据帧（数据帧不带 command 字节），地址编解码共用 `egress_proxy_addr.go`；`http`/`https` 天生只有 CONNECT，UDP 仍回落直连
 - **包改写层（移植性最好的一层，供 NAT 风格转发/回退使用）**：`parseIPv4Packet :46` 解析 IPv4（拒绝分片/非 TCP/UDP，`checkIPv4Checksum`/`checkTransportChecksum` 校验）；`forwardPacket :226` 把客户端 → 假 IP 的包改成 `src=假IP、dst=真实IP、srcPort=新分配端口` 并重算校验和，`reversePacket :262` 把回包改回 `src=假IP、dst=客户端`；`domainForFakeIP :184` / `primaryRealIP :201` 走 DB 反查；`conntrack`（`flow.go:81`/`:124`）5 元组复用端口、TTL 2 分钟、容量 8192。TUN 数据面走用户态栈后不再需要 raw socket 注入，这一层保留为可移植实现（macOS 上可测）
 - **注意**：所有 `nft`/`ip` 命令串行执行（`natMu`），建表失败会整体跳过、不留下半套 host route；`table_prefix` 只允许字母数字下划线；`next_hop` 必须是合法 IP（`:187`）；`proxy` 在 `use_tun: false` 时只会告警、不探测不建连
-- **日志（分级口径）**：全程复用 `p.L()`（插件基类 `BP` 提供的 `*zap.Logger`），不引入新 logger，共 **205 个日志点**（Debug 127 / Info 28 / Warn 45 / Error 5）：
+- **日志（分级口径）**：全程复用 `p.L()`（插件基类 `BP` 提供的 `*zap.Logger`），不引入新 logger，共 **250 个日志点**（Debug 137 / Info 50 / Warn 54 / Error 9）：
   - **Debug**（逐包、逐命令、逐连接，默认关闭）：`Init` 配置回显（`config resolved`，含 `proxy_configured` 布尔而非凭据）→ SQLite 打开/建表/探活 → 每查询（`query in`、AAAA 短路、响应复用、真实 IP 列表、假 IP 分配结果）→ nft 表复用/逐条 setup 命令/映射条数 → 每条 host route、每个候选 IP 的探测结果 → TUN 命令逐条执行、设备取名/复用/跳过、utun unit 与 wintun 适配器选择 → 每包入/出设备（`readFromTun :126` 用 `Check(zap.DebugLevel)` 保护，关闭时不解析报文）→ TCP/UDP 流建立与关闭（含 `bytes_up`/`bytes_down`/`duration`/`datagrams_*`）→ fake IP 反查与真实 IP 选择
   - **Info**（生命周期节点）：插件初始化完成（数据面/tun 设备/代理状态）、nft 表创建（`:152-183`）、映射更新（`:145`）、代理出口就绪、各平台 TUN 设备就绪、`tun data path started`/`tun device attached`/`detached`、transport forwarders 装载、插件关闭
   - **Warn**（可降级的异常）：`script` 字段废弃、代理配了但 `use_tun:false`、代理探测失败回退直连、单条 host route 失败、候选 IP 全不可达回退首个、真实 IP 写库失败、NAT 任务并发上限、单条 TCP/UDP 连接建立失败、设备写/关闭失败、平台不支持 TUN
@@ -222,7 +223,7 @@
   - **开启方式**：mosdns 主配置 `log.level: debug`（Debug 只建议排障时开，逐包日志量很大）
 - **依赖**：`github.com/metacubex/gvisor`（gVisor netstack 的维护分支，`go.mod` 要求 `go 1.20`，与全仓 `go 1.20` 一致）；`golang.zx2c4.com/wintun`（仅 Windows 目标编译）
 - **平台支持**：darwin(amd64/arm64)、linux(amd64/arm/arm64/ppc64le)、freebsd(amd64)、windows(amd64)；`release.py` 里的 `linux/mipsle`、`linux/mips64le` 因上游 `modernc.org/libc` 不含 mips 支持而无法构建，与本插件无关
-- **测试（78 项）**：`fakeip_nat_test.go`（分配 / 幂等 / 并发）、`nat_test.go`（参数解码、nft 输出解析、CIDR 聚合、快速路径、候选选择）、`tun_test.go`（设备创建/复用/失败、`mth<N>` 取名、段首保留）、`egress_test.go`（链接解析、socks5 握手与认证、UDP 拒绝、trojan 头部）、`packet_test.go`/`flow_test.go`（分包拒绝、校验和修复、端口映射、conntrack 过期）、`tunstack_test.go`（代理/直连目标选择、UDP 端到端relay、TCP SYN→SYN-ACK）、`tunstack_icmp_test.go`（TTL 到期的 time exceeded、本机 UDP 探针的 port unreachable、本机 echo 直接进栈）、`mapping_runtime_test.go`（重启恢复运行时表、nft 对账补写与 reserved）、`tun_egress_test.go`（路由表命令计划三种形态、`tun_route_table` 默认与非法名拒绝）、`tun_icmp_test.go`（12 项：`TestBuildClientUDPQuote` 引用构造 / `TestBuildICMPEchoIPv4` echo 字段与校验和 / `TestICMPErrorFromSocketError` errno→type・code / `TestICMPRelayTables` 流表与引用表 / `TestHandleICMPEchoAcceptsFakeIPOnly` 只吃发往 fake IP 的 echo / `TestBuildICMPErrorQuotesTransportHeader` 引用必须含 UDP 头 / `TestShouldProbeBounds` TTL 边界 / `TestProbeTableIsOneShot` 探测表一次性删除 / `TestProbeReplyRewritesHopAddress` 回包源地址落在段内且可反查 / `TestPtrAddrParsesReverseName` 反向名解析 / `TestHopFakeForSkipsAllocatedAddresses` 虚拟地址避开已用地址 / `TestHopNameSuffixDefaultAndValidation` 后缀默认跟随 table_prefix、下划线转换、非法值拒绝）
+- **测试（90 项）**：`fakeip_nat_test.go`（分配 / 幂等 / 并发）、`nat_test.go`（参数解码、nft 输出解析、CIDR 聚合、快速路径、候选选择）、`tun_test.go`（设备创建/复用/失败、`mth<N>` 取名、段首保留）、`egress_test.go`（链接解析、socks5 握手与认证、UDP 拒绝、trojan 头部）、`packet_test.go`/`flow_test.go`（分包拒绝、校验和修复、端口映射、conntrack 过期）、`tunstack_test.go`（代理/直连目标选择、UDP 端到端relay、TCP SYN→SYN-ACK）、`tunstack_icmp_test.go`（TTL 到期的 time exceeded、本机 UDP 探针的 port unreachable、本机 echo 直接进栈）、`mapping_runtime_test.go`（重启恢复运行时表、nft 对账补写与 reserved）、`tun_egress_test.go`（路由表命令计划三种形态、`tun_route_table` 默认与非法名拒绝）、`tun_icmp_test.go`（12 项：`TestBuildClientUDPQuote` 引用构造 / `TestBuildICMPEchoIPv4` echo 字段与校验和 / `TestICMPErrorFromSocketError` errno→type・code / `TestICMPRelayTables` 流表与引用表 / `TestHandleICMPEchoAcceptsFakeIPOnly` 只吃发往 fake IP 的 echo / `TestBuildICMPErrorQuotesTransportHeader` 引用必须含 UDP 头 / `TestShouldProbeBounds` TTL 边界 / `TestProbeTableIsOneShot` 探测表一次性删除 / `TestProbeReplyRewritesHopAddress` 回包源地址落在段内且可反查 / `TestPtrAddrParsesReverseName` 反向名解析 / `TestHopFakeForSkipsAllocatedAddresses` 虚拟地址避开已用地址 / `TestHopNameSuffixDefaultAndValidation` 后缀默认跟随 table_prefix、下划线转换、非法值拒绝）
 
 ### 2.22 `ocserv_ctl`（定制）
 - **文件**：`plugin/executable/ocserv_ctl/ocserv_ctl.go`（注册 `:37`）；`plugin/enabled_plugin.go:42` 导入
@@ -234,15 +235,25 @@
 ### 2.23 `telegram_bot`（定制）
 - **文件**：`plugin/executable/telegram_bot/telegram_bot.go`（主体与命令）、`telegram.go`（HTTP 客户端）、`config.go`（配置读写）、`permissions.go`（角色与权限）；`plugin/enabled_plugin.go` 导入（`_ telegram_bot` 在 `_ fakeip_nat` 之前）
 - **依赖**：`github.com/go-telegram/bot v1.28.0`（长轮询 `Bot.Start`、`WithSkipGetMe` 避免启动期打 API、`WithServerURL` 便于镜像/测试）
-- **参数**：`token`（BotFather 令牌，必填）、`chat_ids`（管理员 chat id 列表，使用 `default_role`）、`admins`（`chat_id` + `role` 精细绑定）、`roles`（命名权限集，`allow` 授权、`inherits` 继承其它角色，取并集）、`default_role`（默认 `admin`，内置角色拥有全部权限）；`fakeip_tags` / `ocserv_tags`（数组，可同时管多个插件实例，首项为默认目标）、`config_path`、`proxy`、`api_base`、`poll_timeout`(30s)。`chat_ids` 与 `admins` 合并，老配置只写 `chat_ids` 仍是全权管理员
-- **权限**：`status`（`/status` `/plugins` `/plugin` `/perm`）、`fakeip`（`/fip` 及 `/list` `/stats` `/lookup` `/rev` `/del` `/clear`）、`ocserv`（`/vpn`）、`config`（`/config` 读写）、`reload`（`/reload confirm`）、`exec_script`（`/exec`）、`admin`（全部）。未授权 chat 直接忽略，越权命令回 `permission denied: role "x" lacks "y"`
-- **命令**：`/fip [tag] {tags|help|list [n]|get <domain|fake_ip>|add|del|stats|clear confirm}`、`/vpn [tag] {tags|help|users|status|sessions|kick|term|run <occtl args...>}`、`/exec <tag> <ip> <domain>`、`/perm`、`/status`、`/plugins`、`/plugin <tag>`、`/config {show|get|set|add|del|validate}`、`/reload confirm`
+- **参数**：`token`（BotFather 令牌，必填）、`chat_ids`（管理员 chat id 列表，使用 `default_role`）、`admins`（`chat_id` + `role` 精细绑定）、`roles`（命名权限集，`allow` 授权、`inherits` 继承其它角色，取并集）、`default_role`（默认 `admin`，内置角色拥有全部权限）；`fakeip_tags` / `ocserv_tags` / `radius_tags`（数组，可同时管多个插件实例，首项为默认目标）、`config_path`、`proxy`、`api_base`、`poll_timeout`(30s)。`chat_ids` 与 `admins` 合并，老配置只写 `chat_ids` 仍是全权管理员
+- **权限**：`status`（`/status` `/plugins` `/plugin` `/perm`）、`fakeip`（`/fip` 及 `/list` `/stats` `/lookup` `/rev` `/del` `/clear`）、`ocserv`（`/vpn`）、`radius`（`/user`）、`config`（`/config` 读写）、`reload`（`/reload confirm`）、`exec_script`（`/exec`）、`admin`（全部）。未授权 chat 直接忽略，越权命令回 `permission denied: role "x" lacks "y"`
+- **命令**：`/fip [tag] {tags|help|list [n]|get <domain|fake_ip>|add|del|stats|clear confirm}`、`/vpn [tag] {tags|help|users|status|sessions|kick|term|run <occtl args...>}`、`/user [tag] {tags|help|list|add <name> <pass> [group]|del|pass|enable|disable|group|sessions [active] [n]}`、`/exec <tag> <ip> <domain>`、`/perm`、`/status`、`/plugins`、`/plugin <tag>`、`/config {show|get|set|add|del|validate}`、`/reload confirm`
 - **配置管理**：以 `yaml.Node` 树就地编辑，保留注释与顺序；`get/set` 支持 `plugins[1].tag` 这类下标路径；`add` 向 `log` 合并键或向 `data_providers` / `plugins` / `servers` 追加元素（拒绝重复 tag）；`del` 按 tag / 下标 / log 键删除；`validate` 在写前检查 tag/type、`servers[].exec` 与 `listeners`；每次写入先落 `<path>.bak.<unixts>` 备份，编码后再解析校验才 `rename`
 - **/reload**：mosdns 无进程内重载（插件与监听在启动时一次性装配），因此校验配置后 `SendCloseSignal(errors.New(...))` 以非零码退出，交给 launchd / systemd / GoLand 拉起
 - **注意**：`/exec` 只调用配置里已绑定的脚本（`script_path <ip> <domain>`），不接受任意命令；`exec_script` 为此新增 `AdminRun`
-- **测试（16 项）**：命令解析与别名、fip 增删查改、occtl 透传、白名单、`httptest` 假服务端端到端（multipart 回复）、tag 数组合并、配置 `get/set/add/del/validate` 与备份、角色继承与权限门、继承环与未知权限拒绝
+- **测试（25 项）**：命令解析与别名、fip 增删查改、occtl 透传、白名单、`httptest` 假服务端端到端（multipart 回复）、tag 数组合并、配置 `get/set/add/del/validate` 与备份、角色继承与权限门、继承环与未知权限拒绝
 
-### 2.24 `exec_script`（定制）
+### 2.24 `radius`（定制）
+- **文件**：`plugin/executable/radius/radius.go`（`Args` / `Admin` 接口 / 校验）、`radius_packet.go`（报文编解码、`User-Password` 链式异或、响应认证符、Message-Authenticator）、`radius_server.go`（UDP 收发与两个 handler）、`radius_store.go`（PBKDF2 + SQLite 两张表）；导入在 `plugin/enabled_plugin.go`（`_ query_summary` 之后）
+- **参数**：`listen`（默认 `0.0.0.0:1812`）、`accounting_listen`（默认 `0.0.0.0:1813`，`off` / `0` 关闭）、`secret`（必填，与 ocserv 的 `radius secret` 一致）、`db_path`（默认 `radius.db`）
+- **认证**：只支持 PAP（ocserv 的 `auth = radius` 走 `Access-Request` + `User-Password`）。报文头 length 与实际长度不符或属性长度越界即拒；`Access-Request` 带 `CHAP-Password` 而没有 `User-Password` 时明确回 Reject 并提示改用 PAP，不静默丢包。认证通过把 `group_name` 作为 `Class(25)` 回给 ocserv
+- **记账**（RFC 2866）：`Start(1)` / `Start2(15)` 建会话并置 `active=1`，`Interim(3)` / `Alive(4)` 只更新用量，`Stop(2)` 写 `ended_at` 并置 `active=0`；请求认证符按 `MD5(code|id|len|16 个 0|attrs|secret)` 校验
+- **存储**：`radius_users`（`name` 主键 + `password` + `group_name` + `enabled` + 时间戳）、`radius_sessions`（`session_id` 主键 + `name` + `remote_ip` + 起止时间 + 收发字节 + `active`），DSN 带 `busy_timeout(5000)` 与 WAL；密码是手写 PBKDF2-HMAC-SHA256（12000 轮、16 字节盐、32 字节 DK），不引入 `x/crypto`
+- **管理入口**：`Admin` 接口 `Users` / `AddUser` / `DeleteUser` / `SetPassword` / `SetEnabled` / `Sessions`，另有 `SetGroup`，供 `telegram_bot` 的 `/user` 类型断言使用
+- **注意**：`Exec` 是纯透传，插件不进 DNS 链，只借 `GetExecutables()` 被 bot 看见；账号表与 ocserv 的 `ocpasswd` 完全独立，ocserv 侧本地用户不再参与认证
+- **测试（7 项）**：密码编解码往返、截断属性拒绝、哈希校验、Accept/Reject/未知用户/禁用账号端到端 UDP、客户端复算响应认证符、记账 Start/Stop 落库、`Admin` 校验与增删改查
+
+### 2.25 `exec_script`（定制）
 - **文件**：`plugin/executable/exec_script/exec_script.go`；注册 `:21`
 - **参数**（`:24-28`）：`script_path`（必填）、`dedup_ttl`(300s)、`async`（默认 **true**，`:54-57`）
 - **行为**（`:97-131`）：先跑 `next`，取响应里的每个 A/AAAA 的 IP，调 `script_path <ip> <qname>`；`async` 决定是否起 goroutine
@@ -250,19 +261,19 @@
 - **注意**：脚本接收的是**真实 IP**；本插件不读写数据库，状态只在内存，进程重启即清空
 - **管理入口**：`AdminRun(ctx, ip, domain)`（同步执行并返回合并输出），供 `telegram_bot` 的 `/exec` 使用；参数契约与 DNS 路径一致，无法注入任意命令
 
-### 2.25 `query_matcher`
+### 2.26 `query_matcher`
 - **文件**：`plugin/matcher/query_matcher/query_matcher.go`；注册 `:39`
 - **参数**（`:64-71`）：`client_ip[]`、`ecs[]`、`domain[]`、`qtype[]`、`qclass[]`
 - **行为**：逐项构建 matcher 后逻辑与（`:88-129`）；**空组 = 不匹配**（`utils.go:119-121`）
 - **预置**（`:41-59`）：`_qtype_A_AAAA`（qtype 1,28）、`_qtype_AAAA`（28）、`_query_edns0`（查询带 EDNS0，`:133-139`）
 
-### 2.26 `response_matcher`
+### 2.27 `response_matcher`
 - **文件**：`plugin/matcher/response_matcher/response_matcher.go`；注册 `:38`
 - **参数**（`:47-51`）：`rcode[]`、`ip[]`、`cname[]`
 - **行为**：RCode 匹配、答案 IP 匹配、CNAME 匹配，三者逻辑与（`:68-99`）
 - **预置** `_response_valid_answer`（`:40`）：答案里存在与问题完全对应（name/qtype/qclass 三元组相等）的记录（`:107-132`）——**只要求「有一个有效答案」，不看 rcode**
 
-### 2.27 `misc_optm`（仅预置，无 type）
+### 2.28 `misc_optm`（仅预置，无 type）
 - **文件**：`plugin/executable/misc_optm/misc.go`；常量 `PluginType` 在 `:33` 但**没有** `RegNewPluginFunc`，只注册 `_misc_optm`（`:41`）
 - **行为**（`:52-107`）：
   1. 非标准查询（非 QUERY、QR=1、多问题、非 IN）→ 直接 `REFUSED` 且**不走 `next`**（`:55-60`）
@@ -270,11 +281,11 @@
   3. 响应后：A/AAAA 只留同类型答案并洗牌、改回问题名（`:78-92`）
   4. 响应里删 padding（`:95-97`）；查询没 EDNS0 就删响应 EDNS0（`:100-102`）
 
-### 2.28 `query_summary`（仅预置）
+### 2.29 `query_summary`（仅预置）
 - **文件**：`plugin/executable/query_summary/query_summary.go`；只注册 `_query_summary`（`:36`）
 - **行为**（`:49-60+`）：先跑 `next`，再按「问题 + rcode + 耗时」打一行日志
 
-### 2.29 `padding`（仅预置）
+### 2.30 `padding`（仅预置）
 - **文件**：`plugin/executable/padding/padding.go`；三个预置（`:34-42`）
 - **行为**：
   - `_pad_query`：查询补到 128 字节；回包时若原查询没有 EDNS0 就删响应 EDNS0、没有 padding 就删响应 padding（`:58-79`）

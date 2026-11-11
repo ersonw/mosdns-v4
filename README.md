@@ -198,16 +198,42 @@ CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中
       cache_ttl: 15
       mark: 100
 ```
+### radius
+给 ocserv 当 RADIUS 服务端：账号由插件自己存在本地 SQLite，不再从 ocserv 的 `ocpasswd` 读。
+ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用户名、密码与启用状态，
+通过时把账号的 group 作为 `Class` 属性回给 ocserv；打开记账后同时收 `Accounting-Request`，
+在 `radius_sessions` 里记录每个会话的起止时间、客户端地址与收发字节。
+只实现 PAP：若客户端协商成 EAP-MSCHAPv2，ocserv 发来的是 `CHAP-Password`，插件明确回 Reject
+并提示改用 PAP，不会静默丢包。密码按 PBKDF2-HMAC-SHA256（12000 轮加盐）存，明文不落盘；
+账号的增删改由 `telegram_bot` 的 `/user` 完成。
+```yaml
+  - tag: radius
+    type: radius
+    args:
+      listen: 0.0.0.0:1812             # 认证端口
+      accounting_listen: 0.0.0.0:1813  # 记账端口，off / 0 关闭
+      secret: "换成一串随机字符"        # 必填，必须与 ocserv 的 secret 一致
+      db_path: etc/mosdns/radius.db    # 账号与会话表
+```
+ocserv 侧对应（版本不同，段名可能是 `radius server` / `radius secret`，以本机 `ocserv.conf` 注释为准）：
+```ini
+auth = radius
+radius[0].server = 127.0.0.1
+radius[0].secret = 换成一串随机字符
+radius[0].auth = pap
+accounting[0].server = 127.0.0.1
+accounting[0].secret = 换成一串随机字符
+```
 ### telegram_bot
 长轮询 Telegram Bot，用来在没有 SSH 的场合看状态、改配置、跑脚本。启动即开始拉取
 `getUpdates`，`token` 缺失或 `chat_ids` 为空时插件保持禁用（不建连、不占线程）。每个 chat 绑定
 一个角色，角色决定它能发哪些命令；只列在 `chat_ids` 里的 chat 用 `default_role`（默认 `admin`）。
 常用命令：`/status`、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
-`/vpn`（查 ocserv 在线用户）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
+`/vpn`（查 ocserv 在线用户）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
 `/reload`（给进程发关闭信号，靠外部 supervisor 重新拉起）。`proxy` 可让 API 请求走
 HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
-插件之间通过 `fakeip_tags` / `ocserv_tags` 定位目标：列表第一个是默认，
-`fakeip_tag` / `ocserv_tag` 是旧配置的单值写法，仍兼容。
+插件之间通过 `fakeip_tags` / `ocserv_tags` / `radius_tags` 定位目标：列表第一个是默认，
+`fakeip_tag` / `ocserv_tag` / `radius_tag` 是旧配置的单值写法，仍兼容。
 ```yaml
   - tag: tg
     type: telegram_bot
@@ -219,10 +245,11 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
           role: admin
       roles:
         admin:
-          permissions: ["*"]
+          allow: ["admin"]              # "admin" 表示全部权限；也可用 inherits 组合子角色
       default_role: admin                 # 只列在 chat_ids 里的 chat 用这个角色
       fakeip_tags: ["fakeip"]             # /fip 可管理的 fakeip_nat 插件 tag
       ocserv_tags: ["ocserv_user"]        # /vpn 可查询的 ocserv_ctl 插件 tag
+      radius_tags: ["radius"]             # /user 可管理的 radius 插件 tag
       config_path: etc/mosdns/config.yaml # /config 改写的文件，留空取 -c 参数
       proxy: ""                           # 例如 socks5://127.0.0.1:1080
       api_base: https://api.telegram.org

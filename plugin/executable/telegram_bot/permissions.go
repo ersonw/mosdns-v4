@@ -36,6 +36,7 @@ const (
 	PermStatus     = "status"      // /status, /plugins, /plugin, /perm, /help
 	PermFakeIP     = "fakeip"      // /fip and its short aliases
 	PermOcserv     = "ocserv"      // /vpn
+	PermRadius     = "radius"      // /user
 	PermConfig     = "config"      // /config read and write
 	PermReload     = "reload"      // /reload confirm
 	PermExecScript = "exec_script" // /exec <tag> <ip> <domain>
@@ -46,6 +47,7 @@ var allPermissions = []string{
 	PermStatus,
 	PermFakeIP,
 	PermOcserv,
+	PermRadius,
 	PermConfig,
 	PermReload,
 	PermExecScript,
@@ -221,6 +223,8 @@ func requiredPermission(cmd string) string {
 		return PermFakeIP
 	case "/vpn":
 		return PermOcserv
+	case "/user":
+		return PermRadius
 	case "/config":
 		return PermConfig
 	case "/reload":

@@ -39,6 +39,7 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	fakeipadmin "github.com/ersonw/mosdns-v4/pkg/fakeip_admin"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/plugin/executable/radius"
 	"go.uber.org/zap"
 )
 
@@ -80,6 +81,11 @@ type Args struct {
 	OcservTags []string `yaml:"ocserv_tags"`
 	// OcservTag is the single-value form of OcservTags.
 	OcservTag string `yaml:"ocserv_tag"`
+	// RadiusTags are the radius plugin tags used by /user. The first tag is
+	// the default target. Default ["radius"].
+	RadiusTags []string `yaml:"radius_tags"`
+	// RadiusTag is the single-value form of RadiusTags.
+	RadiusTag string `yaml:"radius_tag"`
 	// ConfigPath is the mosdns config file /config edits. Empty means:
 	// take -c from the process arguments, else "etc/mosdns/config.yaml".
 	ConfigPath string `yaml:"config_path"`
@@ -97,8 +103,10 @@ func (a *Args) initDefault() {
 	a.Token = strings.TrimSpace(a.Token)
 	a.FakeIPTags = mergeTagList(a.FakeIPTags, a.FakeIPTag, "fakeip")
 	a.OcservTags = mergeTagList(a.OcservTags, a.OcservTag, "ocserv")
+	a.RadiusTags = mergeTagList(a.RadiusTags, a.RadiusTag, "radius")
 	a.FakeIPTag = a.FakeIPTags[0]
 	a.OcservTag = a.OcservTags[0]
+	a.RadiusTag = a.RadiusTags[0]
 	a.DefaultRole = strings.TrimSpace(a.DefaultRole)
 	if a.DefaultRole == "" {
 		a.DefaultRole = PermAll
@@ -197,6 +205,10 @@ type telegramBot struct {
 	ocserv      ocservAdmin
 	ocservCache map[string]ocservAdmin
 
+	radiusMu    sync.Mutex
+	radius      radius.Admin
+	radiusCache map[string]radius.Admin
+
 	access *accessTable
 }
 
@@ -212,6 +224,7 @@ func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		startedAt:   time.Now(),
 		adminCache:  make(map[string]mappingAdmin),
 		ocservCache: make(map[string]ocservAdmin),
+		radiusCache: make(map[string]radius.Admin),
 	}
 	if !args.enabled() {
 		bp.L().Info("telegram bot disabled, token or chat_ids is empty")
@@ -340,6 +353,8 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 		return p.handleFip(ctx, fields[1:])
 	case "/vpn":
 		return p.handleVPN(ctx, fields[1:])
+	case "/user":
+		return p.handleUser(fields[1:]), nil
 	case "/status":
 		return p.handleStatus(ctx)
 	case "/plugins":
@@ -689,6 +704,12 @@ const helpText = `mosdns admin bot
 /vpn kick <user>             disconnect one user
 /vpn term <user>             terminate one user
 /vpn run <occtl args...>     any other occtl command
+/user list                   radius accounts with group and state
+/user add <name> <pass> [g]  create a radius account
+/user del <name>             delete a radius account
+/user pass <name> <pass>     replace a password
+/user enable|disable <name>  toggle authentication
+/user sessions [active] [n]  accounting sessions
 /status                      process and plugin summary
 /plugins                     loaded plugins and their capabilities
 /plugin <tag>                one plugin: type, capabilities, config args

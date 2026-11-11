@@ -43,6 +43,7 @@ import (
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/ocserv_ctl"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/padding"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/query_summary"
+	_ "github.com/ersonw/mosdns-v4/plugin/executable/radius"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/redirect"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/reverse_lookup"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/sequence"

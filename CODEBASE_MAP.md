@@ -44,7 +44,7 @@
 | `coremain/interface.go` | 三种插件接口定义 | `interface.go:28-44` | `Plugin`、`ExecutablePlugin`、`MatcherPlugin` |
 | `mlog/` | zap logger 构建（level / file / err_file / info_file）| `logger.go:29-34`、`45+` | `NewLogger`、全局 `S()`/`L()` |
 | `plugin/enabled_plugin.go` | **插件启用清单**（27 个空白导入）| `enabled_plugin.go:23-51` | — |
-| `plugin/executable/*` | 25 个可执行插件（改查询/改响应/转发/缓存/落盘）| 见 `PLUGIN_INDEX.md` | `Executable` |
+| `plugin/executable/*` | 26 个可执行插件（改查询/改响应/转发/缓存/落盘/管理面）| 见 `PLUGIN_INDEX.md` | `Executable` |
 | `plugin/matcher/*` | 2 个匹配器插件（`query_matcher`、`response_matcher`）| 同上 | `Matcher` |
 | `pkg/` | 可复用底座：上下文、链、匹配器、缓存、上游、服务端、池化、工具 | 见 §5 | — |
 | `tools/` | CLI 子命令：`probe`（连通/复用探测）、`v2dat`（解 v2ray dat）、`config`（生成/转换）| `tools/init.go:27-55` | — |
@@ -229,6 +229,7 @@ type Executable interface {
 | TTL 上下限 | `plugin/executable/ttl/ttl.go:61-71`、`pkg/dnsutils/msg.go:69-74` |
 | 写 ipset / nftables | `ipset/ipset_linux.go:80-112`、`nftset/nftset_linux.go:90-138` |
 | 假 IP + NAT 映射 | `fakeip_nat/fakeip_nat.go:289-358`（Exec）、`:360-499`（分配 / 落库 / 派发）；`fakeip_nat/nat.go:59-146`（nftables 同步）；`fakeip_nat/tun.go:31`（tun 设备/段首地址（掩码取自 `ipv4_range`）/connected 路由）、`fakeip_nat/tunstack.go:65`（gVisor netstack 终止 TCP/UDP，`relayTCP:134`/`relayUDP:169`/`dialTarget:228`）、`fakeip_nat/tunio.go`（平台无关读写泵）、`fakeip_nat/tuncmd.go`（linux/bsd/windows 命令计划）、`fakeip_nat/tunio_linux.go`（`/dev/net/tun` + TUNSETIFF）、`fakeip_nat/tunio_darwin.go`（utun 控制套接字）、`fakeip_nat/tunio_freebsd.go`（`/dev/tun`）、`fakeip_nat/tunio_windows.go`（Wintun + netsh）、`fakeip_nat/tun_icmp.go`（ICMP echo/错误转发、逐跳探测、hop 虚拟地址与 PTR：`startICMPRelay:241`/`probeHop:570`/`probeReply:607`/`hopFakeFor:438`/`takeHop:499`）、`fakeip_nat/icmpraw_linux.go`/`icmpraw_bsd.go`/`icmpraw_other.go`（raw ICMP socket 平台打开方式）、`fakeip_nat/packet.go:46`（IPv4 解析/改写/校验和，`buildICMPError:257`）、`fakeip_nat/flow.go:217`（假 IP→真实 IP 双向改写 + 连接映射）、`egress.go:48`（socks5/http/trojan 出站；UDP 分支 `dialUDP:302`/`:495`）、`fakeip_nat/egress_proxy_addr.go`（ATYP 地址编解码，socks5/trojan 共用）、`fakeip_nat/egress_socks5_udp.go`（RFC 1928 UDP ASSOCIATE + `socks5UDPConn`）、`fakeip_nat/egress_trojan_udp.go`（udp-associate 请求行 + 长度前缀数据帧）、`fakeip_nat/record_retention.go`（`record_ttl` 过期清理：`startRecordRetention:40`/`sweepRecords:95`）、`fakeip_nat/tun_snat.go`（`tunSNATPlan:24`）、`fakeip_nat/tun_snat_linux.go`（nft masquerade 安装/卸载）、`fakeip_nat/tun_snat_darwin.go`（隐式 SNAT 说明） |
+| RADIUS 认证 / 记账 / 账号表 | `radius/radius_server.go:114`（`handleAccess`）、`:176`（`handleAccounting`）、`:207`（`reply`）；`radius_packet.go:160`（响应认证符）、`:172`（请求认证符）、`:182`（`User-Password` 解码）；`radius_store.go:112`（PBKDF2）、`:283`（记账落库）；`radius.go:121`（`Init`） |
 | 答案里出现 IP 时回调外部脚本 | `exec_script/exec_script.go:97-131` |
 | 客户端限速 / 坏 IP 观察 | `client_limiter/client_limiter.go:72-85`、`pkg/ip_observer/bad_ip_observer.go:100+` |
 | 指标 / pprof / 插件 HTTP API | `mosdns.go:78-83`、`register.go:202-204`、`mosdns.go:156-158` |
