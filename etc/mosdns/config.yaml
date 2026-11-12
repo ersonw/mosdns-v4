@@ -130,6 +130,9 @@ plugins:
       ipv4_range: 198.18.0.0/15
       ttl: 60
       use_tun: true
+#      proxy: "socks5://admin:admin@11.10.10.13:1080"
+      proxy: "trojan://admin:admin@11.10.10.13:443?sni=localhost"
+      proxy_insecure: true
 #      hop_name_suffix: "mth-remote"   # one DNS label; empty = table_prefix
 #      record_ttl: "168h"              # drop mappings idle this long; empty = 7d, "0" = off
 
@@ -516,6 +519,13 @@ servers:
 #                     Skipped when a proxy is configured. Linux only: darwin has
 #                     one table, so it binds the outlet to next_hop_dev instead.
 #                     Default: "100"
+#   realip - false = allocate a fake IP, install the DNAT mapping, then answer
+#            the fake IP. The reply waits until the mapping is in place, so a
+#            client never holds a fake IP the data plane cannot serve.
+#            true = do not allocate a fake IP and do not write DNAT; answer the
+#            real IPs as-is and only install a host route to next_hop for each
+#            of them (pure routing split). Has no effect with use_tun.
+#            Default: false
 #   use_tun - false = built-in nftables NAT (default); true = TUN data plane.
 #             TUN mode needs root/CAP_NET_ADMIN and a working TUN driver
 #             (Linux /dev/net/tun, macOS utun, Windows wintun.dll).
@@ -547,6 +557,7 @@ servers:
 #       route_table: main
 #       hop_name_suffix: default        # one label; empty = table_prefix
 #       route_aggregation: true
+#       realip: false
 #       tun_route_table: 100
 #       use_tun: false
 #       tun_dev: ""
