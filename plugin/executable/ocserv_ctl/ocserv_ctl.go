@@ -86,6 +86,16 @@ type Args struct {
 	// DisabledRestart blocks /vpn restart, which drops every connected
 	// session. Reload stays available.
 	DisabledRestart bool `yaml:"disable_restart"`
+	// EventSocket is a unix socket the plugin creates for the ocserv up/down
+	// hook. The hook writes one JSON event per line; the plugin validates it,
+	// keeps the newest EventBuffer events in memory and appends them to
+	// EventLog. Empty disables the channel.
+	EventSocket string `yaml:"event_socket"`
+	// EventLog is a JSONL file that outlives a restart. Empty keeps events in
+	// memory only.
+	EventLog string `yaml:"event_log"`
+	// EventBuffer is how many events AdminEvents keeps in memory. Default 500.
+	EventBuffer int `yaml:"event_buffer"`
 }
 
 func (a *Args) initDefault() error {
@@ -110,6 +120,14 @@ func (a *Args) initDefault() error {
 	a.SystemdUnit = strings.TrimSpace(a.SystemdUnit)
 	if a.SystemdUnit == "" {
 		a.SystemdUnit = "ocserv"
+	}
+	a.EventSocket = strings.TrimSpace(a.EventSocket)
+	a.EventLog = strings.TrimSpace(a.EventLog)
+	if a.EventBuffer <= 0 {
+		a.EventBuffer = 500
+	}
+	if a.EventBuffer > 5000 {
+		a.EventBuffer = 5000
 	}
 	return nil
 }
@@ -164,6 +182,10 @@ type ocservCtl struct {
 	// allocMu serializes address allocation so two concurrent bot commands
 	// cannot hand out the same free address.
 	allocMu sync.Mutex
+
+	events  eventStore
+	eventLn net.Listener
+	eventWG sync.WaitGroup
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -175,6 +197,9 @@ func newOcservCtl(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		return nil, err
 	}
 	p := &ocservCtl{BP: bp, args: args}
+	if err := p.startEvents(); err != nil {
+		return nil, err
+	}
 	if !args.enabled() {
 		bp.L().Info("ocserv ctl plugin disabled, no socket or addr configured")
 		return p, nil
@@ -243,7 +268,7 @@ func (p *ocservCtl) Exec(ctx context.Context, qCtx *query_context.Context, next 
 }
 
 func (p *ocservCtl) Close() error {
-	return nil
+	return p.closeEvents()
 }
 
 // AdminExec runs one occtl command against the configured endpoint and

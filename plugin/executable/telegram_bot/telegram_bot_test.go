@@ -72,6 +72,10 @@ type stubOcserv struct {
 	released  string
 	reloaded  int
 	restarted int
+
+	events      string
+	eventsLimit int
+	eventsUser  string
 }
 
 func (s *stubOcserv) AdminExec(_ context.Context, argv []string) (string, error) {
@@ -101,6 +105,11 @@ func (s *stubOcserv) AdminAllocIP(_ context.Context, user, ip string) (string, e
 func (s *stubOcserv) AdminReleaseIP(_ context.Context, user string) (string, error) {
 	s.released = user
 	return "released " + user, nil
+}
+
+func (s *stubOcserv) AdminEvents(limit int, user string) (string, error) {
+	s.eventsLimit, s.eventsUser = limit, user
+	return s.events, nil
 }
 
 func (s *stubAdmin) AdminListMappings(context.Context, int) ([]fakeipnat.MappingEntry, error) {
@@ -331,6 +340,27 @@ func TestVPNAdminExtensions(t *testing.T) {
 
 	if _, err := p.handleText(context.Background(), 123, "/vpn alloc"); err != nil {
 		t.Fatalf("alloc usage must not error: %v", err)
+	}
+}
+
+func TestVPNEvents(t *testing.T) {
+	p := newStubPlugin()
+	oc := &stubOcserv{events: "[2026-11-12 23:00:00] event=connect user=alice"}
+	p.ocserv = oc
+
+	reply, err := p.handleText(context.Background(), 123, "/vpn events")
+	if err != nil || !strings.Contains(reply, "user=alice") || oc.eventsLimit != 0 || oc.eventsUser != "" {
+		t.Fatalf("events reply = %q limit=%d user=%q err=%v", reply, oc.eventsLimit, oc.eventsUser, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn events 20 alice")
+	if err != nil || oc.eventsLimit != 20 || oc.eventsUser != "alice" {
+		t.Fatalf("events args reply = %q limit=%d user=%q err=%v", reply, oc.eventsLimit, oc.eventsUser, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn events bob")
+	if err != nil || oc.eventsLimit != 0 || oc.eventsUser != "bob" {
+		t.Fatalf("events user reply = %q limit=%d user=%q err=%v", reply, oc.eventsLimit, oc.eventsUser, err)
 	}
 }
 

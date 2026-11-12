@@ -191,6 +191,12 @@ type ocservPoolAdmin interface {
 	AdminReleaseIP(ctx context.Context, user string) (string, error)
 }
 
+// ocservEventAdmin is the up/down event ring kept by ocserv_ctl. The hook
+// writes to its unix socket instead of paging an administrator.
+type ocservEventAdmin interface {
+	AdminEvents(limit int, user string) (string, error)
+}
+
 // execScriptAdmin is the slice of exec_script this bot is allowed to use: it
 // runs the script already configured in mosdns, never an arbitrary command.
 type execScriptAdmin interface {
@@ -651,6 +657,23 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 			ip = args[2]
 		}
 		return pool.AdminAllocIP(ctx, args[1], ip)
+	case "events":
+		ev, ok := admin.(ocservEventAdmin)
+		if !ok {
+			return "", fmt.Errorf("ocserv_ctl tag %q does not expose updown events", tag)
+		}
+		limit, user := 0, ""
+		if len(args) > 1 {
+			if n, err := strconv.Atoi(args[1]); err == nil {
+				limit = n
+			} else {
+				user = args[1]
+			}
+		}
+		if len(args) > 2 && user == "" {
+			user = args[2]
+		}
+		return ev.AdminEvents(limit, user)
 	case "free":
 		if len(args) < 2 {
 			return "usage: /vpn free <user>", nil
@@ -905,4 +928,5 @@ const vpnHelp = `ocserv commands (occtl; optional tag first, e.g. /vpn ocserv2 u
 /vpn alloc <user> [ip]       pin a fixed IP in config-per-user
 /vpn free <user>             drop that fixed IP
 /vpn reload                  systemctl reload ocserv (keeps sessions)
-/vpn restart                 systemctl restart ocserv (drops sessions)`
+/vpn restart                 systemctl restart ocserv (drops sessions)
+/vpn events [n] [user]       recent connect/disconnect events from the updown hook`

@@ -359,6 +359,11 @@ CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中
 其余按需分配给用户（写 `explicit-ipv4`，改完 `/vpn reload` 生效）；并通过 `systemctl`
 执行 `reload`（保留在线会话）与 `restart`（断开所有会话，可用 `disable_restart: true` 禁用）。
 `config-per-user` 在 `auth = "radius[...,groupconfig=true]"` 时不生效，两种方式不要混用。
+
+插件还会建一个 unix socket（`event_socket`）接收 ocserv 上下线钩子推送的事件：钩子每次
+connect/disconnect 发一行 JSON，插件校验后写进内存环形缓冲（`event_buffer`，默认 500 条）
+并追加到 JSONL（`event_log`），不再逐条给管理员发 Telegram。`/vpn events [n] [user]` 可以回看。
+脚本见 `etc/ocserv/ocserv-updown.sh` 与 `etc/ocserv/ocserv_notify.py`。
 ```yaml
   - tag: ocserv_user
     type: ocserv_ctl
@@ -371,6 +376,9 @@ CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中
       systemd_unit: ocserv
       systemctl_path: systemctl
       disable_restart: false
+      event_socket: /run/mosdns/ocserv-updown.sock
+      event_log: /config/ocserv-events.jsonl
+      event_buffer: 500
 ```
 ### radius
 给 ocserv 当 RADIUS 服务端：账号由插件自己存在本地 SQLite，不再从 ocserv 的 `ocpasswd` 读。
@@ -408,7 +416,7 @@ ocserv、导出指定用户的访问记录（`status`/`ocserv`/`radius`/`access`
 `ip rule show` 里的规则、出口表的 default、nft 标记集合大小）、`/ledger`（账本里记了哪些待清理对象）、
 `/sweep`（按账本删掉当前配置不拥有的残留，`kill -9` 之后可以手动收尾）、`/diag <domain>`（一次诊断：
 假 IP、已学到的真实 IP、出口是代理还是 `next_hop`）、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
-`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
+`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务、回看上下线事件）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
 `/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
 `/help`（只列出当前 chat 有权限执行的命令，并按组隐藏整组；`/help` 本身不受权限限制）、
 `/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、
