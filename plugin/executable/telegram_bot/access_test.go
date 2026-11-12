@@ -24,8 +24,8 @@ func TestAddressesOfUser(t *testing.T) {
 		{Name: "bob", RemoteIP: "192.0.2.99"},
 		{Name: "alice", RemoteIP: ""}, // accounting row without an address
 	}
-	got := addressesOfUser(sessions, "alice")
-	want := []string{"192.0.2.10", "192.0.2.11"}
+	got := addressesOfUser(sessions, "10.9.0.2", "alice")
+	want := []string{"10.9.0.2", "192.0.2.10", "192.0.2.11"}
 	if len(got) != len(want) {
 		t.Fatalf("addresses = %v, want %v", got, want)
 	}

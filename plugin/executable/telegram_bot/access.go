@@ -68,13 +68,18 @@ func (p *telegramBot) handleAccess(ctx context.Context, chatID int64, args []str
 		if err != nil {
 			return "", err
 		}
+		users, err := rad.Users()
+		if err != nil {
+			return "", fmt.Errorf("read radius users: %w", err)
+		}
+		fixed := fixedIPOfUser(users, target)
 		sessions, err := rad.Sessions(false, 5000)
 		if err != nil {
 			return "", fmt.Errorf("read radius sessions: %w", err)
 		}
-		addresses = addressesOfUser(sessions, target)
+		addresses = addressesOfUser(sessions, fixed, target)
 		if len(addresses) == 0 {
-			return fmt.Sprintf("no accounting session with an address for user %q; use /access <ip> if the address is known", target), nil
+			return fmt.Sprintf("no fixed IP or accounting session with an address for user %q; use /access <ip> if the address is known", target), nil
 		}
 	}
 
@@ -125,24 +130,40 @@ func (p *telegramBot) handleAccess(ctx context.Context, chatID int64, args []str
 	return "", nil
 }
 
-// addressesOfUser collects the distinct client addresses RADIUS saw for one
-// account, newest sessions first.
-func addressesOfUser(sessions []radius.Session, user string) []string {
+// fixedIPOfUser returns the fixed tunnel address radius assigned to one
+// account, or "" when the account has none.
+func fixedIPOfUser(users []radius.User, user string) string {
+	for _, u := range users {
+		if strings.EqualFold(strings.TrimSpace(u.Name), user) {
+			return strings.TrimSpace(u.IP)
+		}
+	}
+	return ""
+}
+
+// addressesOfUser collects the distinct addresses that may appear as the
+// source of a DNS query for one account: the fixed VPN IP first, then the
+// public addresses RADIUS saw in accounting sessions.
+func addressesOfUser(sessions []radius.Session, fixed string, user string) []string {
 	seen := make(map[string]struct{})
 	var out []string
+	add := func(ip string) {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			return
+		}
+		if _, ok := seen[ip]; ok {
+			return
+		}
+		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	add(fixed)
 	for _, s := range sessions {
 		if !strings.EqualFold(strings.TrimSpace(s.Name), user) {
 			continue
 		}
-		ip := strings.TrimSpace(s.RemoteIP)
-		if ip == "" {
-			continue
-		}
-		if _, ok := seen[ip]; ok {
-			continue
-		}
-		seen[ip] = struct{}{}
-		out = append(out, ip)
+		add(s.RemoteIP)
 	}
 	return out
 }

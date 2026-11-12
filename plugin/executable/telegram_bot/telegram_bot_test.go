@@ -358,6 +358,11 @@ func TestVPNEvents(t *testing.T) {
 		t.Fatalf("events args reply = %q limit=%d user=%q err=%v", reply, oc.eventsLimit, oc.eventsUser, err)
 	}
 
+	reply, err = p.handleText(context.Background(), 123, "/vpn user alice")
+	if err != nil || strings.Join(oc.argv, " ") != "show user alice" {
+		t.Fatalf("user reply = %q argv=%v err=%v", reply, oc.argv, err)
+	}
+
 	reply, err = p.handleText(context.Background(), 123, "/vpn events bob")
 	if err != nil || oc.eventsLimit != 0 || oc.eventsUser != "bob" {
 		t.Fatalf("events user reply = %q limit=%d user=%q err=%v", reply, oc.eventsLimit, oc.eventsUser, err)

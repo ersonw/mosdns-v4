@@ -687,6 +687,11 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 
 	var argv []string
 	switch strings.ToLower(args[0]) {
+	case "user":
+		if len(args) < 2 {
+			return "usage: /vpn user <name>", nil
+		}
+		argv = []string{"show", "user", args[1]}
 	case "users":
 		argv = []string{"show", "users"}
 	case "status":
@@ -820,6 +825,8 @@ var helpGroups = []helpGroup{
 	}},
 	{title: "ocserv", items: []helpItem{
 		{"/vpn users                   connected ocserv users", PermOcserv},
+		{"/vpn user <name>             state of one ocserv user", PermOcserv},
+		{"/vpn events [n] [user]       connect/disconnect history", PermOcserv},
 		{"/vpn status                  ocserv status", PermOcserv},
 		{"/vpn sessions                valid sessions", PermOcserv},
 		{"/vpn kick <user>             disconnect one user", PermOcserv},
@@ -917,6 +924,7 @@ const fipHelp = `fakeip commands (optional tag first, e.g. /fip fakeip2 list)
 const vpnHelp = `ocserv commands (occtl; optional tag first, e.g. /vpn ocserv2 users)
 /vpn tags                    configured targets
 /vpn users                   connected users
+/vpn user <name>             state of one user (online, IP, traffic)
 /vpn status                  server status
 /vpn sessions                valid sessions
 /vpn kick <user>             disconnect one user
