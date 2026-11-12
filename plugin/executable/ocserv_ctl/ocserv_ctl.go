@@ -54,6 +54,9 @@ var _ coremain.ExecutablePlugin = (*ocservCtl)(nil)
 // Args configures how the plugin reaches ocserv.
 type Args struct {
 	// Socket is the occtl socket file, e.g. /run/ocserv/occtl.socket.
+	// "auto" probes the common locations (see autoSocketCandidates) and uses
+	// the first one that exists, which is what a VyOS box needs because its
+	// socket path differs from the upstream default.
 	// At most one of Socket and Addr may be set. With neither set the plugin
 	// stays disabled and every query passes straight through.
 	Socket string `yaml:"socket"`
@@ -71,6 +74,18 @@ type Args struct {
 	// Mark is added to the query context when the client address belongs to
 	// a connected user. Zero means "do not mark", only log.
 	Mark uint `yaml:"mark"`
+	// ConfigPath is the ocserv configuration file. It is read on demand to
+	// learn the IPv4 lease pool (ipv4-network) and the config-per-user
+	// directory used to pin addresses. Only the admin commands need it.
+	ConfigPath string `yaml:"config_path"`
+	// SystemdUnit is the systemd unit controlled by /vpn reload and
+	// /vpn restart. Default is "ocserv".
+	SystemdUnit string `yaml:"systemd_unit"`
+	// SystemctlPath is the systemctl binary. Default is "systemctl".
+	SystemctlPath string `yaml:"systemctl_path"`
+	// DisabledRestart blocks /vpn restart, which drops every connected
+	// session. Reload stays available.
+	DisabledRestart bool `yaml:"disable_restart"`
 }
 
 func (a *Args) initDefault() error {
@@ -86,6 +101,15 @@ func (a *Args) initDefault() error {
 	}
 	if a.CacheTTL <= 0 {
 		a.CacheTTL = 15
+	}
+	a.ConfigPath = strings.TrimSpace(a.ConfigPath)
+	a.SystemctlPath = strings.TrimSpace(a.SystemctlPath)
+	if a.SystemctlPath == "" {
+		a.SystemctlPath = "systemctl"
+	}
+	a.SystemdUnit = strings.TrimSpace(a.SystemdUnit)
+	if a.SystemdUnit == "" {
+		a.SystemdUnit = "ocserv"
 	}
 	return nil
 }
@@ -104,6 +128,21 @@ func (a *Args) endpoint() string {
 	return a.Addr
 }
 
+// autoSocket is the value of socket that asks the plugin to find the occtl
+// socket itself. Deployments differ: Debian/upstream use /run/ocserv, VyOS and
+// older packages keep /var/run/ocserv, and some builds name it occtl.sock.
+const autoSocket = "auto"
+
+// autoSocketCandidates is probed in order when socket: auto is set.
+var autoSocketCandidates = []string{
+	"/run/ocserv/occtl.socket",
+	"/var/run/ocserv/occtl.socket",
+	"/run/ocserv/occtl.sock",
+	"/var/run/ocserv/occtl.sock",
+	"/run/ocserv/socket",
+	"/var/run/ocserv/socket",
+}
+
 // ocservUser is one row of "occtl --json show users".
 type ocservUser struct {
 	ID       string
@@ -120,6 +159,11 @@ type ocservCtl struct {
 	users     []ocservUser
 	fetchedAt time.Time
 	noticedAt time.Time
+	// socketPath is the discovered path when args.Socket == "auto".
+	socketPath string
+	// allocMu serializes address allocation so two concurrent bot commands
+	// cannot hand out the same free address.
+	allocMu sync.Mutex
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -135,13 +179,42 @@ func newOcservCtl(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		bp.L().Info("ocserv ctl plugin disabled, no socket or addr configured")
 		return p, nil
 	}
+	// With socket: auto the path may not exist yet (ocserv can be down at
+	// startup), so resolution is deferred to the first use.
 	bp.L().Info("ocserv ctl plugin initialized",
 		zap.String("endpoint", args.endpoint()),
 		zap.String("occtl", args.OcctlPath),
+		zap.String("ocserv_config", args.ConfigPath),
+		zap.String("systemd_unit", args.SystemdUnit),
 		zap.Int("timeout", args.Timeout),
 		zap.Int("cache_ttl", args.CacheTTL),
 		zap.Uint("mark", args.Mark))
 	return p, nil
+}
+
+// endpoint returns the socket or TCP endpoint to pass to occtl. In auto mode
+// the first existing candidate wins and is cached; a missing socket is retried
+// on the next call, so a late ocserv start is picked up without a restart.
+func (p *ocservCtl) endpoint() (string, error) {
+	if !strings.EqualFold(p.args.Socket, autoSocket) {
+		return p.args.endpoint(), nil
+	}
+	p.mu.Lock()
+	cached := p.socketPath
+	p.mu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+	for _, cand := range autoSocketCandidates {
+		if _, err := os.Stat(cand); err == nil {
+			p.mu.Lock()
+			p.socketPath = cand
+			p.mu.Unlock()
+			p.L().Info("ocserv ctl socket discovered", zap.String("socket", cand))
+			return cand, nil
+		}
+	}
+	return "", fmt.Errorf("occtl socket not found, probed: %s", strings.Join(autoSocketCandidates, ", "))
 }
 
 // Exec identifies the source address before the rest of the chain runs. A
@@ -186,7 +259,11 @@ func (p *ocservCtl) AdminExec(ctx context.Context, argv []string) (string, error
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(p.args.Timeout)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, p.args.OcctlPath, append([]string{"-s", p.args.endpoint()}, argv...)...)
+	ep, err := p.endpoint()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, p.args.OcctlPath, append([]string{"-s", ep}, argv...)...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -205,15 +282,26 @@ func (p *ocservCtl) available() bool {
 	if p.args.Socket == "" {
 		return true
 	}
-	_, err := os.Stat(p.args.Socket)
-	if err == nil {
+	ep, err := p.endpoint()
+	if err != nil {
+		p.mu.Lock()
+		if time.Since(p.noticedAt) > time.Second {
+			p.noticedAt = time.Now()
+			p.L().Debug("occtl socket not available, skipping identification",
+				zap.String("socket", p.args.Socket), zap.String("reason", err.Error()))
+		}
+		p.mu.Unlock()
+		return false
+	}
+	_, statErr := os.Stat(ep)
+	if statErr == nil {
 		return true
 	}
 	p.mu.Lock()
 	if time.Since(p.noticedAt) > time.Second {
 		p.noticedAt = time.Now()
 		p.L().Debug("occtl socket not available, skipping identification",
-			zap.String("socket", p.args.Socket), zap.String("stat_error", err.Error()))
+			zap.String("socket", ep), zap.String("stat_error", statErr.Error()))
 	}
 	p.mu.Unlock()
 	return false
@@ -261,7 +349,11 @@ func (p *ocservCtl) fetch(parent context.Context) ([]ocservUser, error) {
 	ctx, cancel := context.WithTimeout(parent, time.Duration(p.args.Timeout)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, p.args.OcctlPath, "-s", p.args.endpoint(), "-j", "show", "users")
+	ep, err := p.endpoint()
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.CommandContext(ctx, p.args.OcctlPath, "-s", ep, "-j", "show", "users")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

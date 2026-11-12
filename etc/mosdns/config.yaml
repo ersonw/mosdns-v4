@@ -1157,27 +1157,50 @@ servers:
 # interface: it runs occtl once per cache window and never exposes commands.
 # Requires the occtl binary (package ocserv) on the same host.
 # Args:
-#   socket - occtl socket file, e.g. /run/ocserv/occtl.socket.
+#   socket - occtl socket file, e.g. /run/ocserv/occtl.socket, or "auto" to
+#            probe /run/ocserv and /var/run/ocserv for occtl.socket/sock/socket
+#            and use the first one that exists. "auto" is the easy choice on
+#            VyOS, where the socket path differs from upstream.
 #   addr   - TCP endpoint ("host:port") for an occtl that speaks TCP.
 #            At most one of socket and addr may be set. Leave both empty and
 #            the plugin stays disabled: no occtl call, no mark, queries pass
 #            straight through.
 #   occtl_path - occtl binary. Default: "occtl" from PATH.
-#   timeout - upper bound for one occtl call, in seconds. Default: 3.
+#   timeout - upper bound for one occtl call or one systemctl call, in seconds.
+#             Default: 3.
 #   cache_ttl - reuse the user list for this many seconds. Default: 15.
 #   mark - mark id added to the query when the client address belongs to a
 #          connected user; match it later with a marker plugin.
 #          Default: 0 (log only, no mark).
+#   config_path - ocserv.conf path. Read on demand by the /vpn pool and
+#          /vpn alloc commands to learn ipv4-network and config-per-user.
+#          Default: "" (allocation commands disabled).
+#   systemd_unit - unit controlled by /vpn reload and /vpn restart.
+#          Default: "ocserv".
+#   systemctl_path - systemctl binary. Default: "systemctl" from PATH.
+#   disable_restart - true blocks /vpn restart (it drops every session).
+#          Reload stays available. Default: false.
+#
+# /vpn commands backed by this plugin (permission: ocserv):
+#   pool | alloc <user> [ip] | free <user> | reload | restart
+# Allocation writes "explicit-ipv4 = <ip>" into config-per-user/<user>; the
+# first usable address of ipv4-network is reserved for the server side of the
+# tun link. Run /vpn reload afterwards to apply. Note that ocserv ignores
+# config-per-user when the radius auth string has groupconfig=true.
 # -----------------------------------------------------------------------------
 #   - tag: ocserv_user
 #     type: ocserv_ctl
 #     args:
-#       socket: /run/ocserv/occtl.socket
+#       socket: auto
 #       addr: ""
 #       occtl_path: occtl
 #       timeout: 3
 #       cache_ttl: 15
 #       mark: 0
+#       config_path: /etc/ocserv/ocserv.conf
+#       systemd_unit: ocserv
+#       systemctl_path: systemctl
+#       disable_restart: false
 
 
 # -----------------------------------------------------------------------------

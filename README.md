@@ -348,17 +348,29 @@ CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中
 ### ocserv_ctl
 把 DNS 请求的来源地址映射到 ocserv 当前登录用户：源地址命中 `occtl --json show users` 里的
 `Remote IP`（客户端公网地址）或 `IPv4`（隧道内地址）时，给查询打上标记（`mark`），供后续
-`marker` matcher 使用。插件不提供 CLI / HTTP 控制面，只在查询链上做识别。
+`marker` matcher 使用。
 用户列表按 `cache_ttl` 缓存；`occtl` 失败或超时只告警并沿用上一份快照，不阻塞解析。
-`socket` 与 `addr` 都不填时插件不启用（不调 occtl、不打标记，查询透传）；配置的 socket 文件尚未创建时也会跳过。
+`socket` 与 `addr` 都不填时插件不启用（不调 occtl、不打标记，查询透传）；socket 尚未创建时也会跳过。
+`socket: auto` 会依次探测 `/run/ocserv`、`/var/run/ocserv` 下的 `occtl.socket|occtl.sock|socket`，
+用第一个存在的路径并缓存——VyOS 上 socket 路径与上游不同，用 auto 最省事。
+
+除查询链识别外，插件还给 bot 的 `/vpn` 提供运维动作：从 `config_path` 指向的 `ocserv.conf`
+解析 `ipv4-network`/`ipv4-netmask` 与 `config-per-user`，把网段首个可用地址留给 tun 服务端，
+其余按需分配给用户（写 `explicit-ipv4`，改完 `/vpn reload` 生效）；并通过 `systemctl`
+执行 `reload`（保留在线会话）与 `restart`（断开所有会话，可用 `disable_restart: true` 禁用）。
+`config-per-user` 在 `auth = "radius[...,groupconfig=true]"` 时不生效，两种方式不要混用。
 ```yaml
   - tag: ocserv_user
     type: ocserv_ctl
     args:
-      socket: /run/ocserv/occtl.socket   # 或 addr: "1.2.3.4:4433"（二选一）
+      socket: auto                       # 或具体路径 / addr: "1.2.3.4:4433"（二选一）
       timeout: 3
       cache_ttl: 15
       mark: 100
+      config_path: /etc/ocserv/ocserv.conf
+      systemd_unit: ocserv
+      systemctl_path: systemctl
+      disable_restart: false
 ```
 ### radius
 给 ocserv 当 RADIUS 服务端：账号由插件自己存在本地 SQLite，不再从 ocserv 的 `ocpasswd` 读。
@@ -396,7 +408,7 @@ ocserv、导出指定用户的访问记录（`status`/`ocserv`/`radius`/`access`
 `ip rule show` 里的规则、出口表的 default、nft 标记集合大小）、`/ledger`（账本里记了哪些待清理对象）、
 `/sweep`（按账本删掉当前配置不拥有的残留，`kill -9` 之后可以手动收尾）、`/diag <domain>`（一次诊断：
 假 IP、已学到的真实 IP、出口是代理还是 `next_hop`）、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
-`/vpn`（查 ocserv 在线用户）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
+`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
 `/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
 `/help`（只列出当前 chat 有权限执行的命令，并按组隐藏整组；`/help` 本身不受权限限制）、
 `/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、

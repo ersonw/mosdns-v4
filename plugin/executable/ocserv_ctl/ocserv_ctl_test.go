@@ -208,3 +208,48 @@ func TestArgsDefaultsAndExclusivity(t *testing.T) {
 		t.Fatalf("addr endpoint not applied: %+v", tcp)
 	}
 }
+
+func withCandidates(t *testing.T, list []string) {
+	t.Helper()
+	old := autoSocketCandidates
+	autoSocketCandidates = list
+	t.Cleanup(func() { autoSocketCandidates = old })
+}
+
+func TestAutoSocketDiscoversFirstExisting(t *testing.T) {
+	occtl, argvLog, _ := fakeOcctl(t, sampleUsers)
+	dir := t.TempDir()
+	sock := filepath.Join(dir, "occtl.socket")
+	if err := os.WriteFile(sock, nil, 0o600); err != nil {
+		t.Fatalf("write socket: %v", err)
+	}
+	withCandidates(t, []string{filepath.Join(dir, "absent.socket"), sock})
+
+	p := newTestPlugin(t, &Args{OcctlPath: occtl, Socket: autoSocket, Mark: 7})
+	if !p.available() {
+		t.Fatalf("auto socket that exists must be usable")
+	}
+	runQuery(t, p, "203.0.113.10")
+
+	raw, err := os.ReadFile(argvLog)
+	if err != nil {
+		t.Fatalf("read argv log: %v", err)
+	}
+	if want := "-s\n" + sock + "\n-j\nshow\nusers\n"; string(raw) != want {
+		t.Fatalf("occtl argv = %q, want %q", raw, want)
+	}
+}
+
+func TestAutoSocketMissingSkipsCall(t *testing.T) {
+	occtl, argvLog, _ := fakeOcctl(t, sampleUsers)
+	withCandidates(t, []string{filepath.Join(t.TempDir(), "absent.socket")})
+
+	p := newTestPlugin(t, &Args{OcctlPath: occtl, Socket: autoSocket})
+	if p.available() {
+		t.Fatalf("no candidate exists, availability must be false")
+	}
+	runQuery(t, p, "203.0.113.10")
+	if raw, err := os.ReadFile(argvLog); err == nil && len(raw) > 0 {
+		t.Fatalf("occtl must not be called without a socket, argv = %q", raw)
+	}
+}

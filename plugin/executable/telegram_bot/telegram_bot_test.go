@@ -60,15 +60,47 @@ func (s *stubAdmin) AdminPutMapping(_ context.Context, domain, fakeIP string) er
 	return nil
 }
 
-// stubOcserv records the argv handed to occtl.
+// stubOcserv records the argv handed to occtl and the admin-side calls the
+// systemd/address extensions receive.
 type stubOcserv struct {
 	argv []string
 	out  string
+
+	pool      string
+	allocUser string
+	allocIP   string
+	released  string
+	reloaded  int
+	restarted int
 }
 
 func (s *stubOcserv) AdminExec(_ context.Context, argv []string) (string, error) {
 	s.argv = argv
 	return s.out, nil
+}
+
+func (s *stubOcserv) AdminReload(context.Context) (string, error) {
+	s.reloaded++
+	return "reloaded ocserv", nil
+}
+
+func (s *stubOcserv) AdminRestart(context.Context) (string, error) {
+	s.restarted++
+	return "restarted ocserv", nil
+}
+
+func (s *stubOcserv) AdminPool(context.Context) (string, error) {
+	return s.pool, nil
+}
+
+func (s *stubOcserv) AdminAllocIP(_ context.Context, user, ip string) (string, error) {
+	s.allocUser, s.allocIP = user, ip
+	return "assigned to " + user, nil
+}
+
+func (s *stubOcserv) AdminReleaseIP(_ context.Context, user string) (string, error) {
+	s.released = user
+	return "released " + user, nil
 }
 
 func (s *stubAdmin) AdminListMappings(context.Context, int) ([]fakeipnat.MappingEntry, error) {
@@ -259,6 +291,46 @@ func TestVPNCommandsForwardToOcctl(t *testing.T) {
 	reply, err = p.handleText(context.Background(), 123, "/vpn kick")
 	if err != nil || !strings.Contains(reply, "usage") {
 		t.Fatalf("missing argument must report usage, got %q err=%v", reply, err)
+	}
+}
+
+func TestVPNAdminExtensions(t *testing.T) {
+	p := newStubPlugin()
+	oc := &stubOcserv{pool: "leases: 10.8.0.2 - 10.8.0.254"}
+	p.ocserv = oc
+
+	reply, err := p.handleText(context.Background(), 123, "/vpn pool")
+	if err != nil || !strings.Contains(reply, "10.8.0.2 - 10.8.0.254") {
+		t.Fatalf("pool reply = %q err=%v", reply, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn alloc alice")
+	if err != nil || oc.allocUser != "alice" || oc.allocIP != "" {
+		t.Fatalf("alloc reply = %q user=%q ip=%q err=%v", reply, oc.allocUser, oc.allocIP, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn alloc bob 10.8.0.9")
+	if err != nil || oc.allocUser != "bob" || oc.allocIP != "10.8.0.9" {
+		t.Fatalf("alloc ip reply = %q user=%q ip=%q err=%v", reply, oc.allocUser, oc.allocIP, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn free bob")
+	if err != nil || oc.released != "bob" {
+		t.Fatalf("free reply = %q released=%q err=%v", reply, oc.released, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn reload")
+	if err != nil || oc.reloaded != 1 {
+		t.Fatalf("reload reply = %q count=%d err=%v", reply, oc.reloaded, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/vpn restart")
+	if err != nil || oc.restarted != 1 {
+		t.Fatalf("restart reply = %q count=%d err=%v", reply, oc.restarted, err)
+	}
+
+	if _, err := p.handleText(context.Background(), 123, "/vpn alloc"); err != nil {
+		t.Fatalf("alloc usage must not error: %v", err)
 	}
 }
 

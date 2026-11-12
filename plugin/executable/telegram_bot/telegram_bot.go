@@ -175,6 +175,22 @@ type ocservAdmin interface {
 	AdminExec(ctx context.Context, argv []string) (string, error)
 }
 
+// ocservServiceAdmin is the systemd slice of ocserv_ctl: reload keeps sessions,
+// restart drops them. Optional, so a plugin without a systemd_unit still works
+// for the read-only /vpn commands.
+type ocservServiceAdmin interface {
+	AdminReload(ctx context.Context) (string, error)
+	AdminRestart(ctx context.Context) (string, error)
+}
+
+// ocservPoolAdmin is the address-pool slice of ocserv_ctl: it reads the pool
+// from ocserv.conf and pins explicit-ipv4 values in config-per-user.
+type ocservPoolAdmin interface {
+	AdminPool(ctx context.Context) (string, error)
+	AdminAllocIP(ctx context.Context, user, ip string) (string, error)
+	AdminReleaseIP(ctx context.Context, user string) (string, error)
+}
+
 // execScriptAdmin is the slice of exec_script this bot is allowed to use: it
 // runs the script already configured in mosdns, never an arbitrary command.
 type execScriptAdmin interface {
@@ -603,6 +619,49 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 		return "", err
 	}
 
+	switch strings.ToLower(args[0]) {
+	case "reload":
+		svc, ok := admin.(ocservServiceAdmin)
+		if !ok {
+			return "", fmt.Errorf("ocserv_ctl tag %q does not expose systemd control", tag)
+		}
+		return svc.AdminReload(ctx)
+	case "restart":
+		svc, ok := admin.(ocservServiceAdmin)
+		if !ok {
+			return "", fmt.Errorf("ocserv_ctl tag %q does not expose systemd control", tag)
+		}
+		return svc.AdminRestart(ctx)
+	case "pool":
+		pool, ok := admin.(ocservPoolAdmin)
+		if !ok {
+			return "", fmt.Errorf("ocserv_ctl tag %q does not expose address allocation", tag)
+		}
+		return pool.AdminPool(ctx)
+	case "alloc":
+		if len(args) < 2 {
+			return "usage: /vpn alloc <user> [ip]", nil
+		}
+		pool, ok := admin.(ocservPoolAdmin)
+		if !ok {
+			return "", fmt.Errorf("ocserv_ctl tag %q does not expose address allocation", tag)
+		}
+		ip := ""
+		if len(args) > 2 {
+			ip = args[2]
+		}
+		return pool.AdminAllocIP(ctx, args[1], ip)
+	case "free":
+		if len(args) < 2 {
+			return "usage: /vpn free <user>", nil
+		}
+		pool, ok := admin.(ocservPoolAdmin)
+		if !ok {
+			return "", fmt.Errorf("ocserv_ctl tag %q does not expose address allocation", tag)
+		}
+		return pool.AdminReleaseIP(ctx, args[1])
+	}
+
 	var argv []string
 	switch strings.ToLower(args[0]) {
 	case "users":
@@ -841,4 +900,9 @@ const vpnHelp = `ocserv commands (occtl; optional tag first, e.g. /vpn ocserv2 u
 /vpn term <user>             terminate one user
 /vpn run <occtl args...>     any other occtl command, e.g.
                              /vpn run show iroutes
-                             /vpn run unban ip 10.0.0.5`
+                             /vpn run unban ip 10.0.0.5
+/vpn pool                    lease range parsed from ocserv.conf
+/vpn alloc <user> [ip]       pin a fixed IP in config-per-user
+/vpn free <user>             drop that fixed IP
+/vpn reload                  systemctl reload ocserv (keeps sessions)
+/vpn restart                 systemctl restart ocserv (drops sessions)`
