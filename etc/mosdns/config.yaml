@@ -26,11 +26,8 @@
 #   - Three packages (padding, query_summary, misc_optm) only expose preset
 #     plugins (tags starting with "_"); they cannot be declared with a
 #     "type:" entry. See "PRESET PLUGINS" at the bottom.
-#   - A runnable full example - one instance of every plugin type with every
-#     option set, plus every top-level key - lives in
-#     etc/mosdns/config-full.yaml. Copy from it instead of assembling a
-#     plugin from the fragments below; coremain/config_example_test.go decodes
-#     that file, so its key names are known-good for this binary.
+#   - Every executable / matcher block below lists ALL of its args fields, so
+#     a block can be copied as-is; the top-level keys carry every field too.
 # =============================================================================
 
 
@@ -550,6 +547,16 @@ servers:
 #   use_tun - false = built-in nftables NAT (default); true = TUN data plane.
 #             TUN mode needs root/CAP_NET_ADMIN and a working TUN driver
 #             (Linux /dev/net/tun, macOS utun, Windows wintun.dll).
+#   tun_mtu - TUN mode device MTU, i.e. the largest segment advertised to
+#             clients. 0 = automatic: 1500 for a direct outlet, 1400 when a
+#             proxy is configured (the proxy link already sits inside a tunnel
+#             and 1500-byte segments are dropped, which looks like a hung
+#             transfer). Explicit values win and must be 576..1500.
+#   mss_clamp - NAT mode only: rewrite the MSS option of SYN / SYN-ACK packets
+#               in the plugin's nft table so TCP never negotiates 1460 bytes
+#               over a tunnel that carries less (1400-byte link -> 1360).
+#               0 = disabled. Valid values: 0 or 536..65535. Ignored by the
+#               TUN data plane (tun_mtu covers that) and by realip mode.
 #   tun_dev - TUN mode device name. Empty = auto-allocate the first free
 #             name in the mth0, mth1, ... sequence (a leftover device whose
 #             address is still the first address of the range is reused).
@@ -573,17 +580,23 @@ servers:
 #       table_prefix: default
 #       ipv4_range: 198.18.0.0/15
 #       ttl: 60
+#       record_ttl: 168h                # mapping lifetime, "0" keeps forever
 #       next_hop: ""
 #       next_hop_dev: ""
+#       script: ""                      # deprecated, only logs a warning
+#       mss_clamp: 0                    # NAT only, 0 or 536..65535
 #       route_table: main
-#       hop_name_suffix: default        # one label; empty = table_prefix
+#       route_mark: 0                   # non-zero = nft set + fwmark split
+#       route_rule_priority: 1000       # 1..32766; raise it to lose to existing rules
 #       route_aggregation: true
 #       realip: false
 #       tun_route_table: 100
 #       use_tun: false
 #       tun_dev: ""
+#       tun_mtu: 0                      # 0 = auto: 1500 direct, 1400 via proxy
 #       proxy: ""
 #       proxy_insecure: false
+#       hop_name_suffix: default        # one label; empty = table_prefix
 
 # -----------------------------------------------------------------------------
 # type: fast_forward - concurrent, pipelined forwarder (recommended).
@@ -618,8 +631,17 @@ servers:
 #     args:
 #       upstream:
 #         - addr: https://dns.alidns.com/dns-query
+#           dial_addr: 223.5.5.5:443
+#           trusted: true
+#           socks5: 127.0.0.1:1080
+#           so_mark: 0
+#           bind_to_device: eth0
+#           idle_timeout: 30
+#           max_conns: 2
 #           enable_pipeline: true
+#           enable_http3: false
 #           bootstrap: 223.5.5.5
+#           insecure_skip_verify: false
 #         - addr: tls://dns.google
 #           dial_addr: 8.8.8.8:853
 #       ca:
@@ -649,6 +671,7 @@ servers:
 #         - addr: tls://dns.google
 #           ip_addr:
 #             - 8.8.8.8
+#           trusted: false
 #       timeout: 5
 #       insecure_skip_verify: false
 #       bootstrap:
@@ -900,8 +923,11 @@ servers:
 #           allow: [exec_script, config, reload]
 #       default_role: admin
 #       fakeip_tags: [fakeip]
+#       fakeip_tag: ""                    # single-value alias of fakeip_tags
 #       ocserv_tags: [ocserv]
+#       ocserv_tag: ""                    # single-value alias of ocserv_tags
 #       radius_tags: [radius]
+#       radius_tag: ""                    # single-value alias of radius_tags
 #       config_path: etc/mosdns/config.yaml
 #       audit_log: ""                     # default <config dir>/telegram_bot_audit.log
 #       proxy: ""
