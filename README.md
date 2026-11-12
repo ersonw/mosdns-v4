@@ -411,3 +411,24 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       api_base: https://api.telegram.org
       poll_timeout: 30
 ```
+
+## 构建与发布
+
+本地交叉编译：
+
+```bash
+go run ./tools/crossbuild                 # 全部目标，版本号取 dev/4.0-<git describe>
+go run ./tools/crossbuild -version v4.0.1 # 固定版本号
+go run ./tools/crossbuild linux/amd64     # 只编指定目标
+```
+
+产物在 `build/`，版本号经 `-ldflags -X main.version` 注入；不传 `-version` 且 git 也无答案时不注入，`main.version` 保持默认 `dev/4.0`。
+
+GitHub Actions：
+
+- `.github/workflows/build.yml`：push `main` / PR / 手动触发。跑 `go vet ./...`、`coremain` + `fakeip_nat` + `telegram_bot` + `tools/crossbuild` 的测试，再做十平台交叉编译，二进制作为 artifact 保留 14 天；手动触发可传 `version`。
+- `.github/workflows/release.yml`：push `v*` 标签（或手动触发并给版本号）时触发。标签名即发布版本，原样传给 `tools/crossbuild -version`，随后产出：
+  - 十个平台二进制，命名 `mosdns-<版本>-<平台>[-armv6|-armv7|...][.exe]`
+  - 源码包 `mosdns-<版本>-src.tar.gz` 与 `mosdns-<版本>-src.zip`：排除 `.git`、`.github`、`.idea`、`build`、`dist`、`release` 以及本地 `*.db*`，解包后顶层是 `mosdns-<版本>/`
+  - `SHA256SUMS.txt`
+  - 以上全部附加到同名 Release（已存在则 `--clobber` 覆盖上传，重跑安全）

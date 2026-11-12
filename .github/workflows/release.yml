@@ -1,0 +1,125 @@
+# Tag a commit (git tag v4.0.1 && git push origin v4.0.1) and this workflow
+# builds every platform with that version stamped in, then publishes three
+# things: the cross-built binaries, and two source archives (.tar.gz and .zip)
+# taken from the working tree with the repository-only files left out.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, tag name included (e.g. v4.0.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # VERSION is the tag name and is what the binary reports. SLUG is the same
+      # string with slashes replaced, because a version such as dev/4.0-abc
+      # cannot appear in a file name.
+      - name: resolve version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "${version}" ]; then
+            echo "no version: pass one with workflow_dispatch or push a tag" >&2
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+          echo "SLUG=${version//\//-}" >> "${GITHUB_ENV}"
+          echo "version ${version} (files use ${version//\//-})"
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./coremain/ ./plugin/executable/fakeip_nat/ ./plugin/executable/telegram_bot/ ./tools/crossbuild/ -count=1
+
+      # The version travels into every binary through the tool, which is the same
+      # path a local build takes.
+      - name: cross build
+        run: go run ./tools/crossbuild -version "${VERSION}"
+
+      - name: package binaries and source
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Binaries, renamed to carry the version so assets do not collide
+          # between releases.
+          for f in build/mosdns-*; do
+            target="${f#build/mosdns-}"
+            ext=""
+            case "${target}" in
+              *.exe) ext=".exe"; target="${target%.exe}" ;;
+            esac
+            cp "${f}" "dist/mosdns-${SLUG}-${target}${ext}"
+          done
+
+          # Source archives. .git, .github, .idea and the local build output are
+          # repository-only and are left out; the local sqlite files are runtime
+          # state, not source.
+          stage="$(mktemp -d)"
+          root="mosdns-${SLUG}"
+          mkdir -p "${stage}/${root}"
+          rsync -a \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude '.idea' \
+            --exclude 'build' \
+            --exclude 'dist' \
+            --exclude 'release' \
+            --exclude 'crossbuild' \
+            --exclude '*.db' \
+            --exclude '*.db-shm' \
+            --exclude '*.db-wal' \
+            ./ "${stage}/${root}/"
+          tar -czf "dist/${root}-src.tar.gz" -C "${stage}" "${root}"
+          ( cd "${stage}" && zip -qr "${GITHUB_WORKSPACE}/dist/${root}-src.zip" "${root}" )
+
+          # One checksum file for everything that is about to be published.
+          ( cd dist && sha256sum * > SHA256SUMS.txt )
+
+          echo "files to publish:"
+          ls -lh dist
+
+      # Uploading over an existing release replaces the asset, which makes a
+      # re-run after a failed step safe.
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            gh release upload "${VERSION}" dist/* --clobber
+          else
+            gh release create "${VERSION}" dist/* \
+              --title "${VERSION}" \
+              --generate-notes \
+              --target "${GITHUB_SHA}"
+          fi

@@ -1,0 +1,66 @@
+# Build every platform the release script targets, on one runner, with cgo off.
+# The version stamped into the binary comes from an explicit input when one is
+# given, otherwise from `git describe --tags --long --always` by the tool
+# itself, so a build from main still says which commit it came from.
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp (default: dev/4.0-<git describe>)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cross:
+    name: cross build
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0 so `git describe --tags --long --always` can see the tags.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go version
+        run: go version
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test ./coremain/ ./plugin/executable/fakeip_nat/ ./plugin/executable/telegram_bot/ ./tools/crossbuild/ -count=1
+
+      - name: cross build
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "${VERSION}" ]; then
+            args+=("-version" "${VERSION}")
+          fi
+          go run ./tools/crossbuild "${args[@]}"
+
+      - name: upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosdns-cross-builds
+          path: build/mosdns-*
+          if-no-files-found: error
+          retention-days: 14
