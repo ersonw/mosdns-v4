@@ -254,6 +254,20 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 		p.L().Debug("fakeip nat: host route skipped, no next hop and no device", zap.String("real_ip", ip))
 		return
 	}
+	// Mark routing carries the mapped addresses as nft set members instead of
+	// host routes. A success here means there is nothing left to write: the
+	// dedicated table already routes every marked destination.
+	if p.markActiveNow() {
+		if err := p.markRealIP(ctx, ip); err == nil {
+			p.L().Debug("fakeip nat: real ip marked for the dedicated table",
+				zap.String("real_ip", ip), zap.String("route_table", p.routeTable))
+			return
+		} else {
+			p.L().Warn("fakeip nat: marking the real ip failed, falling back to a host route",
+				zap.String("real_ip", ip), zap.Error(err))
+		}
+	}
+
 	commands := routeWriteCommands(ip+"/32", hop, dev, p.routeTable)
 	if len(commands) == 0 {
 		p.L().Debug("fakeip nat: host route skipped, platform has no usable route command",
@@ -281,6 +295,13 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 // first and the originals are deleted afterwards, so a packet never falls into
 // the gap between the two passes.
 func (p *FakeIPNatPlugin) aggregateManagedRoutes() {
+	if p.markActiveNow() {
+		// Mark routing keeps the mapped addresses out of the routing tables, so
+		// there is nothing to fold and nothing to prune.
+		p.L().Debug("route aggregation: mark routing owns the mapped addresses, scan skipped")
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
 	defer cancel()
 
@@ -443,6 +464,11 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 		hop, dev = p.systemDefaultRoute(ctx)
 	}
 
+	// The policy rule and the default route of the dedicated table go before the
+	// ledger sweep: they are two fixed objects, and leaving them behind would
+	// keep steering traffic into a table that no longer has anywhere to send it.
+	p.cleanupMarkRouting(ctx)
+
 	p.natMu.Lock()
 	defer p.natMu.Unlock()
 
@@ -465,8 +491,11 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 		}
 	}
 
+	// The table now carries the DNAT map, the mark set and the mark chains. On
+	// the non-tun path nothing else owns it, so it goes away with the data path
+	// whether the traffic was rewritten or merely marked.
 	tableDeleted := false
-	if !p.useTun && !p.realIP {
+	if !p.useTun {
 		if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", p.nftTableName()); err == nil {
 			tableDeleted = true
 		}

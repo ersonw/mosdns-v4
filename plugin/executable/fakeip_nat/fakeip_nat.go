@@ -74,6 +74,18 @@ type Args struct {
 	RouteTable      string `yaml:"route_table"`       // host route 写入的路由表，默认: "main"
 	AggregateRoutes *bool  `yaml:"route_aggregation"` // 是否把 /32 host route 做严格 CIDR 聚合，默认: true
 
+	// RouteMark 打开「目的地址打标」分流：映射出来的真实 IP 只进 nft 集合
+	// real_ipv4，由 prerouting / output 两个钩子给目的地址打上这个 mark，再用
+	// 一条 ip rule fwmark 把这些包导进 RouteTable 里的专用表（表内只有一条指向
+	// next_hop / next_hop_dev 的 default）。0 表示关闭（默认，仍写 /32 host route）。
+	// 与 use_tun 互斥，且只在 Linux 上可用；route_table 不能是 main——打标的意义
+	// 就是别再往主表里堆东西。取值要避开本机已有用途（例如 gost 的 -M、wg 的
+	// fwmark 已占用的位）。
+	RouteMark uint32 `yaml:"route_mark"`
+	// RouteRulePriority 是那条 ip rule 的优先级，默认 1000。数值越小越先匹配，
+	// 与既有策略规则冲突时调大它，让本插件的规则排在后面。
+	RouteRulePriority int `yaml:"route_rule_priority"`
+
 	// UseTun 打开 TUN 数据面：向系统申请 tun 网卡，并在主表把 ipv4_range 路由到
 	// 该网卡。默认 false，即使用内置 NAT。
 	UseTun bool `yaml:"use_tun"`
@@ -141,6 +153,17 @@ type FakeIPNatPlugin struct {
 	// NAT data path: the plugin owns the nftables map and host routes.
 	routeTable      string
 	aggregateRoutes bool
+	// routeMark turns the host-route-per-address shape into destination marking:
+	// the mapped addresses live in an nft set, and a policy rule sends the marked
+	// packets into routeTable, which holds one default route.
+	routeMark         uint32
+	routeRulePriority int
+	// markMu guards markReady and markActive. markReady means the nft set and the
+	// two mark chains exist; markActive means the default route and the ip rule
+	// are installed as well, so an address can simply be added to the set.
+	markMu     sync.Mutex
+	markReady  bool
+	markActive bool
 	// mssClamp is the MSS value written into SYN / SYN-ACK packets, 0 to leave
 	// the negotiated value alone.
 	mssClamp int
@@ -256,6 +279,28 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			zap.String("route_table", cfg.RouteTable))
 		cfg.RouteTable = "main"
 	}
+	routeRulePriority := cfg.RouteRulePriority
+	if routeRulePriority == 0 {
+		routeRulePriority = 1000
+	}
+	// Mark routing moves the mapped addresses out of the routing table, so it
+	// only makes sense where a named table exists, where the tun path is not
+	// already responsible for them, and where the table is not the main one —
+	// piling marks into main is the shape this option exists to avoid.
+	if cfg.RouteMark != 0 {
+		if routeRulePriority < 1 || routeRulePriority > 32766 {
+			return nil, fmt.Errorf("invalid route_rule_priority %d: must be between 1 and 32766", routeRulePriority)
+		}
+		if !supportsNamedRouteTable() {
+			return nil, fmt.Errorf("route_mark is only supported on linux")
+		}
+		if cfg.UseTun {
+			return nil, fmt.Errorf("route_mark and use_tun are mutually exclusive")
+		}
+		if cfg.RouteTable == "main" {
+			return nil, fmt.Errorf("route_mark needs route_table to name a dedicated table, not main")
+		}
+	}
 	if cfg.HopNameSuffix == "" {
 		// Reuse the table prefix so a deployment names its hops after its
 		// own table; underscores become dashes to keep the label legal.
@@ -285,6 +330,8 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.Duration("record_ttl", recordTTL),
 		zap.String("route_table", cfg.RouteTable),
 		zap.Bool("route_aggregation", aggregateRoutes),
+		zap.Uint32("route_mark", cfg.RouteMark),
+		zap.Int("route_rule_priority", routeRulePriority),
 		zap.Bool("use_tun", cfg.UseTun),
 		zap.String("tun_dev", strings.TrimSpace(cfg.TunDev)),
 		zap.String("next_hop", cfg.NextHop),
@@ -412,13 +459,15 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		taskSem:      make(chan struct{}, defaultTaskConcurrency),
 		taskInFlight: make(map[string]struct{}),
 
-		hopSuffix:       cfg.HopNameSuffix,
-		routeTable:      cfg.RouteTable,
-		tunRouteTable:   cfg.TunRouteTable,
-		aggregateRoutes: aggregateRoutes,
-		mssClamp:        cfg.MSSClamp,
-		useTun:          cfg.UseTun,
-		tunDev:          strings.TrimSpace(cfg.TunDev),
+		hopSuffix:         cfg.HopNameSuffix,
+		routeTable:        cfg.RouteTable,
+		routeMark:         cfg.RouteMark,
+		routeRulePriority: routeRulePriority,
+		tunRouteTable:     cfg.TunRouteTable,
+		aggregateRoutes:   aggregateRoutes,
+		mssClamp:          cfg.MSSClamp,
+		useTun:            cfg.UseTun,
+		tunDev:            strings.TrimSpace(cfg.TunDev),
 	}
 	p.runner = execRunner{}
 	p.probe = p.probeReachable
@@ -530,6 +579,20 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// before the first route of this run is written, so the two never mix.
 	p.sweepResidualRoutes()
 
+	// Mark routing is installed after the sweep and before any resolution: the
+	// sweep still has to clean the host routes an earlier shape wrote, and from
+	// here on an address is only added to the nft set. A failure leaves
+	// markActive false, which the data path reads as "keep writing host routes".
+	if p.markRoutingEnabled() {
+		markCtx, markCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := p.setupMarkRouting(markCtx)
+		markCancel()
+		if err != nil {
+			p.L().Error("route_mark is enabled but the mark routing could not be installed; falling back to host routes",
+				zap.Uint32("route_mark", p.routeMark), zap.String("route_table", p.routeTable), zap.Error(err))
+		}
+	}
+
 	// The NAT data path writes one host route per resolution. A periodic scan
 	// folds them into CIDR blocks; the tun path needs none of that.
 	p.startRouteAggregation()
@@ -638,6 +701,12 @@ func (p *FakeIPNatPlugin) stopTunDataPath() {
 // data path routes the whole fake range as one prefix already.
 func (p *FakeIPNatPlugin) startRouteAggregation() {
 	if p.useTun || !p.aggregateRoutes {
+		return
+	}
+	// Under mark routing the mapped addresses never enter a routing table, so
+	// there is nothing for the scan to fold or prune.
+	if p.markActiveNow() {
+		p.L().Debug("fakeip nat: route aggregation not needed under route_mark")
 		return
 	}
 	p.aggMu.Lock()

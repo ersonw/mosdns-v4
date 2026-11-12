@@ -23,6 +23,8 @@ prerouting/forward/postrouting），探测候选真实 IP 的可达性，写 `/3
       next_hop_dev: "eth0"
       route_table: "main"       # 默认 main；自定义表名仅 Linux 支持，macOS/Windows 回退 main
       route_aggregation: true   # 默认 true：每 30 秒扫描路由表，把指向出口的 /32 聚合为 CIDR
+      route_mark: 0             # 默认 0 关闭；非 0 表示按目的地址打标分流（见下文，与 use_tun 互斥）
+      route_rule_priority: 1000 # 打标模式下那条 ip rule 的优先级，与既有策略规则冲突时调大
       realip: false             # 默认 false（发 fake IP）；true 则不分配假 IP、不做 DNAT，只给真实 IP 写出口路由
       mss_clamp: 0              # 默认 0 关闭；出口隧道 MTU 1400 时填 1360，改写 SYN/SYN-ACK 的 MSS
 ```
@@ -135,6 +137,36 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
 
 TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所有）。升级到该模式前，
 请确认 `<prefix>_mapping` 里没有域名正好占着段首地址。
+
+#### 目的地址打标路由（非 TUN，`route_mark`）
+
+非 tun 数据面本来给每条解析出的真实 IP 写一条 `/32` host route，默认落进主表 `main`。网关解析量一大，
+主表就堆满运维自己也认不出的条目，重启和重载都不保证清干净。把 `route_mark` 填成非 0 后，这套状态
+完全移出路由表：
+
+1. 真实 IP 只进 nft 集合 `real_ipv4`（`type ipv4_addr; flags timeout; timeout 1h`），不再写任何 host route；
+   过期地址没人续期就自己消失，不需要额外的清扫循环。
+2. 在 `fakeip_<prefix>` 里新增两条链：`mark_prerouting`（prerouting，priority 0，排在 DNAT 的 -100 之后，
+   所以 fake-ip 模式下此时目的地址已经是真实 IP）与 `mark_output`（`type route hook output`，本机产生的
+   流量改 mark 后会重新寻路），各自把「目的地址命中集合」的包 `meta mark set <route_mark>`。
+3. `ip route replace default [via <next_hop>] [dev <next_hop_dev>] table <route_table>` 建出专用表里唯一的
+   default（`next_hop` / `next_hop_dev` 留空时取系统默认网关），再
+   `ip rule add fwmark <route_mark> lookup <route_table> prio <route_rule_priority>`。只有带标记的包查这张表。
+
+```yaml
+      route_table: "oversea"    # 必须显式命名专用表，填 main 会被拒绝
+      route_mark: 256           # 0=关闭；取值避开 gost -M / wg 已用的 fwmark 位
+      route_rule_priority: 1000 # 1..32766，与既有策略规则冲突时调大
+```
+
+边界：
+
+- 非映射流量不查专用表，`ip rule` 只匹配带标记的包，主表不再被污染；
+- 打标模式下 `route_aggregation` 的扫描直接跳过：地址不在任何路由表里，无可折叠也无可清理；
+- 集合写入失败会回落成写 host route 并打 Warn，数据面不断流；nft 对象或 `ip rule` 装不上时整体回落，
+  `route_mark` 只打 Error，不影响 DNS 服务；
+- 与 `use_tun` 互斥（tun 自己管整段路由），且仅 Linux 支持，其他平台启动即报错；
+- 清理只做三件事：删 `ip rule`、删专用表的 default、删整张 nft 表，不会残留。
 
 #### TUN 下的 TCP / UDP / ICMP 语义
 
