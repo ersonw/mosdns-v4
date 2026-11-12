@@ -3,7 +3,9 @@ package radius
 import (
 	"bytes"
 	"crypto/md5"
+	"database/sql"
 	"encoding/binary"
+	"errors"
 	"net"
 	"path/filepath"
 	"testing"
@@ -124,6 +126,9 @@ func TestAccessAcceptAndReject(t *testing.T) {
 	if err := st.addUser("alice", "secret123", "staff"); err != nil {
 		t.Fatalf("addUser: %v", err)
 	}
+	if ok, err := st.setIP("alice", "10.8.0.20"); err != nil || !ok {
+		t.Fatalf("setIP = %v/%v", ok, err)
+	}
 	srv, err := newServer(zap.NewNop(), secret, st, "127.0.0.1:0", "")
 	if err != nil {
 		t.Fatalf("newServer: %v", err)
@@ -163,7 +168,10 @@ func TestAccessAcceptAndReject(t *testing.T) {
 		t.Fatalf("code = %d, want accept (%d)", accept.code, codeAccessAccept)
 	}
 	if v, ok := accept.get(attrClass); !ok || string(v) != "staff" {
-			t.Fatalf("class attribute = %q/%v, want staff", v, ok)
+		t.Fatalf("class attribute = %q/%v, want staff", v, ok)
+	}
+	if v, ok := accept.get(attrFramedIPAddress); !ok || !bytes.Equal(v, net.ParseIP("10.8.0.20").To4()) {
+		t.Fatalf("framed-ip attribute = %q/%v, want 10.8.0.20", v, ok)
 	}
 
 	// Wrong password -> Reject.
@@ -257,11 +265,11 @@ func TestAccountingRecordsSession(t *testing.T) {
 		// here would hide an off-by-one in the numbering, which is exactly how
 		// Output-Octets was once read as Output-Packets.
 		attrs := []attribute{
-			{typ: 1, value: []byte("alice")},              // User-Name
-			{typ: 44, value: []byte("sess-1")},            // Acct-Session-Id
-			{typ: 40, value: uint32Bytes(status)},         // Acct-Status-Type
-			{typ: 42, value: uint32Bytes(in)},             // Acct-Input-Octets
-			{typ: 43, value: uint32Bytes(out)},            // Acct-Output-Octets
+			{typ: 1, value: []byte("alice")},      // User-Name
+			{typ: 44, value: []byte("sess-1")},    // Acct-Session-Id
+			{typ: 40, value: uint32Bytes(status)}, // Acct-Status-Type
+			{typ: 42, value: uint32Bytes(in)},     // Acct-Input-Octets
+			{typ: 43, value: uint32Bytes(out)},    // Acct-Output-Octets
 		}
 		if _, err := conn.Write(buildAcctRequest(1, secret, attrs)); err != nil {
 			t.Fatalf("write accounting: %v", err)
@@ -300,6 +308,100 @@ func uint32Bytes(v uint32) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, v)
 	return b
+}
+
+func TestAdminFixedIP(t *testing.T) {
+	p := testPlugin(t)
+	if err := p.AddUser("alice", "secret123", "staff"); err != nil {
+		t.Fatalf("AddUser alice: %v", err)
+	}
+	if err := p.AddUser("bob", "secret123", ""); err != nil {
+		t.Fatalf("AddUser bob: %v", err)
+	}
+
+	for _, bad := range []string{"not-an-ip", "10.8.0", "::1", "0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255"} {
+		if _, err := p.SetIP("alice", bad); !errors.Is(err, errInvalidIP) {
+			t.Fatalf("SetIP(%q) = %v, want errInvalidIP", bad, err)
+		}
+	}
+
+	ok, err := p.SetIP("alice", "10.8.0.20")
+	if err != nil || !ok {
+		t.Fatalf("SetIP alice = %v/%v", ok, err)
+	}
+	users, err := p.Users()
+	if err != nil {
+		t.Fatalf("Users: %v", err)
+	}
+	for _, u := range users {
+		if u.Name == "alice" && u.IP != "10.8.0.20" {
+			t.Fatalf("alice ip = %q", u.IP)
+		}
+	}
+
+	// The same address cannot be pinned to a second account.
+	if _, err := p.SetIP("bob", "10.8.0.20"); !errors.Is(err, errIPInUse) {
+		t.Fatalf("duplicate SetIP = %v, want errIPInUse", err)
+	}
+	if ok, err := p.SetIP("bob", "10.8.0.21"); err != nil || !ok {
+		t.Fatalf("SetIP bob = %v/%v", ok, err)
+	}
+
+	// "-" clears the pin and frees the address for another user.
+	if ok, err := p.SetIP("alice", "-"); err != nil || !ok {
+		t.Fatalf("clear SetIP = %v/%v", ok, err)
+	}
+	if ok, err := p.SetIP("bob", "10.8.0.20"); err != nil || !ok {
+		t.Fatalf("reuse cleared ip = %v/%v", ok, err)
+	}
+
+	// A missing user is reported as "not found", not as an IP error.
+	if ok, err := p.SetIP("nobody", "10.8.0.22"); err != nil || ok {
+		t.Fatalf("SetIP nobody = %v/%v, want false/nil", ok, err)
+	}
+}
+
+func TestMigrateAddsFixedIPColumn(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE radius_users (
+		name TEXT PRIMARY KEY,
+		password TEXT NOT NULL,
+		group_name TEXT NOT NULL DEFAULT '',
+		enabled INTEGER NOT NULL DEFAULT 1,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO radius_users
+		(name, password, group_name, enabled, created_at, updated_at)
+		VALUES ('legacy', 'hash', 'staff', 1, 1, 1)`); err != nil {
+		t.Fatalf("insert legacy user: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	st, err := openStore(path)
+	if err != nil {
+		t.Fatalf("openStore migrated: %v", err)
+	}
+	defer st.close()
+
+	u, found, err := st.getUser("legacy")
+	if err != nil || !found {
+		t.Fatalf("legacy user = %+v/%v/%v", u, found, err)
+	}
+	if u.IP != "" || u.Group != "staff" {
+		t.Fatalf("legacy user changed: %+v", u)
+	}
+	if ok, err := st.setIP("legacy", "10.8.0.30"); err != nil || !ok {
+		t.Fatalf("setIP after migration = %v/%v", ok, err)
+	}
 }
 
 func TestAdminValidateAndCRUD(t *testing.T) {

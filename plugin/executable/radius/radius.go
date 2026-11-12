@@ -85,6 +85,7 @@ func (a *Args) initDefault() error {
 type User struct {
 	Name      string
 	Group     string
+	IP        string // fixed tunnel address, empty means "from the pool"
 	Enabled   bool
 	CreatedAt int64
 	UpdatedAt int64
@@ -111,6 +112,7 @@ type Admin interface {
 	DeleteUser(name string) (bool, error)
 	SetPassword(name, password string) (bool, error)
 	SetEnabled(name string, enabled bool) (bool, error)
+	SetIP(name, ip string) (bool, error)
 	Sessions(activeOnly bool, limit int) ([]Session, error)
 }
 
@@ -180,7 +182,7 @@ func (p *Plugin) Users() ([]User, error) {
 	out := make([]User, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, User{
-			Name: r.Name, Group: r.Group, Enabled: r.Enabled,
+			Name: r.Name, Group: r.Group, IP: r.IP, Enabled: r.Enabled,
 			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
@@ -236,6 +238,26 @@ func (p *Plugin) SetEnabled(name string, enabled bool) (bool, error) {
 	return ok, nil
 }
 
+// SetIP pins a tunnel address for one account. ocserv reads it from the
+// Framed-IP-Address attribute (8) in the Access-Accept and hands the same
+// address to that user on every login. An empty value (or "-" from the bot)
+// clears the pin and returns the user to the dynamic pool.
+func (p *Plugin) SetIP(name, ip string) (bool, error) {
+	normalized, err := normalizeFixedIP(ip)
+	if err != nil {
+		return false, err
+	}
+	ok, err := p.store.setIP(name, normalized)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		p.L().Info("radius: fixed ip changed",
+			zap.String("user", name), zap.String("ip", normalized))
+	}
+	return ok, nil
+}
+
 // SetGroup changes the class attribute handed to ocserv.
 func (p *Plugin) SetGroup(name, group string) (bool, error) {
 	ok, err := p.store.setGroup(name, strings.TrimSpace(group))
@@ -262,6 +284,24 @@ func (p *Plugin) Sessions(activeOnly bool, limit int) ([]Session, error) {
 		})
 	}
 	return out, nil
+}
+
+// normalizeFixedIP canonicalizes an IPv4 address and rejects values that
+// cannot be a tunnel endpoint. An empty string or "-" means "no pin".
+func normalizeFixedIP(ip string) (string, error) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || ip == "-" {
+		return "", nil
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return "", errInvalidIP
+	}
+	if parsed.IsUnspecified() || parsed.IsLoopback() || parsed.IsMulticast() ||
+		parsed.Equal(net.IPv4bcast) {
+		return "", fmt.Errorf("%w: %s is not a usable tunnel address", errInvalidIP, ip)
+	}
+	return parsed.To4().String(), nil
 }
 
 func validateCredentials(name, password string) error {

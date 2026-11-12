@@ -17,6 +17,7 @@ const userHelp = `radius account commands (optional tag first, e.g. /user radius
 /user enable <name>            allow authentication
 /user disable <name>           block authentication, keep the row
 /user group <name> <group>     set the ocserv group (class attribute)
+/user ip <name> <ipv4|->       pin or clear a fixed VPN IP (Framed-IP)
 /user sessions [active] [n]    accounting sessions, newest first`
 
 // resolveRadiusFor finds the radius plugin that owns the account table. Lookup
@@ -140,6 +141,22 @@ func (p *telegramBot) handleUser(args []string) string {
 		}
 		return fmt.Sprintf("%s: group %s", rest[1], rest[2])
 
+	case "ip":
+		if len(rest) < 3 {
+			return "usage: /user ip <name> <ipv4|->"
+		}
+		ok, err := adm.SetIP(rest[1], rest[2])
+		if err != nil {
+			return "ip change failed: " + err.Error()
+		}
+		if !ok {
+			return "no such user: " + rest[1]
+		}
+		if rest[2] == "-" || rest[2] == "" {
+			return rest[1] + ": fixed ip cleared"
+		}
+		return fmt.Sprintf("%s: fixed ip %s", rest[1], rest[2])
+
 	case "sessions":
 		activeOnly := false
 		limit := 20
@@ -191,8 +208,12 @@ func formatUsers(tag string, users []radius.User) string {
 		if group == "" {
 			group = "-"
 		}
-		fmt.Fprintf(&b, "%-20s group=%-12s %s  updated %s\n",
-			u.Name, group, state, time.Unix(u.UpdatedAt, 0).Format("2006-01-02 15:04"))
+		ip := u.IP
+		if ip == "" {
+			ip = "-"
+		}
+		fmt.Fprintf(&b, "%-20s group=%-12s ip=%-15s %s  updated %s\n",
+			u.Name, group, ip, state, time.Unix(u.UpdatedAt, 0).Format("2006-01-02 15:04"))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

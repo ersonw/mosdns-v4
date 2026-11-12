@@ -25,11 +25,19 @@ const (
 // errUserExists is returned by AddUser when the name is already taken.
 var errUserExists = errors.New("radius: user already exists")
 
+// errIPInUse is returned when a fixed address is already pinned to another
+// account. ocserv would hand the same tunnel address to two users otherwise.
+var errIPInUse = errors.New("radius: ip already assigned to another user")
+
+// errInvalidIP is returned for anything that is not a usable IPv4 address.
+var errInvalidIP = errors.New("radius: invalid ipv4 address")
+
 // userRow is one account, as stored and as handed to the admin surface.
 type userRow struct {
 	Name      string
 	Password  string // the stored hash, never the plaintext
 	Group     string
+	IP        string // fixed tunnel address, empty means "from the pool"
 	Enabled   bool
 	CreatedAt int64
 	UpdatedAt int64
@@ -78,6 +86,7 @@ func (s *store) migrate() error {
 			name TEXT PRIMARY KEY,
 			password TEXT NOT NULL,
 			group_name TEXT NOT NULL DEFAULT '',
+			ip TEXT NOT NULL DEFAULT '',
 			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at INTEGER NOT NULL,
 			updated_at INTEGER NOT NULL
@@ -101,7 +110,52 @@ func (s *store) migrate() error {
 			return fmt.Errorf("radius: migrate: %w", err)
 		}
 	}
+
+	// Databases created before fixed IP support have no ip column. SQLite has
+	// no ADD COLUMN IF NOT EXISTS, so check PRAGMA table_info first.
+	hasIP, err := s.hasColumn(userTableName, "ip")
+	if err != nil {
+		return err
+	}
+	if !hasIP {
+		if _, err := s.db.Exec(fmt.Sprintf(
+			"ALTER TABLE %s ADD COLUMN ip TEXT NOT NULL DEFAULT ''", userTableName)); err != nil {
+			return fmt.Errorf("radius: add ip column: %w", err)
+		}
+	}
+	// Partial unique index: empty means "no fixed address", and many users may
+	// share that value, but a non-empty address belongs to exactly one user.
+	if _, err := s.db.Exec(fmt.Sprintf(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_ip ON %s (ip) WHERE ip <> ''",
+		userTableName, userTableName)); err != nil {
+		return fmt.Errorf("radius: create ip index: %w", err)
+	}
 	return nil
+}
+
+func (s *store) hasColumn(table, column string) (bool, error) {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, fmt.Errorf("radius: table info: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			typ        string
+			notNull    int
+			dflt       sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &primaryKey); err != nil {
+			return false, fmt.Errorf("radius: table info scan: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func (s *store) close() error { return s.db.Close() }
@@ -176,9 +230,9 @@ func (s *store) getUser(name string) (userRow, bool, error) {
 	var u userRow
 	var enabled int
 	err := s.db.QueryRow(fmt.Sprintf(
-		"SELECT name, password, group_name, enabled, created_at, updated_at FROM %s WHERE name = ?",
+		"SELECT name, password, group_name, ip, enabled, created_at, updated_at FROM %s WHERE name = ?",
 		userTableName), name).
-		Scan(&u.Name, &u.Password, &u.Group, &enabled, &u.CreatedAt, &u.UpdatedAt)
+		Scan(&u.Name, &u.Password, &u.Group, &u.IP, &enabled, &u.CreatedAt, &u.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return userRow{}, false, nil
 	}
@@ -198,7 +252,7 @@ func (s *store) addUser(name, password, group string) error {
 	}
 	now := time.Now().Unix()
 	_, err = s.db.Exec(fmt.Sprintf(
-		"INSERT INTO %s (name, password, group_name, enabled, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
+		"INSERT INTO %s (name, password, group_name, ip, enabled, created_at, updated_at) VALUES (?, ?, ?, '', 1, ?, ?)",
 		userTableName), name, hash, group, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "constraint") {
@@ -259,9 +313,23 @@ func (s *store) setGroup(name, group string) (bool, error) {
 	return n > 0, nil
 }
 
+func (s *store) setIP(name, ip string) (bool, error) {
+	res, err := s.db.Exec(fmt.Sprintf(
+		"UPDATE %s SET ip = ?, updated_at = ? WHERE name = ?", userTableName),
+		ip, time.Now().Unix(), name)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return false, errIPInUse
+		}
+		return false, fmt.Errorf("radius: set ip: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *store) listUsers() ([]userRow, error) {
 	rows, err := s.db.Query(fmt.Sprintf(
-		"SELECT name, password, group_name, enabled, created_at, updated_at FROM %s ORDER BY name", userTableName))
+		"SELECT name, password, group_name, ip, enabled, created_at, updated_at FROM %s ORDER BY name", userTableName))
 	if err != nil {
 		return nil, fmt.Errorf("radius: list users: %w", err)
 	}
@@ -270,7 +338,7 @@ func (s *store) listUsers() ([]userRow, error) {
 	for rows.Next() {
 		var u userRow
 		var enabled int
-		if err := rows.Scan(&u.Name, &u.Password, &u.Group, &enabled, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.Name, &u.Password, &u.Group, &u.IP, &enabled, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("radius: scan user: %w", err)
 		}
 		u.Enabled = enabled != 0

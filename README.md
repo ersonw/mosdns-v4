@@ -3,6 +3,11 @@
 git tag v4.0.0 && git push origin v4.0.0     # 触发 release
 gh workflow run release.yml -f version=v4.0.0 # 或手动
 
+
+sudo install -m 755 etc/ocserv/ocserv-updown.sh /usr/libexec/vyos/op_mode/ocserv-updown-script.sh
+sudo install -m 755 etc/ocserv/ocserv_notify.py /usr/libexec/vyos/op_mode/ocserv_notify.py
+sudo systemctl restart ocserv
+
 ```
 ### exec_script
 ```yaml
@@ -383,11 +388,13 @@ connect/disconnect 发一行 JSON，插件校验后写进内存环形缓冲（`e
 ### radius
 给 ocserv 当 RADIUS 服务端：账号由插件自己存在本地 SQLite，不再从 ocserv 的 `ocpasswd` 读。
 ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用户名、密码与启用状态，
-通过时把账号的 group 作为 `Class` 属性回给 ocserv；打开记账后同时收 `Accounting-Request`，
+通过时把账号的 group 作为 `Class` 属性回给 ocserv；账号配置了固定 IP 时再回
+`Framed-IP-Address(8)`，ocserv 每次登录都给该用户同一个隧道地址。打开记账后同时收 `Accounting-Request`，
 在 `radius_sessions` 里记录每个会话的起止时间、客户端地址与收发字节。
 只实现 PAP：若客户端协商成 EAP-MSCHAPv2，ocserv 发来的是 `CHAP-Password`，插件明确回 Reject
 并提示改用 PAP，不会静默丢包。密码按 PBKDF2-HMAC-SHA256（12000 轮加盐）存，明文不落盘；
-账号的增删改由 `telegram_bot` 的 `/user` 完成。
+账号的增删改由 `telegram_bot` 的 `/user` 完成，固定 IP 用 `/user ip <name> <ipv4|->`
+设置或清除（`-` 表示回到动态池）。
 ```yaml
   - tag: radius
     type: radius
@@ -397,6 +404,8 @@ ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用
       secret: "换成一串随机字符"        # 必填，必须与 ocserv 的 secret 一致
       db_path: etc/mosdns/radius.db    # 账号与会话表
 ```
+老库（`radius_users` 还没有 `ip` 列）在插件启动时自动补列，不需要手工迁移；固定 IP 由
+`ip <> ''` 的部分唯一索引约束，同一个地址不能同时绑两个账号。
 ocserv 侧对应（版本不同，段名可能是 `radius server` / `radius secret`，以本机 `ocserv.conf` 注释为准）：
 ```ini
 auth = radius
@@ -416,7 +425,7 @@ ocserv、导出指定用户的访问记录（`status`/`ocserv`/`radius`/`access`
 `ip rule show` 里的规则、出口表的 default、nft 标记集合大小）、`/ledger`（账本里记了哪些待清理对象）、
 `/sweep`（按账本删掉当前配置不拥有的残留，`kill -9` 之后可以手动收尾）、`/diag <domain>`（一次诊断：
 假 IP、已学到的真实 IP、出口是代理还是 `next_hop`）、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
-`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务、回看上下线事件）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
+`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务、回看上下线事件）、`/user`（增删改 RADIUS 账号、用 `/user ip` 绑定固定 IP、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
 `/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
 `/help`（只列出当前 chat 有权限执行的命令，并按组隐藏整组；`/help` 本身不受权限限制）、
 `/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、

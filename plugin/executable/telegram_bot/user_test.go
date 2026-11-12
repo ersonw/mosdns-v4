@@ -17,6 +17,7 @@ type stubRadius struct {
 	pass     [][2]string
 	enabled  [][2]bool
 	groups   [][2]string
+	ips      [][2]string
 }
 
 func (s *stubRadius) Users() ([]radius.User, error) { return s.users, nil }
@@ -51,6 +52,11 @@ func (s *stubRadius) SetGroup(name, group string) (bool, error) {
 	return true, nil
 }
 
+func (s *stubRadius) SetIP(name, ip string) (bool, error) {
+	s.ips = append(s.ips, [2]string{name, ip})
+	return true, nil
+}
+
 func (s *stubRadius) Sessions(activeOnly bool, limit int) ([]radius.Session, error) {
 	if activeOnly {
 		var out []radius.Session
@@ -68,7 +74,7 @@ func newRadiusBot() (*telegramBot, *stubRadius) {
 	p := newStubPlugin()
 	adm := &stubRadius{
 		users: []radius.User{
-			{Name: "alice", Group: "staff", Enabled: true, UpdatedAt: 1700000000},
+			{Name: "alice", Group: "staff", IP: "10.8.0.20", Enabled: true, UpdatedAt: 1700000000},
 			{Name: "bob", Enabled: false, UpdatedAt: 1700000100},
 		},
 		sessions: []radius.Session{
@@ -86,7 +92,7 @@ func TestUserHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleText: %v", err)
 	}
-	if !strings.Contains(reply, "/user add") || !strings.Contains(reply, "/user sessions") {
+	if !strings.Contains(reply, "/user add") || !strings.Contains(reply, "/user ip") || !strings.Contains(reply, "/user sessions") {
 		t.Fatalf("help text missing commands: %s", reply)
 	}
 }
@@ -97,7 +103,7 @@ func TestUserList(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleText: %v", err)
 	}
-	for _, want := range []string{"users on radius (2)", "alice", "staff", "enabled", "bob", "disabled"} {
+	for _, want := range []string{"users on radius (2)", "alice", "staff", "ip=10.8.0.20", "enabled", "bob", "disabled"} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("list output missing %q: %s", want, reply)
 		}
@@ -161,6 +167,30 @@ func TestUserGroup(t *testing.T) {
 	}
 	if len(adm.groups) != 1 || adm.groups[0] != [2]string{"alice", "ops"} {
 		t.Fatalf("SetGroup calls = %v", adm.groups)
+	}
+}
+
+func TestUserFixedIP(t *testing.T) {
+	p, adm := newRadiusBot()
+	reply, _ := p.handleText(context.Background(), 123, "/user ip alice 10.8.0.30")
+	if !strings.Contains(reply, "fixed ip 10.8.0.30") {
+		t.Fatalf("unexpected reply: %s", reply)
+	}
+	if len(adm.ips) != 1 || adm.ips[0] != [2]string{"alice", "10.8.0.30"} {
+		t.Fatalf("SetIP calls = %v", adm.ips)
+	}
+
+	reply, _ = p.handleText(context.Background(), 123, "/user ip alice -")
+	if !strings.Contains(reply, "fixed ip cleared") {
+		t.Fatalf("unexpected clear reply: %s", reply)
+	}
+	if len(adm.ips) != 2 || adm.ips[1] != [2]string{"alice", "-"} {
+		t.Fatalf("SetIP calls after clear = %v", adm.ips)
+	}
+
+	reply, _ = p.handleText(context.Background(), 123, "/user ip alice")
+	if !strings.Contains(reply, "usage: /user ip") {
+		t.Fatalf("missing usage reply: %s", reply)
 	}
 }
 

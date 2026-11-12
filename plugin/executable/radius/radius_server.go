@@ -166,8 +166,20 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 	if u.Group != "" {
 		extra = append(extra, attribute{typ: attrClass, value: []byte(u.Group)})
 	}
+	if u.IP != "" {
+		// Framed-IP-Address is a 4-byte IPv4 value. SetIP only stores a
+		// canonical address, but re-check here so a hand-edited SQLite row
+		// cannot make the encoder write a malformed attribute.
+		if ip := net.ParseIP(u.IP).To4(); ip != nil {
+			extra = append(extra, attribute{typ: attrFramedIPAddress, value: ip})
+		} else {
+			s.lg.Warn("radius: stored fixed ip is not ipv4, ignored",
+				zap.String("user", name), zap.String("ip", u.IP))
+		}
+	}
 	s.lg.Debug("radius: authentication accepted",
-		zap.String("user", name), zap.String("client", src.String()), zap.String("group", u.Group))
+		zap.String("user", name), zap.String("client", src.String()),
+		zap.String("group", u.Group), zap.String("ip", u.IP))
 	return s.reply(p, withMA, codeAccessAccept, "", extra)
 }
 
