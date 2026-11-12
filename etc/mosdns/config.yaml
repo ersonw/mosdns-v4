@@ -165,6 +165,359 @@ plugins:
             - _return
         - fakeip
 
+
+  # ==========================================================================
+  ## TEST INSTANCE - every plugin type with every option, ready to uncomment.
+  ## These entries sit inside the plugins list: remove the "# " prefix (hash +
+  ## one space) from a line and it becomes a normal list item of this config.
+  ## Prose lines use "#" without the space, so they stay comments.
+  #
+  ## They are NOT active by default: one process cannot start all of them at
+  ## once (ipset/nftset are Linux-only, the TUN plane needs root and a free
+  ## ipv4_range, radius binds 1812/1813, telegram_bot needs a real token,
+  ## exec_script needs its script file, and every provider/db path must exist).
+  ## Enable one block at a time, and give every fakeip_nat instance its own
+  ## ipv4_range and table_prefix.
+  ## ==========================================================================
+  ## ---- arbitrary: static records --------------------------------------------
+  #  - tag: test_arbitrary
+  #    type: arbitrary
+  #    args:
+  #      rr:
+  #        - "test.lan. 60 IN A 10.0.0.10"
+  #        - "test.lan. 60 IN AAAA fd00::10"
+  #        - "*.wild.lan. 60 IN A 10.0.0.11"
+  #
+  ## ---- blackhole: fixed answer or rcode -------------------------------------
+  #  - tag: test_blackhole
+  #    type: blackhole
+  #    args:
+  #      ipv4: [0.0.0.0]
+  #      ipv6: ["::"]
+  #      rcode: 3
+  #
+  ## ---- bufsize: advertised UDP payload --------------------------------------
+  #  - tag: test_bufsize
+  #    type: bufsize
+  #    args:
+  #      size: 1232
+  #
+  ## ---- cache: memory or Redis -----------------------------------------------
+  #  - tag: test_cache
+  #    type: cache
+  #    args:
+  #      size: 40960                # ignored when redis is set
+  #      redis: ""
+  #      redis_timeout: 100         # milliseconds
+  #      lazy_cache_ttl: 60         # seconds, 0 = disabled
+  #      lazy_cache_reply_ttl: 5
+  #      cache_everything: true
+  #      compress_resp: true
+  #      when_hit: ""
+  #
+  ## ---- client_limiter -------------------------------------------------------
+  #  - tag: test_limiter
+  #    type: client_limiter
+  #    args:
+  #      max_qps: 50
+  #      v4_mask: 32
+  #      v6_mask: 48
+  #
+  ## ---- dual_selector --------------------------------------------------------
+  #  - tag: test_dual_selector
+  #    type: dual_selector
+  #    args:
+  #      mode: 0                    # 0 = prefer IPv4, 1 = prefer IPv6
+  #      wait_timeout: 250          # milliseconds
+  #
+  ## ---- ecs ------------------------------------------------------------------
+  #  - tag: test_ecs
+  #    type: ecs
+  #    args:
+  #      auto: true
+  #      force_overwrite: false
+  #      mask4: 24
+  #      mask6: 48
+  #      ipv4: "1.2.3.0"
+  #      ipv6: "2001:db8::"
+  #
+  ## ---- edns0_filter ---------------------------------------------------------
+  #  - tag: test_edns0_filter
+  #    type: edns0_filter
+  #    args:
+  #      no_edns: false
+  #      accept: [8, 10]            # 8 = ECS, 10 = COOKIE
+  #      discard: [12]              # 12 = PADDING
+  #
+  ## ---- exec_script ----------------------------------------------------------
+  #  - tag: test_script
+  #    type: exec_script
+  #    args:
+  #      script_path: /etc/mosdns/nat_map.py
+  #      dedup_ttl: 300
+  #      async: true
+  #
+  ## ---- fakeip_nat: fake-IP DNS + TUN data plane -----------------------------
+  ## NAT plane instead: use_tun: false, and drop tun_dev / tun_mtu / proxy /
+  ## proxy_insecure / tun_route_table.
+  #  - tag: test_fakeip
+  #    type: fakeip_nat
+  #    args:
+  #      db_path: /etc/mosdns/fakeip.db
+  #      table_prefix: test
+  #      ipv4_range: 198.18.0.0/15
+  #      ttl: 60
+  #      record_ttl: 168h           # mapping lifetime, "0" keeps forever
+  #      next_hop: 192.168.1.1
+  #      next_hop_dev: eth0
+  #      realip: false
+  #      script: ""                 # deprecated, only logs a warning
+  #      mss_clamp: 1360            # NAT plane only, 0 or 536..65535
+  #      route_table: main
+  #      route_aggregation: true
+  #      route_mark: 123
+  #      route_rule_priority: 1000
+  #      use_tun: true
+  #      tun_dev: mth0
+  #      tun_mtu: 1500              # 0 = auto: 1500 direct, 1400 proxy
+  #      proxy: "socks5://127.0.0.1:1080"
+  #      proxy_insecure: true
+  #      tun_route_table: 100
+  #      hop_name_suffix: test
+  #
+  ## ---- fast_forward ---------------------------------------------------------
+  #  - tag: test_fast_forward
+  #    type: fast_forward
+  #    args:
+  #      upstream:
+  #        - addr: https://dns.alidns.com/dns-query
+  #          dial_addr: 223.5.5.5:443
+  #          trusted: true
+  #          socks5: 127.0.0.1:1080
+  #          so_mark: 0
+  #          bind_to_device: eth0
+  #          idle_timeout: 30
+  #          max_conns: 2
+  #          enable_pipeline: true
+  #          enable_http3: false
+  #          bootstrap: 223.5.5.5
+  #          insecure_skip_verify: false
+  #      ca:
+  #        - /etc/mosdns/ca.pem
+  #
+  ## ---- forward --------------------------------------------------------------
+  #  - tag: test_forward
+  #    type: forward
+  #    args:
+  #      upstream:
+  #        - addr: tls://dns.google
+  #          ip_addr: [8.8.8.8]
+  #          trusted: false
+  #      timeout: 5
+  #      insecure_skip_verify: false
+  #      bootstrap: [223.5.5.5]
+  #
+  ## ---- hosts ----------------------------------------------------------------
+  #  - tag: test_hosts
+  #    type: hosts
+  #    args:
+  #      hosts:
+  #        - "router.lan 10.0.0.1"
+  #        - "nas.lan 10.0.0.2 fd00::2"
+  #        - "provider:test_hosts_file"
+  #
+  ## ---- ipset: Linux only ----------------------------------------------------
+  #  - tag: test_ipset
+  #    type: ipset
+  #    args:
+  #      set_name4: test4
+  #      set_name6: test6
+  #      mask4: 24
+  #      mask6: 32
+  #
+  ## ---- marker ---------------------------------------------------------------
+  #  - tag: test_marker
+  #    type: marker
+  #
+  ## ---- metrics_collector ----------------------------------------------------
+  #  - tag: test_metrics
+  #    type: metrics_collector
+  #
+  ## ---- nftset: Linux only ---------------------------------------------------
+  #  - tag: test_nftset
+  #    type: nftset
+  #    args:
+  #      table_family4: inet
+  #      table_family6: inet
+  #      table_name4: mosdns_test
+  #      table_name6: mosdns_test
+  #      set_name4: test4
+  #      set_name6: test6
+  #      mask4: 24
+  #      mask6: 32
+  #
+  ## ---- ocserv_ctl -----------------------------------------------------------
+  #  - tag: test_ocserv
+  #    type: ocserv_ctl
+  #    args:
+  #      socket: /run/ocserv/occtl.socket
+  #      addr: ""
+  #      occtl_path: occtl
+  #      timeout: 3
+  #      cache_ttl: 15
+  #      mark: 0
+  #
+  ## ---- radius ---------------------------------------------------------------
+  #  - tag: test_radius
+  #    type: radius
+  #    args:
+  #      listen: 0.0.0.0:1812
+  #      accounting_listen: 0.0.0.0:1813
+  #      secret: "change-me-to-the-ocserv-secret"
+  #      db_path: /etc/mosdns/radius.db
+  #
+  ## ---- redirect -------------------------------------------------------------
+  #  - tag: test_redirect
+  #    type: redirect
+  #    args:
+  #      rule:
+  #        - "grafana.lan grafana.example.com"
+  #        - "*.old.lan new.lan"
+  #
+  ## ---- reverse_lookup -------------------------------------------------------
+  #  - tag: test_reverse_lookup
+  #    type: reverse_lookup
+  #    args:
+  #      size: 65536
+  #      redis: ""
+  #      handle_ptr: true
+  #      ttl: 1800
+  #
+  ## ---- sleep ----------------------------------------------------------------
+  #  - tag: test_sleep
+  #    type: sleep
+  #    args:
+  #      duration: 500
+  #
+  ## ---- telegram_bot ---------------------------------------------------------
+  #  - tag: test_bot
+  #    type: telegram_bot
+  #    args:
+  #      token: ""                  # empty disables the plugin
+  #      chat_ids: [100000001]
+  #      admins:
+  #        - chat_id: 100000001
+  #          role: ops
+  #        - chat_id: 100000002
+  #          role: senior
+  #      roles:
+  #        ops:
+  #          allow: [fakeip, ocserv]
+  #        senior:
+  #          inherits: [ops]
+  #          allow: [exec_script, config, reload]
+  #      default_role: admin
+  #      fakeip_tags: [test_fakeip]
+  #      fakeip_tag: ""
+  #      ocserv_tags: [test_ocserv]
+  #      ocserv_tag: ""
+  #      radius_tags: [test_radius]
+  #      radius_tag: ""
+  #      config_path: /etc/mosdns/config-full.yaml
+  #      audit_log: ""
+  #      proxy: ""
+  #      api_base: https://api.telegram.org
+  #      poll_timeout: 30
+  #
+  ## ---- ttl ------------------------------------------------------------------
+  #  - tag: test_ttl
+  #    type: ttl
+  #    args:
+  #      maximum_ttl: 3600
+  #      minimal_ttl: 60
+  #
+  ## ---- matchers -------------------------------------------------------------
+  #  - tag: test_match_domains
+  #    type: query_matcher
+  #    args:
+  #      client_ip: [192.168.0.0/16]
+  #      ecs: [192.168.0.0/24]
+  #      domain:
+  #        - "provider:test_domains"
+  #        - "provider:test_geosite:cn"
+  #        - "keyword:ads"
+  #        - 'regexp:^ad[0-9]+\.'
+  #      qtype: [1, 28, 65]
+  #      qclass: [1]
+  #
+  #  - tag: test_match_response
+  #    type: response_matcher
+  #    args:
+  #      rcode: [2, 3]
+  #      ip:
+  #        - "provider:test_geoip:cn"
+  #      cname: [example.com]
+  #
+  ## ---- sequences ------------------------------------------------------------
+  ## The served sequence: cache, local answers, then the remote branch with the
+  ## fake-IP data plane, response clamping and reverse lookup.
+  #  - tag: test_sequence
+  #    type: sequence
+  #    args:
+  #      exec:
+  #        - test_limiter
+  #        - test_bufsize
+  #        - test_cache
+  #        - test_hosts
+  #        - test_arbitrary
+  #        - test_edns0_filter
+  #        - test_ecs
+  #        - if: test_match_domains
+  #          exec:
+  #            - test_redirect
+  #            - test_dual_selector
+  #            - test_fast_forward
+  #            - test_fakeip
+  #            - _return
+  #        - test_forward
+  #        - test_ttl
+  #        - test_reverse_lookup
+  #        - _return
+  #
+  ## Not served, but shows every block form of "exec"; it is parsed at startup,
+  ## so a syntax error here also aborts startup.
+  #  - tag: test_sequence_advanced
+  #    type: sequence
+  #    args:
+  #      exec:
+  #        - if_and:
+  #            - test_match_domains
+  #            - _qtype_A_AAAA
+  #          exec:
+  #            - test_forward
+  #          else_exec:
+  #            - test_blackhole
+  #            - _return
+  #        - parallel:
+  #            - test_metrics
+  #            - test_reverse_lookup
+  #        - load_balance:
+  #            - test_fast_forward
+  #            - test_forward
+  #        - primary: [test_fast_forward]
+  #          secondary: [test_forward]
+  #          stat_length: 10
+  #          threshold: 5
+  #          fast_fallback: 300
+  #          always_standby: false
+  #        - test_sleep
+  #        - if: test_match_response
+  #          exec:
+  #            - test_marker
+  #            - _return
+  #        - _return
+  #
+
 servers:
   - exec: main
     listeners:
