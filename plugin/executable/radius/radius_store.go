@@ -243,19 +243,29 @@ func (s *store) getUser(name string) (userRow, bool, error) {
 	return u, true, nil
 }
 
-// addUser inserts an account. Duplicate names are rejected so an overwrite from
-// the bot has to be an explicit password change instead.
+// addUser inserts an account without a fixed address.
 func (s *store) addUser(name, password, group string) error {
+	return s.addUserWithIP(name, password, group, "")
+}
+
+// addUserWithIP inserts an account with an optional fixed address. Duplicate
+// names are rejected so an overwrite from the bot has to be an explicit
+// password change instead; a taken address is reported separately.
+func (s *store) addUserWithIP(name, password, group, ip string) error {
 	hash, err := hashPassword(password)
 	if err != nil {
 		return err
 	}
 	now := time.Now().Unix()
 	_, err = s.db.Exec(fmt.Sprintf(
-		"INSERT INTO %s (name, password, group_name, ip, enabled, created_at, updated_at) VALUES (?, ?, ?, '', 1, ?, ?)",
-		userTableName), name, hash, group, now, now)
+		"INSERT INTO %s (name, password, group_name, ip, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+		userTableName), name, hash, group, ip, now, now)
 	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") || strings.Contains(err.Error(), "constraint") {
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, userTableName+".ip") || strings.Contains(msg, "idx_"+userTableName+"_ip") {
+			return errIPInUse
+		}
+		if strings.Contains(msg, "unique") || strings.Contains(msg, "constraint") {
 			return errUserExists
 		}
 		return fmt.Errorf("radius: add user: %w", err)
@@ -314,17 +324,42 @@ func (s *store) setGroup(name, group string) (bool, error) {
 }
 
 func (s *store) setIP(name, ip string) (bool, error) {
+	// Check the owner first so the bot gets a useful message ("used by alice")
+	// instead of only the SQLite constraint text. The unique index still guards
+	// the race between this SELECT and the UPDATE.
+	if ip != "" {
+		owner, used, err := s.ipOwner(ip)
+		if err != nil {
+			return false, err
+		}
+		if used && owner != name {
+			return false, fmt.Errorf("%w: %s is used by %s", errIPInUse, ip, owner)
+		}
+	}
 	res, err := s.db.Exec(fmt.Sprintf(
 		"UPDATE %s SET ip = ?, updated_at = ? WHERE name = ?", userTableName),
 		ip, time.Now().Unix(), name)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
-			return false, errIPInUse
+			return false, fmt.Errorf("%w: %s", errIPInUse, ip)
 		}
 		return false, fmt.Errorf("radius: set ip: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n > 0, nil
+}
+
+func (s *store) ipOwner(ip string) (string, bool, error) {
+	var owner string
+	err := s.db.QueryRow(fmt.Sprintf(
+		"SELECT name FROM %s WHERE ip = ? LIMIT 1", userTableName), ip).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("radius: look up ip owner: %w", err)
+	}
+	return owner, true, nil
 }
 
 func (s *store) listUsers() ([]userRow, error) {

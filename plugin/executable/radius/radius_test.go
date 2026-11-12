@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,6 +45,85 @@ func testPlugin(t *testing.T) *Plugin {
 	}
 	t.Cleanup(func() { _ = p.Close() })
 	return p.(*Plugin)
+}
+
+func testPluginWithArgs(t *testing.T, args Args) *Plugin {
+	t.Helper()
+	args.Listen = "127.0.0.1:0"
+	args.AccountingListen = "off"
+	args.Secret = "test-secret"
+	args.DBPath = filepath.Join(t.TempDir(), "radius.db")
+	p, err := Init(coremainBP(t), &args)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	return p.(*Plugin)
+}
+
+func userIPs(t *testing.T, p *Plugin) map[string]string {
+	t.Helper()
+	users, err := p.Users()
+	if err != nil {
+		t.Fatalf("Users: %v", err)
+	}
+	out := make(map[string]string, len(users))
+	for _, u := range users {
+		out[u.Name] = u.IP
+	}
+	return out
+}
+
+func TestAddUserAutoIP(t *testing.T) {
+	p := testPluginWithArgs(t, Args{IPPool: "10.9.0.2-10.9.0.4"})
+	for _, name := range []string{"alice", "bob", "carol"} {
+		if err := p.AddUser(name, "pw-"+name, "users"); err != nil {
+			t.Fatalf("AddUser(%s): %v", name, err)
+		}
+	}
+	ips := userIPs(t, p)
+	want := map[string]string{"alice": "10.9.0.4", "bob": "10.9.0.3", "carol": "10.9.0.2"}
+	for name, ip := range want {
+		if ips[name] != ip {
+			t.Fatalf("%s ip = %q, want %q", name, ips[name], ip)
+		}
+	}
+	if err := p.AddUser("dave", "pw-dave", "users"); !errors.Is(err, errPoolExhausted) {
+		t.Fatalf("AddUser on exhausted pool = %v, want errPoolExhausted", err)
+	}
+}
+
+func TestAddUserSkipsOcservServerIP(t *testing.T) {
+	conf := writeOcservConf(t, "ipv4-network = 10.9.0.0/24\nipv6-network = fd00:10:9::/48\n")
+	p := testPluginWithArgs(t, Args{OcservConfig: conf})
+	if err := p.AddUser("alice", "pw-alice", "users"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	ips := userIPs(t, p)
+	if ips["alice"] != "10.9.0.254" {
+		t.Fatalf("alice ip = %q, want the top free address 10.9.0.254", ips["alice"])
+	}
+	if _, err := p.SetIP("alice", "10.9.0.1"); !errors.Is(err, errIPInUse) {
+		t.Fatalf("SetIP to server address = %v, want errIPInUse", err)
+	}
+}
+
+func TestSetIPConflictReportsOwner(t *testing.T) {
+	p := testPluginWithArgs(t, Args{IPPool: "10.9.0.2-10.9.0.4"})
+	for _, name := range []string{"alice", "bob"} {
+		if err := p.AddUser(name, "pw-"+name, "users"); err != nil {
+			t.Fatalf("AddUser(%s): %v", name, err)
+		}
+	}
+	ips := userIPs(t, p)
+	if ips["alice"] != "10.9.0.4" || ips["bob"] != "10.9.0.3" {
+		t.Fatalf("unexpected auto allocation: %+v", ips)
+	}
+	if _, err := p.SetIP("bob", "10.9.0.4"); !errors.Is(err, errIPInUse) {
+		t.Fatalf("SetIP conflict = %v, want errIPInUse", err)
+	} else if !strings.Contains(err.Error(), "alice") {
+		t.Fatalf("SetIP conflict = %v, want the current owner alice", err)
+	}
 }
 
 func randomAuth() [16]byte {

@@ -251,13 +251,13 @@
 
 ### 2.24 `radius`（定制）
 - **文件**：`plugin/executable/radius/radius.go`（`Args` / `Admin` 接口 / 校验）、`radius_packet.go`（报文编解码、`User-Password` 链式异或、响应认证符、Message-Authenticator）、`radius_server.go`（UDP 收发与两个 handler）、`radius_store.go`（PBKDF2 + SQLite 两张表）；导入在 `plugin/enabled_plugin.go`（`_ query_summary` 之后）
-- **参数**：`listen`（默认 `0.0.0.0:1812`）、`accounting_listen`（默认 `0.0.0.0:1813`，`off` / `0` 关闭）、`secret`（必填，与 ocserv 的 `radius secret` 一致）、`db_path`（默认 `radius.db`）
-- **认证**：只支持 PAP（ocserv 的 `auth = radius` 走 `Access-Request` + `User-Password`）。报文头 length 与实际长度不符或属性长度越界即拒；`Access-Request` 带 `CHAP-Password` 而没有 `User-Password` 时明确回 Reject 并提示改用 PAP，不静默丢包。认证通过把 `group_name` 作为 `Class(25)` 回给 ocserv；`ip` 非空时再回 `Framed-IP-Address(8)`（4 字节 IPv4），ocserv 1.1.6 在 `mode radius` 下按该属性分配固定隧道地址
+- **参数**：`listen`（默认 `0.0.0.0:1812`）、`accounting_listen`（默认 `0.0.0.0:1813`，`off` / `0` 关闭）、`secret`（必填，与 ocserv 的 `radius secret` 一致）、`db_path`（默认 `radius.db`）、`ocserv_config`（ocserv.conf 路径，读 `ipv4-network` 作为自动分配池；本机地址不分配）、`ip_pool`（手动覆盖，CIDR 或 `起始-结束`；空则读 `ocserv_config`）
+- **认证**：只支持 PAP（ocserv 的 `auth = radius` 走 `Access-Request` + `User-Password`）。报文头 length 与实际长度不符或属性长度越界即拒；`Access-Request` 带 `CHAP-Password` 而没有 `User-Password` 时明确回 Reject 并提示改用 PAP，不静默丢包。认证通过把 `group_name` 作为 `Class(25)` 回给 ocserv；`ip` 非空时再回 `Framed-IP-Address(8)`（4 字节 IPv4），ocserv 1.1.6 在 `mode radius` 下按该属性分配固定隧道地址。配置分配池后，新增账号自动从池高端向下取空闲地址；ocserv 本机 tun 地址（默认 `ipv4-network` 首个可用地址，或 `server-ip` / 带主机地址的 CIDR）被排除，手动绑定到该地址也会被拒
 - **记账**（RFC 2866）：`Start(1)` / `Start2(15)` 建会话并置 `active=1`，`Interim(3)` / `Alive(4)` 只更新用量，`Stop(2)` 写 `ended_at` 并置 `active=0`；请求认证符按 `MD5(code|id|len|16 个 0|attrs|secret)` 校验
 - **存储**：`radius_users`（`name` 主键 + `password` + `group_name` + `ip` + `enabled` + 时间戳；老库打开时自动 `ALTER TABLE` 补 `ip`，再建 `ip <> ''` 的部分唯一索引）、`radius_sessions`（`session_id` 主键 + `name` + `remote_ip` + 起止时间 + 收发字节 + `active`），DSN 带 `busy_timeout(5000)` 与 WAL；密码是手写 PBKDF2-HMAC-SHA256（12000 轮、16 字节盐、32 字节 DK），不引入 `x/crypto`
 - **管理入口**：`Admin` 接口 `Users` / `AddUser` / `DeleteUser` / `SetPassword` / `SetEnabled` / `SetIP` / `Sessions`，另有 `SetGroup`，供 `telegram_bot` 的 `/user` 类型断言使用
 - **注意**：`Exec` 是纯透传，插件不进 DNS 链，只借 `GetExecutables()` 被 bot 看见；账号表与 ocserv 的 `ocpasswd` 完全独立，ocserv 侧本地用户不再参与认证
-- **测试（9 项）**：密码编解码往返、截断属性拒绝、哈希校验、Accept/Reject/未知用户/禁用账号端到端 UDP（含 `Framed-IP-Address` 断言）、客户端复算响应认证符、记账 Start/Stop 落库、`Admin` 校验与增删改查、固定 IP 校验/冲突/清除、老库补列迁移
+- **测试（17 项）**：密码编解码往返、截断属性拒绝、哈希校验、Accept/Reject/未知用户/禁用账号端到端 UDP（含 `Framed-IP-Address` 断言）、客户端复算响应认证符、记账 Start/Stop 落库、`Admin` 校验与增删改查、固定 IP 校验/冲突/清除、老库补列迁移、`ipv4-network` 池解析、自动分配递减顺序、服务端地址排除、绑定冲突报告占用者
 
 ### 2.25 `exec_script`（定制）
 - **文件**：`plugin/executable/exec_script/exec_script.go`；注册 `:21`

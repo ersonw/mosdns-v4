@@ -15,6 +15,7 @@ package radius
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -48,6 +49,14 @@ type Args struct {
 	// DBPath is the SQLite file holding accounts and sessions.
 	// Default "radius.db" next to the process working directory.
 	DBPath string `yaml:"db_path"`
+	// OcservConfig is the ocserv.conf to read ipv4-network from for automatic
+	// address assignment, e.g. /run/ocserv/dyize/ocserv.conf.
+	OcservConfig string `yaml:"ocserv_config"`
+	// IPPool overrides OcservConfig with an explicit range:
+	// "10.8.0.0/24" or "10.8.0.2-10.8.0.254". Empty means "read ocserv.conf".
+	IPPool string `yaml:"ip_pool"`
+
+	pool *ipPool
 }
 
 func (a *Args) initDefault() error {
@@ -70,6 +79,19 @@ func (a *Args) initDefault() error {
 	if a.DBPath == "" {
 		a.DBPath = "radius.db"
 	}
+	a.OcservConfig = strings.TrimSpace(a.OcservConfig)
+	var pool *ipPool
+	var err error
+	switch {
+	case a.IPPool != "":
+		pool, err = parseIPPool(a.IPPool)
+	case a.OcservConfig != "":
+		pool, err = loadPoolFromOcserv(a.OcservConfig)
+	}
+	if err != nil {
+		return err
+	}
+	a.pool = pool
 	if _, err := net.ResolveUDPAddr("udp", a.Listen); err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", a.Listen, err)
 	}
@@ -121,6 +143,7 @@ type Plugin struct {
 	args  *Args
 	store *store
 	srv   *server
+	pool  *ipPool
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -142,14 +165,19 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		return nil, fmt.Errorf("radius: %w", err)
 	}
 
-	p := &Plugin{BP: bp, args: a, store: st, srv: srv}
+	p := &Plugin{BP: bp, args: a, store: st, srv: srv, pool: a.pool}
 	srv.start()
 
 	users, _ := st.listUsers()
+	poolInfo := ""
+	if a.pool != nil {
+		poolInfo = ipv4String(a.pool.first) + "-" + ipv4String(a.pool.last)
+	}
 	p.L().Info("radius: plugin initialized",
 		zap.String("db_path", a.DBPath),
 		zap.String("listen", a.Listen),
 		zap.String("accounting_listen", a.AccountingListen),
+		zap.String("ip_pool", poolInfo),
 		zap.Int("users", len(users)),
 	)
 	return p, nil
@@ -195,10 +223,35 @@ func (p *Plugin) AddUser(name, password, group string) error {
 	if err := validateCredentials(name, password); err != nil {
 		return err
 	}
-	if err := p.store.addUser(name, password, strings.TrimSpace(group)); err != nil {
+	group = strings.TrimSpace(group)
+
+	// With ip_pool set, a new account always gets a fixed address. Allocation
+	// and insert are two statements, so a concurrent SetIP can take the
+	// candidate; the unique index rejects it and we try the next free address.
+	if p.pool != nil {
+		for attempt := 0; attempt < 3; attempt++ {
+			ip, err := p.store.allocate(p.pool)
+			if err != nil {
+				return err
+			}
+			err = p.store.addUserWithIP(name, password, group, ip)
+			if errors.Is(err, errIPInUse) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			p.L().Info("radius: user added",
+				zap.String("user", name), zap.String("group", group), zap.String("ip", ip))
+			return nil
+		}
+		return fmt.Errorf("%w: could not allocate a free address", errIPInUse)
+	}
+
+	if err := p.store.addUser(name, password, group); err != nil {
 		return err
 	}
-	p.L().Info("radius: user added", zap.String("user", name), zap.String("group", strings.TrimSpace(group)))
+	p.L().Info("radius: user added", zap.String("user", name), zap.String("group", group))
 	return nil
 }
 
@@ -246,6 +299,12 @@ func (p *Plugin) SetIP(name, ip string) (bool, error) {
 	normalized, err := normalizeFixedIP(ip)
 	if err != nil {
 		return false, err
+	}
+	if normalized != "" && p.pool != nil {
+		v, _ := parseIPv4(normalized)
+		if v == p.pool.server {
+			return false, fmt.Errorf("%w: %s is the ocserv server address", errIPInUse, normalized)
+		}
 	}
 	ok, err := p.store.setIP(name, normalized)
 	if err != nil {

@@ -394,7 +394,9 @@ ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用
 只实现 PAP：若客户端协商成 EAP-MSCHAPv2，ocserv 发来的是 `CHAP-Password`，插件明确回 Reject
 并提示改用 PAP，不会静默丢包。密码按 PBKDF2-HMAC-SHA256（12000 轮加盐）存，明文不落盘；
 账号的增删改由 `telegram_bot` 的 `/user` 完成，固定 IP 用 `/user ip <name> <ipv4|->`
-设置或清除（`-` 表示回到动态池）。
+设置或清除（`-` 表示清除固定 IP）。配置 `ocserv_config` 后，新增账号会自动从 ocserv 的
+`ipv4-network` 分配一个固定地址：从池高端向下找空闲地址，ocserv 自己的 tun 地址（默认首个
+可用地址，或 `ipv4-network = 10.9.0.1/24` / `server-ip` 显式写出的地址）不参与分配。
 ```yaml
   - tag: radius
     type: radius
@@ -403,6 +405,10 @@ ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用
       accounting_listen: 0.0.0.0:1813  # 记账端口，off / 0 关闭
       secret: "换成一串随机字符"        # 必填，必须与 ocserv 的 secret 一致
       db_path: etc/mosdns/radius.db    # 账号与会话表
+      # 新增账号自动分配固定 IP：读 ocserv.conf 的 ipv4-network 作为分配池
+      ocserv_config: /run/ocserv/dyize/ocserv.conf
+      # 可选：手动指定池，优先于 ocserv_config；CIDR 或 起始-结束
+      # ip_pool: "10.9.0.2-10.9.0.254"
 ```
 老库（`radius_users` 还没有 `ip` 列）在插件启动时自动补列，不需要手工迁移；固定 IP 由
 `ip <> ''` 的部分唯一索引约束，同一个地址不能同时绑两个账号。
