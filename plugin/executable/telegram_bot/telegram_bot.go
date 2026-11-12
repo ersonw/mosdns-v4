@@ -357,7 +357,7 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 
 	switch cmd {
 	case "/start", "/help":
-		return helpText, nil
+		return p.helpFor(chatID), nil
 	case "/fip":
 		return p.handleFip(ctx, fields[1:])
 	case "/vpn":
@@ -714,49 +714,114 @@ func formatTime(unix int64) string {
 	return time.Unix(unix, 0).Format("2006-01-02 15:04")
 }
 
-const helpText = `mosdns admin bot
-/fip [tag] list [n]          recent mappings (default 20)
-/fip get <domain|fake_ip>    look up one mapping
-/fip add <domain> <fake_ip>  create or replace a mapping
-/fip del <domain>            drop a mapping
-/fip stats                   mapping counters
-/fip clear confirm           drop every mapping
-/vpn users                   connected ocserv users
-/vpn status                  ocserv status
-/vpn sessions                valid sessions
-/vpn kick <user>             disconnect one user
-/vpn term <user>             terminate one user
-/vpn run <occtl args...>     any other occtl command
-/user list                   radius accounts with group and state
-/user add <name> <pass> [g]  create a radius account
-/user del <name>             delete a radius account
-/user pass <name> <pass>     replace a password
-/user enable|disable <name>  toggle authentication
-/user sessions [active] [n]  accounting sessions
-/access <user> [days]        export that user's visit records as xlsx (default 7 days)
-/access <ip> [days]          export one client address directly
-/net [tag]                   data plane: device, proxy, mark, rules, routes
-/ledger [tag]                recorded objects a later run would clean
-/sweep [tag] confirm         drop recorded objects this config does not own
-/diag <domain> [tag]         mapping, real ips and outlet for one domain
-/proxy [tag]                 proxy state of the fakeip plugin
-/proxy on <url>|off          write the proxy, then /reload confirm
-/audit [n]                   last administration actions
-/status                      process and plugin summary
-/plugins                     loaded plugins and their capabilities
-/plugin <tag>                one plugin: type, capabilities, config args
-/config                      config file summary
-/config show <section>       dump log/data_providers/plugins/servers
-/config get <key.path>       read a value, e.g. plugins[1].tag
-/config set <key.path> <v>   write a value (backup taken)
-/config add <section> <yaml> append a block; flow yaml, e.g.
-                             /config add plugins {tag: x, type: sequence}
-/config del <section> <k>    drop by tag, index or log key
-/config validate             check required fields before reload
-/exec <tag> <ip> <domain>    run one configured exec_script plugin
-/perm                        your role and permissions
-/reload confirm              validate config and stop, so a supervisor restarts
-/help                        this message`
+// helpGroup / helpItem describe /help in a form that can be filtered per
+// chat: a command only makes sense to print when the caller may actually run
+// it, otherwise the reply is a list of things that answer "permission denied".
+type helpItem struct {
+	line string
+	perm string
+}
+
+type helpGroup struct {
+	title string
+	items []helpItem
+}
+
+var helpGroups = []helpGroup{
+	{title: "fakeip mappings", items: []helpItem{
+		{"/fip [tag] list [n]          recent mappings (default 20)", PermFakeIP},
+		{"/fip get <domain|fake_ip>    look up one mapping", PermFakeIP},
+		{"/fip add <domain> <fake_ip>  create or replace a mapping", PermFakeIP},
+		{"/fip del <domain>            drop a mapping", PermFakeIP},
+		{"/fip stats                   mapping counters", PermFakeIP},
+		{"/fip clear confirm           drop every mapping", PermFakeIP},
+	}},
+	{title: "ocserv", items: []helpItem{
+		{"/vpn users                   connected ocserv users", PermOcserv},
+		{"/vpn status                  ocserv status", PermOcserv},
+		{"/vpn sessions                valid sessions", PermOcserv},
+		{"/vpn kick <user>             disconnect one user", PermOcserv},
+		{"/vpn term <user>             terminate one user", PermOcserv},
+		{"/vpn run <occtl args...>     any other occtl command", PermOcserv},
+	}},
+	{title: "radius accounts", items: []helpItem{
+		{"/user list                   radius accounts with group and state", PermRadius},
+		{"/user add <name> <pass> [g]  create a radius account", PermRadius},
+		{"/user del <name>             delete a radius account", PermRadius},
+		{"/user pass <name> <pass>     replace a password", PermRadius},
+		{"/user enable|disable <name>  toggle authentication", PermRadius},
+		{"/user sessions [active] [n]  accounting sessions", PermRadius},
+	}},
+	{title: "access records", items: []helpItem{
+		{"/access <user> [days]        export that user's visit records as xlsx (default 7 days)", PermAccess},
+		{"/access <ip> [days]          export one client address directly", PermAccess},
+	}},
+	{title: "data plane", items: []helpItem{
+		{"/net [tag]                   data plane: device, proxy, mark, rules, routes", PermStatus},
+		{"/ledger [tag]                recorded objects a later run would clean", PermStatus},
+		{"/diag <domain> [tag]         mapping, real ips and outlet for one domain", PermFakeIP},
+		{"/sweep [tag] confirm         drop recorded objects this config does not own", PermConfig},
+	}},
+	{title: "process", items: []helpItem{
+		{"/status                      process and plugin summary", PermStatus},
+		{"/plugins                     loaded plugins and their capabilities", PermStatus},
+		{"/plugin <tag>                one plugin: type, capabilities, config args", PermStatus},
+		{"/audit [n]                   last administration actions", PermStatus},
+	}},
+	{title: "config", items: []helpItem{
+		{"/config                      config file summary", PermConfig},
+		{"/config show <section>       dump log/data_providers/plugins/servers", PermConfig},
+		{"/config get <key.path>       read a value, e.g. plugins[1].tag", PermConfig},
+		{"/config set <key.path> <v>   write a value (backup taken)", PermConfig},
+		{"/config add <section> <yaml> append a block; flow yaml, e.g.", PermConfig},
+		{"                             /config add plugins {tag: x, type: sequence}", PermConfig},
+		{"/config del <section> <k>    drop by tag, index or log key", PermConfig},
+		{"/config validate             check required fields before reload", PermConfig},
+		{"/proxy [tag]                 proxy state of the fakeip plugin", PermConfig},
+		{"/proxy on <url>|off          write the proxy, then /reload confirm", PermConfig},
+		{"/exec <tag> <ip> <domain>    run one configured exec_script plugin", PermExecScript},
+		{"/reload confirm              validate config and stop, so a supervisor restarts", PermReload},
+	}},
+}
+
+// helpFor builds the reply for one chat: only the commands that chat may run,
+// with an empty group omitted entirely.
+func (p *telegramBot) helpFor(chatID int64) string {
+	var b strings.Builder
+	b.WriteString("mosdns admin bot")
+	if p.access != nil {
+		if role, ok := p.access.roles[chatID]; ok {
+			b.WriteString(" (role: " + role + ")")
+		}
+	}
+	b.WriteString("\n")
+	for _, group := range helpGroups {
+		var visible []string
+		for _, item := range group.items {
+			if p.mayRun(chatID, item.perm) {
+				visible = append(visible, item.line)
+			}
+		}
+		if len(visible) == 0 {
+			continue
+		}
+		b.WriteString("\n" + group.title + "\n")
+		for _, line := range visible {
+			b.WriteString(line + "\n")
+		}
+	}
+	b.WriteString("\n/perm                        your role and permissions\n/help                        this message")
+	return b.String()
+}
+
+// mayRun reports whether the chat holds a permission. An unconfigured
+// permission table means the bot is disabled, and the help is not filtered.
+func (p *telegramBot) mayRun(chatID int64, perm string) bool {
+	if p.access == nil || perm == "" {
+		return true
+	}
+	return p.access.allowed(chatID, perm)
+}
 
 const fipHelp = `fakeip commands (optional tag first, e.g. /fip fakeip2 list)
 /fip tags                    configured targets

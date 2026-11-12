@@ -398,6 +398,7 @@ ocserv、导出指定用户的访问记录（`status`/`ocserv`/`radius`/`access`
 假 IP、已学到的真实 IP、出口是代理还是 `next_hop`）、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
 `/vpn`（查 ocserv 在线用户）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
 `/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
+`/help`（只列出当前 chat 有权限执行的命令，并按组隐藏整组；`/help` 本身不受权限限制）、
 `/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、
 `/reload`（给进程发关闭信号，靠外部 supervisor 重新拉起）、
 `/access <user|ip> [days]`（按 RADIUS 用户（取其记账会话里的地址）或直接给地址，从 fakeip 的访问记录

@@ -250,6 +250,10 @@ func (t *accessTable) permissionNames(chatID int64) string {
 // what a role can do.
 func requiredPermission(cmd string) string {
 	switch cmd {
+	case "/start", "/help":
+		// Help describes what a chat may do, so it must never be gated on one
+		// of those permissions.
+		return ""
 	case "/fip", "/list", "/stats", "/lookup", "/rev", "/del", "/clear":
 		return PermFakeIP
 	case "/vpn":
@@ -277,7 +281,7 @@ func (p *telegramBot) require(chatID int64, perm string) error {
 	if _, ok := p.access.perms[chatID]; !ok {
 		return fmt.Errorf("permission denied: chat %d is not an administrator", chatID)
 	}
-	if p.access.allowed(chatID, perm) {
+	if perm == "" || p.access.allowed(chatID, perm) {
 		return nil
 	}
 	return fmt.Errorf("permission denied: role %q lacks %q (allowed: %s)",
