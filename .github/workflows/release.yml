@@ -1,7 +1,7 @@
 # Tag a commit (git tag v4.0.1 && git push origin v4.0.1) and this workflow
-# builds every platform with that version stamped in, then publishes three
-# things: the cross-built binaries, and two source archives (.tar.gz and .zip)
-# taken from the working tree with the repository-only files left out.
+# builds every platform with that version stamped in, then publishes the
+# cross-built binaries. GitHub already attaches the source archives for a tag,
+# so the workflow does not create its own copies.
 name: release
 
 on:
@@ -65,7 +65,7 @@ jobs:
       - name: cross build
         run: go run ./tools/crossbuild -version "${VERSION}"
 
-      - name: package binaries and source
+      - name: package binaries
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -80,27 +80,6 @@ jobs:
             esac
             cp "${f}" "dist/mosdns-${SLUG}-${target}${ext}"
           done
-
-          # Source archives. .git, .github, .idea and the local build output are
-          # repository-only and are left out; the local sqlite files are runtime
-          # state, not source.
-          stage="$(mktemp -d)"
-          root="mosdns-${SLUG}"
-          mkdir -p "${stage}/${root}"
-          rsync -a \
-            --exclude '.git' \
-            --exclude '.github' \
-            --exclude '.idea' \
-            --exclude 'build' \
-            --exclude 'dist' \
-            --exclude 'release' \
-            --exclude 'crossbuild' \
-            --exclude '*.db' \
-            --exclude '*.db-shm' \
-            --exclude '*.db-wal' \
-            ./ "${stage}/${root}/"
-          tar -czf "dist/${root}-src.tar.gz" -C "${stage}" "${root}"
-          ( cd "${stage}" && zip -qr "${GITHUB_WORKSPACE}/dist/${root}-src.zip" "${root}" )
 
           # One checksum file for everything that is about to be published.
           ( cd dist && sha256sum * > SHA256SUMS.txt )
