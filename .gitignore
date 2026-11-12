@@ -4,3 +4,4 @@
 /etc/mosdns/fakeip.db-shm
 /etc/mosdns/fakeip.db-wal
 /build/
+/crossbuild
