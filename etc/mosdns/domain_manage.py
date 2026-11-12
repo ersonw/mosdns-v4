@@ -5,12 +5,16 @@ Input is messy by nature: URLs, wildcards, ports, trailing notes and pasted
 chat lines. Every line is reduced to bare lower-case domains first, validated
 against DNS label rules, then merged into the file as a sorted set.
 
+Without a file path the normalized list goes to stdout, so it can feed a
+pipe; the summary goes to stderr. With a file path the list is edited in
+place.
+
 Examples:
-  python3 domain_manage.py google.com
-  python3 domain_manage.py add https://foo.com/path 'bar.com (backup)'
-  python3 domain_manage.py del foo.com
-  python3 domain_manage.py clean                 # rewrite the file, drop junk
-  cat list.txt | python3 domain_manage.py
+  cat messy.txt | python3 domain_manage.py            # clean to stdout
+  python3 domain_manage.py 'https://foo.com/x'        # one domain to stdout
+  python3 domain_manage.py /etc/mosdns/rule/oversea_domains.txt google.com
+  python3 domain_manage.py del /etc/mosdns/rule/oversea_domains.txt foo.com
+  python3 domain_manage.py clean /etc/mosdns/rule/oversea_domains.txt
 """
 
 import ipaddress
@@ -19,8 +23,6 @@ import re
 import stat
 import sys
 import tempfile
-
-DEFAULT_DOMAIN_FILE = "/etc/mosdns/rule/oversea_domains.txt"
 
 # A DNS name candidate. The lookarounds keep it from matching a suffix of a
 # longer broken token such as "foo_bar.com" or "foo..bar.com".
@@ -76,6 +78,10 @@ def extract_domains(line):
     text = line.strip().lstrip("\ufeff")
     if not text or text.startswith("#"):
         return []
+    # "*.example.com" is not a valid name for mosdns' subdomain matcher: the
+    # "*" becomes a literal label, so the pattern never matches. Strip it and
+    # keep example.com, which matches the exact host and all subdomains.
+    text = re.sub(r"\*\.", "", text)
 
     host = None
     if "://" in text:
@@ -101,15 +107,16 @@ def extract_domains(line):
 def load_domains(path):
     """Read the file and normalize every entry.
 
-    Returns (domains, cleaned, dropped). cleaned counts lines that were not
-    already a bare domain (URL, wildcard, duplicate text); dropped counts
-    lines with no usable domain at all.
+    Returns (domains, cleaned, dropped, raw). cleaned counts lines that were
+    not already a bare domain (URL, wildcard, duplicate); dropped counts lines
+    with no usable domain at all; raw is the number of non-comment lines.
     """
     domains = set()
     cleaned = 0
     dropped = 0
+    raw = 0
     if not os.path.exists(path):
-        return domains, cleaned, dropped
+        return domains, cleaned, dropped, raw
     if os.path.isdir(path):
         raise SystemExit(f"Error: {path} is a directory")
 
@@ -118,6 +125,7 @@ def load_domains(path):
             text = line.strip()
             if not text or text.startswith("#"):
                 continue
+            raw += 1
             found = extract_domains(text)
             if not found:
                 dropped += 1
@@ -125,8 +133,11 @@ def load_domains(path):
                 continue
             if len(found) != 1 or text.lower().rstrip(".") != found[0]:
                 cleaned += 1
-            domains.update(found)
-    return domains, cleaned, dropped
+            for domain in found:
+                if domain in domains:
+                    cleaned += 1
+                domains.add(domain)
+    return domains, cleaned, dropped, raw
 
 
 def save_domains(path, domains):
@@ -157,7 +168,8 @@ USAGE = """Usage:
   python3 domain_manage.py clean [file_path]
   cat domain_list.txt | python3 domain_manage.py [add|del] [file_path]
 
-Action defaults to add. file_path defaults to """ + DEFAULT_DOMAIN_FILE + """
+Action defaults to add. Without file_path the sorted domains are printed to
+stdout and only the summary goes to stderr; nothing is written.
 URLs, wildcards, ports and trailing notes are reduced to bare domains."""
 
 
@@ -176,10 +188,14 @@ def parse_args(argv):
     if args and args[0].lower() in ("add", "del", "clean"):
         action = args.pop(0).lower()
 
-    path = DEFAULT_DOMAIN_FILE
+    path = None
     if args:
         first = args[0].strip()
-        if "/" in first or first.lower().endswith((".txt", ".conf", ".list")):
+        if first == "-":
+            args.pop(0)
+        elif not first.lower().startswith(("http://", "https://")) and (
+            "/" in first or first.lower().endswith((".txt", ".conf", ".list"))
+        ):
             path = args.pop(0)
 
     return action, path, args
@@ -188,11 +204,12 @@ def parse_args(argv):
 def main(argv=None):
     action, path, inputs = parse_args(sys.argv[1:] if argv is None else argv)
 
-    # Pipe mode only when nothing was passed as positional domains. clean
-    # never reads stdin, so "clean /path/file" cannot hang on a pipe.
-    if action != "clean" and not inputs and not sys.stdin.isatty():
-        raw = sys.stdin.read()
-        inputs = raw.splitlines()
+    # Pipe mode only when nothing was passed as positional domains. A file
+    # clean never reads stdin; the stdout mode always does.
+    read_stdin = not inputs and not sys.stdin.isatty()
+    if read_stdin and (path is None or action != "clean"):
+        raw_text = sys.stdin.read()
+        inputs = raw_text.splitlines()
 
     valid = []
     skipped = 0
@@ -206,7 +223,24 @@ def main(argv=None):
     unique_input = set(valid)
     duplicate_input = len(valid) - len(unique_input)
 
-    existing, cleaned, dropped = load_domains(path)
+    # No file: print the normalized set, keep stdout pipe-clean.
+    if path is None:
+        if action == "del":
+            print("Error: del needs a file path", file=sys.stderr)
+            return 1
+        if not unique_input:
+            print("Error: no valid domain found in input", file=sys.stderr)
+            return 1
+        for domain in sorted(unique_input):
+            print(domain)
+        print(
+            f"Input: {len(inputs)} lines, {len(unique_input)} valid, "
+            f"{duplicate_input} duplicate, {skipped} skipped",
+            file=sys.stderr,
+        )
+        return 0
+
+    existing, cleaned, dropped, raw = load_domains(path)
     original = len(existing)
 
     if action != "clean" and not unique_input:
@@ -233,7 +267,7 @@ def main(argv=None):
     print(f"Action   : {action}")
     print(f"Input    : {len(inputs)} lines, {len(unique_input)} valid"
           f", {duplicate_input} duplicate, {skipped} skipped")
-    print(f"Existing : {original} entries, {cleaned} normalized/dropped"
+    print(f"Existing : {raw} lines, {original} entries, {cleaned} normalized/dropped"
           f" ({dropped} with no domain)")
     print(f"Changed  : {changed} entries")
     print(f"Total    : {len(existing)} entries")
