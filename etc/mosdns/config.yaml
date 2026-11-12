@@ -415,7 +415,7 @@ plugins:
   #          allow: [fakeip, ocserv]
   #        senior:
   #          inherits: [ops]
-  #          allow: [exec_script, config, reload]
+  #          allow: [status, exec_script, config, reload]
   #      default_role: admin
   #      fakeip_tags: [test_fakeip]
   #      ocserv_tags: [test_ocserv]
@@ -1270,7 +1270,7 @@ servers:
 #           allow: [fakeip, ocserv]
 #         senior:
 #           inherits: [ops]
-#           allow: [exec_script, config, reload]
+#           allow: [status, exec_script, config, reload]
 #       default_role: admin
 #       fakeip_tags: [fakeip]
 #       ocserv_tags: [ocserv]
