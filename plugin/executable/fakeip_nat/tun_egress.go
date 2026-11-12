@@ -25,14 +25,29 @@ func (p *FakeIPNatPlugin) setupTunEgress() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// What this run is about to own. Anything a previous run recorded with a
+	// different spec - an edited range, an edited table, or a run of the NAT
+	// data path - is removed by its record before the new objects are written.
+	keepFakeRule := ""
+	if p.policyRuleSupported {
+		keepFakeRule = fakeRangeRuleState(p.cidr, tunFakeRulePriority)
+	}
+	keepEgress := ""
+	if !p.proxyActive {
+		keepEgress = tunEgressState(p.tunRouteTable, p.cidr)
+	}
+	p.sweepRecordedTunState(ctx, keepFakeRule, keepEgress)
+
 	// The fake range has to reach the device no matter how the host decides to
 	// route or mark packet destinations: a gateway with its own policy routing
 	// (VyOS marks every non-CN destination into an oversea table) intercepts the
 	// fake addresses before main is ever consulted, and the packets leave the
 	// machine through the tunnel instead of entering the device. This rule is
 	// independent of the outlet, so it is installed before the proxy branch.
+	fakeRule := ""
 	if cleanup, ok := p.installFakeRangeRule(ctx); ok {
 		p.tunFakeRuleCleanup = cleanup
+		fakeRule = keepFakeRule
 	}
 
 	if p.proxyActive {
@@ -41,6 +56,7 @@ func (p *FakeIPNatPlugin) setupTunEgress() {
 		// before a proxy was configured leaves the table hooked in postrouting,
 		// and this branch would never remove it.
 		p.removeStaleTunSNAT(ctx)
+		p.saveTunState(ctx, fakeRule, "")
 		return
 	}
 
@@ -66,9 +82,14 @@ func (p *FakeIPNatPlugin) setupTunEgress() {
 		zap.String("next_hop", hop), zap.String("next_hop_dev", dev),
 		zap.String("route_table", p.tunRouteTable), zap.String("from", p.cidr))
 
+	egress := ""
 	if cleanup, ok := p.installTunEgressRoute(ctx); ok {
 		p.tunEgressCleanup = cleanup
+		egress = keepEgress
 	}
+	// Recorded only now, after the writes: a record must never describe an object
+	// this run did not manage to install.
+	p.saveTunState(ctx, fakeRule, egress)
 	p.prepareDirectEgress()
 	// The outlet now has its device (and, on linux, its range source); rewrite
 	// that source on the way out so the gateway can route the answer back.
@@ -190,6 +211,12 @@ func (p *FakeIPNatPlugin) stopTunEgress() {
 	if fakeRule != nil {
 		fakeRule()
 	}
+	// The objects are gone, so the record that named them is too. A crash before
+	// this point leaves the record in place, which is exactly what the next run
+	// needs to remove them.
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	p.clearTunState(ctx)
 }
 
 // tunRoutePlan is the command line that pins the fake range to a dedicated

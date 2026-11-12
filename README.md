@@ -184,6 +184,10 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   就在查到 `main` 之前被抢走、直接从隧道出去，设备一个包都收不到。这条规则不受 mark 影响，
   目的地址落在假段就只查 `main`，也就是设备那条 kernel 路由；它装在出口分支之前，
   所以代理生效时也照样装（代理只影响栈自己拨号的出口）。停机时按同一规格删除。
+  范围和优先级（以及出口的 `tun_route_table` + 范围）都会写进 `plugin_state`
+  的 `fake_range_rule` / `tun_egress` 两条记录：启动时按记录删掉与当前配置不一致的旧对象
+  （改了 `ipv4_range` 或 `tun_route_table` 也能找到），切回非 tun 时由启动清理按记录删除，
+  正常停机删完即清记录；被 `kill -9` 打断则留记录给下一轮，规则本身也会先 `del` 再 `add`。
 - tun 直连出口的 `ip rule from <range> to !<range> lookup <table>` 在启用打标时带
   `prio <route_rule_priority-1>`，保证它先于 `fwmark` 规则命中，插件自己的 socket 不会被自己的标记送回设备；
 - `realip` 且未设 `route_mark` 时启动会打 Warn：每个应答都会往 `route_table`（默认 main）写一条 host route，

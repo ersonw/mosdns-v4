@@ -193,3 +193,117 @@ func TestFakeRangeRuleIsSkippedWithoutPolicyRules(t *testing.T) {
 		t.Fatalf("unsupported platform issued commands: %v", calls)
 	}
 }
+
+// TestSweepRemovesTheRecordedFakeRuleWhenTheRangeChanges: the rule is found
+// again only through its record, so an edited ipv4_range cannot leave the old
+// range pinned in the ruleset.
+func TestSweepRemovesTheRecordedFakeRuleWhenTheRangeChanges(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+	ctx := context.Background()
+
+	p.saveTunState(ctx, fakeRangeRuleState("198.18.0.0/15", 5), "")
+	p.sweepRecordedTunState(ctx, fakeRangeRuleState(p.cidr, 5), "")
+
+	calls := strings.Join(runner.all(), "\n")
+	if !strings.Contains(calls, "ip rule del to 198.18.0.0/15 lookup main prio 5") {
+		t.Fatalf("old range not removed:\n%s", calls)
+	}
+	fakeRule, _ := p.loadTunState(ctx)
+	if fakeRule != fakeRangeRuleState(p.cidr, 5) {
+		t.Fatalf("record not updated, got %q", fakeRule)
+	}
+}
+
+// TestSweepRemovesTheRecordedOutletWhenTheTableChanges: tun_route_table edited
+// from 100 to 101 must delete the rules and the default route in 100, not just
+// install the new ones.
+func TestSweepRemovesTheRecordedOutletWhenTheTableChanges(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+	ctx := context.Background()
+
+	p.saveTunState(ctx, "", tunEgressState("100", "198.18.0.0/15"))
+	p.sweepRecordedTunState(ctx, "", tunEgressState("101", p.cidr))
+
+	calls := strings.Join(runner.all(), "\n")
+	for _, want := range []string{
+		"ip rule del from 198.18.0.0/15 lookup 100",
+		"ip route del default table 100",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("missing %q in:\n%s", want, calls)
+		}
+	}
+}
+
+// TestNonTunStartupRemovesRecordedTunObjects: switching to the NAT data path has
+// to clear what the previous tun run left, even though this run's configuration
+// names none of it.
+func TestNonTunStartupRemovesRecordedTunObjects(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+	ctx := context.Background()
+
+	p.saveTunState(ctx, fakeRangeRuleState("198.18.0.0/15", 5), tunEgressState("101", "198.18.0.0/15"))
+	p.cleanupStaleTunEgress(ctx)
+
+	calls := strings.Join(runner.all(), "\n")
+	for _, want := range []string{
+		"ip rule del to 198.18.0.0/15 lookup main prio 5",
+		"ip route del default table 101",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("missing %q in:\n%s", want, calls)
+		}
+	}
+	if fakeRule, egress := p.loadTunState(ctx); fakeRule != "" || egress != "" {
+		t.Fatalf("record not cleared: fake=%q egress=%q", fakeRule, egress)
+	}
+}
+
+// TestStopTunEgressClearsTheRecord: stop removes the objects and forgets them in
+// the same pass, so the next run has nothing to sweep.
+func TestStopTunEgressClearsTheRecord(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+	p.nextHop = "10.0.0.1"
+	p.nextHopDev = "eth0"
+
+	p.setupTunEgress()
+	if fakeRule, egress := p.loadTunState(context.Background()); fakeRule == "" || egress == "" {
+		t.Fatalf("setup did not record its objects: fake=%q egress=%q", fakeRule, egress)
+	}
+
+	p.stopTunEgress()
+	if fakeRule, egress := p.loadTunState(context.Background()); fakeRule != "" || egress != "" {
+		t.Fatalf("record not cleared on stop: fake=%q egress=%q", fakeRule, egress)
+	}
+}
+
+// TestTunStateCodecRejectsUnusableSpecs keeps a corrupted row from turning into
+// a command against the wrong range or the main table.
+func TestTunStateCodecRejectsUnusableSpecs(t *testing.T) {
+	if _, _, ok := parseFakeRangeRuleState(""); ok {
+		t.Fatalf("empty fake rule state accepted")
+	}
+	if _, _, ok := parseFakeRangeRuleState("notanumber|198.18.0.0/15"); ok {
+		t.Fatalf("non numeric priority accepted")
+	}
+	if _, _, ok := parseFakeRangeRuleState("0|198.18.0.0/15"); ok {
+		t.Fatalf("priority 0 accepted")
+	}
+	if _, _, ok := parseTunEgressState("main|198.18.0.0/15"); ok {
+		t.Fatalf("main table accepted as an outlet")
+	}
+	if _, _, ok := parseTunEgressState("101|"); ok {
+		t.Fatalf("empty range accepted")
+	}
+	if got := tunEgressState("main", "198.18.0.0/15"); got != "" {
+		t.Fatalf("main must encode as nothing, got %q", got)
+	}
+}

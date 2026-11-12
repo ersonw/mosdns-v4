@@ -22,7 +22,59 @@ import (
 const (
 	stateKeyMark  = "route_mark"
 	stateKeyTable = "route_table"
+	// The tun data path installs objects whose spec depends on the configuration
+	// at the time of the run: the fake range rule is keyed on the range and its
+	// priority, the outlet on the table and the range. Editing ipv4_range,
+	// tun_route_table or switching to the NAT data path would leave them behind
+	// with no way to recognise them, so their exact spec is recorded.
+	stateKeyFakeRule  = "fake_range_rule"
+	stateKeyTunEgress = "tun_egress"
 )
+
+// fakeRangeRuleState encodes the fake range rule as "<prio>|<cidr>".
+func fakeRangeRuleState(cidr string, prio int) string {
+	if cidr == "" {
+		return ""
+	}
+	return strconv.Itoa(prio) + "|" + cidr
+}
+
+func parseFakeRangeRuleState(value string) (string, int, bool) {
+	sep := strings.Index(value, "|")
+	if sep < 0 {
+		return "", 0, false
+	}
+	prio, err := strconv.Atoi(value[:sep])
+	if err != nil || prio < 1 || prio > 32766 {
+		return "", 0, false
+	}
+	cidr := value[sep+1:]
+	if cidr == "" {
+		return "", 0, false
+	}
+	return cidr, prio, true
+}
+
+// tunEgressState encodes the outlet as "<table>|<cidr>".
+func tunEgressState(table, cidr string) string {
+	if table == "" || table == "main" || cidr == "" {
+		return ""
+	}
+	return table + "|" + cidr
+}
+
+func parseTunEgressState(value string) (string, string, bool) {
+	sep := strings.Index(value, "|")
+	if sep < 0 {
+		return "", "", false
+	}
+	table := value[:sep]
+	cidr := value[sep+1:]
+	if table == "" || table == "main" || cidr == "" {
+		return "", "", false
+	}
+	return table, cidr, true
+}
 
 // loadMarkState returns the mark path the previous run installed. A zero mark
 // or an unusable table (empty, main) means "nothing recorded": there is nothing
@@ -85,6 +137,125 @@ func (p *FakeIPNatPlugin) clearMarkState(ctx context.Context) {
 	if _, err := p.db.ExecContext(ctx,
 		"DELETE FROM "+p.stateTable+" WHERE key IN ('"+stateKeyMark+"','"+stateKeyTable+"')"); err != nil {
 		p.L().Debug("route mark: clearing the recorded state failed", zap.Error(err))
+	}
+}
+
+// loadTunState returns the fake range rule and the outlet a previous run
+// recorded. An empty string means "nothing recorded".
+func (p *FakeIPNatPlugin) loadTunState(ctx context.Context) (string, string) {
+	if p.db == nil || p.stateTable == "" {
+		return "", ""
+	}
+	rows, err := p.db.QueryContext(ctx,
+		"SELECT key, value FROM "+p.stateTable+" WHERE key IN ('"+stateKeyFakeRule+"','"+stateKeyTunEgress+"')")
+	if err != nil {
+		p.L().Debug("tun data path: reading the recorded state failed", zap.Error(err))
+		return "", ""
+	}
+	defer rows.Close()
+
+	var fakeRule, egress string
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			p.L().Debug("tun data path: reading the recorded state failed", zap.Error(err))
+			return "", ""
+		}
+		switch key {
+		case stateKeyFakeRule:
+			fakeRule = value
+		case stateKeyTunEgress:
+			egress = value
+		}
+	}
+	if err := rows.Err(); err != nil {
+		p.L().Debug("tun data path: reading the recorded state failed", zap.Error(err))
+		return "", ""
+	}
+	return fakeRule, egress
+}
+
+// saveTunState records exactly what this run installed.
+func (p *FakeIPNatPlugin) saveTunState(ctx context.Context, fakeRule, egress string) {
+	if p.db == nil || p.stateTable == "" {
+		return
+	}
+	statement := "INSERT OR REPLACE INTO " + p.stateTable + " (key, value) VALUES (?, ?), (?, ?)"
+	if _, err := p.db.ExecContext(ctx, statement,
+		stateKeyFakeRule, fakeRule, stateKeyTunEgress, egress); err != nil {
+		p.L().Warn("tun data path: recording the installed objects failed", zap.Error(err))
+	}
+}
+
+// clearTunState forgets the recorded objects once they are gone.
+func (p *FakeIPNatPlugin) clearTunState(ctx context.Context) {
+	if p.db == nil || p.stateTable == "" {
+		return
+	}
+	if _, err := p.db.ExecContext(ctx,
+		"DELETE FROM "+p.stateTable+" WHERE key IN ('"+stateKeyFakeRule+"','"+stateKeyTunEgress+"')"); err != nil {
+		p.L().Debug("tun data path: clearing the recorded state failed", zap.Error(err))
+	}
+}
+
+// removeRecordedFakeRule deletes the fake range rule by its recorded spec, which
+// is the only way to find it again after ipv4_range changed.
+func (p *FakeIPNatPlugin) removeRecordedFakeRule(ctx context.Context, state string) {
+	if !p.policyRuleSupported {
+		return
+	}
+	cidr, prio, ok := parseFakeRangeRuleState(state)
+	if !ok {
+		return
+	}
+	if _, err := p.runner.Run(ctx, "ip", fakeRangeRuleArgs("del", cidr, prio)...); err == nil {
+		p.L().Info("tun data path: removed the fake range rule a previous run installed",
+			zap.String("to", cidr), zap.Int("prio", prio))
+	}
+}
+
+// removeRecordedTunEgress deletes the outlet rules and the default route of the
+// recorded table. The table is deleted by number, never by a guess: VyOS keeps
+// its own policy table on the same machine.
+func (p *FakeIPNatPlugin) removeRecordedTunEgress(ctx context.Context, state string) {
+	if !p.policyRuleSupported {
+		return
+	}
+	table, cidr, ok := parseTunEgressState(state)
+	if !ok {
+		return
+	}
+	removed := false
+	for _, args := range [][]string{
+		{"rule", "del", "from", cidr, "to", "! " + cidr, "lookup", table},
+		{"rule", "del", "from", cidr, "lookup", table},
+	} {
+		if _, err := p.runner.Run(ctx, "ip", args...); err == nil {
+			removed = true
+		}
+	}
+	if _, err := p.runner.Run(ctx, "ip", "route", "del", "default", "table", table); err == nil {
+		removed = true
+	}
+	if removed {
+		p.L().Info("tun data path: removed the outlet a previous run installed",
+			zap.String("table", table), zap.String("from", cidr))
+	}
+}
+
+// sweepRecordedTunState removes exactly what the previous run recorded and keeps
+// what this run is about to own, so an edited range, an edited table or a switch
+// back to the NAT data path cannot leave a rule nobody can find again.
+func (p *FakeIPNatPlugin) sweepRecordedTunState(ctx context.Context, keepFakeRule, keepEgress string) {
+	prevFakeRule, prevEgress := p.loadTunState(ctx)
+	if prevFakeRule != "" && prevFakeRule != keepFakeRule {
+		p.removeRecordedFakeRule(ctx, prevFakeRule)
+	}
+	if prevEgress != "" && prevEgress != keepEgress {
+		p.removeRecordedTunEgress(ctx, prevEgress)
+	}
+	if prevFakeRule != keepFakeRule || prevEgress != keepEgress {
+		p.saveTunState(ctx, keepFakeRule, keepEgress)
 	}
 }
 
@@ -200,6 +371,11 @@ func (p *FakeIPNatPlugin) sweepLegacyMarkPath(ctx context.Context) {
 // the table may be one the box itself routes through.
 func (p *FakeIPNatPlugin) cleanupStaleTunEgress(ctx context.Context) {
 	p.removeStaleTunSNAT(ctx)
+	// Objects recorded by a previous tun run are removed by their record: the
+	// configuration may not name them any more (the range or the table changed,
+	// or use_tun was switched off), and the guesses below only cover the shape
+	// this run would have installed.
+	p.sweepRecordedTunState(ctx, "", "")
 	table := p.tunRouteTable
 	if table == "" || table == "main" {
 		return
