@@ -131,7 +131,15 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
       next_hop_dev: "en0"                # 留空则由路由查找决定；填了则同时绑定该网卡
       tun_route_table: 100               # 专用路由表号，仅 Linux 建表
       record_ttl: "168h"                 # 记录保留期；留空 = 7 天，"0" = 不清理
+      access_log: true                    # 记录每个源 IP 解析了哪些域名，默认 true
+      access_ttl: "168h"                  # 访问记录保留期；留空 = 7 天，"0" = 不清理
 ```
+
+`access_log` 打开后，每回答一个 fake IP 就在同一份 SQLite 的 `<table_prefix>_access` 表里记一行
+`(client_ip, domain)`，带 `fake_ip`、`first_seen`、`last_seen`、`hits`；真实 IP 不重复存，读取时
+从 real IP 表按域名取最新一条，所以之后学到的地址也能看到。写入在应答路径上但失败只告警，
+不影响查询；`access_ttl` 与映射共用同一个清理循环（间隔取两者较小的 TTL）。这些记录由
+telegram_bot 的 `/access` 导出成 Excel。
 
 `record_ttl` 控制数据库与内存里映射记录的保留期：启动 5 秒后先扫一次，之后每
 `min(record_ttl, 1h)`（不低于 1 分钟）扫一次，把「内存 touch / 库内 `last_seen` / `created_at`
@@ -382,6 +390,8 @@ accounting[0].secret = 换成一串随机字符
 长轮询 Telegram Bot，用来在没有 SSH 的场合看状态、改配置、跑脚本。启动即开始拉取
 `getUpdates`，`token` 缺失或 `chat_ids` 为空时插件保持禁用（不建连、不占线程）。每个 chat 绑定
 一个角色，角色决定它能发哪些命令；只列在 `chat_ids` 里的 chat 用 `default_role`（默认 `admin`）。
+两个角色是内置的，不必在 `roles` 里声明：`admin` 只能查看状态、管理 RADIUS 用户、查看和操作
+ocserv、导出指定用户的访问记录（`status`/`ocserv`/`radius`/`access`）；`superadmin` 拥有全部权限。
 常用命令：`/status`、`/net`（数据面观测：tun 设备、代理是否生效、打标与表号、本插件在
 `ip rule show` 里的规则、出口表的 default、nft 标记集合大小）、`/ledger`（账本里记了哪些待清理对象）、
 `/sweep`（按账本删掉当前配置不拥有的残留，`kill -9` 之后可以手动收尾）、`/diag <domain>`（一次诊断：
@@ -389,7 +399,10 @@ accounting[0].secret = 换成一串随机字符
 `/vpn`（查 ocserv 在线用户）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
 `/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
 `/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、
-`/reload`（给进程发关闭信号，靠外部 supervisor 重新拉起）。`proxy` 可让 API 请求走
+`/reload`（给进程发关闭信号，靠外部 supervisor 重新拉起）、
+`/access <user|ip> [days]`（按 RADIUS 用户（取其记账会话里的地址）或直接给地址，从 fakeip 的访问记录
+里取出该地址访问过的域名/真实 IP，生成 `.xlsx` 发回请求的管理员；默认 7 天，最多 365 天）。
+`proxy` 可让 API 请求走
 HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
 插件之间通过 `fakeip_tags` / `ocserv_tags` / `radius_tags` 定位目标：列表第一个是默认，
 其余用命令的第一个参数点名（如 `/fip <tag> stats`）。这三项是列表，不再接受单值写法。
@@ -401,10 +414,12 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       chat_ids: [123456789]              # 允许交互的 chat，空则不启用
       admins:
         - chat_id: 123456789
-          role: admin
-      roles:
-        admin:
-          allow: ["admin"]              # "admin" 表示全部权限；也可用 inherits 组合子角色
+          role: superadmin                # 内置：全部权限
+        - chat_id: 987654321
+          role: admin                     # 内置：状态 + 用户 + ocserv + 访问记录导出
+      roles:                              # 自定义角色，可 inherits: [admin] 复用内置角色
+        ops:
+          allow: [status, fakeip, ocserv]
       default_role: admin                 # 只列在 chat_ids 里的 chat 用这个角色
       fakeip_tags: ["fakeip"]             # /fip 可管理的 fakeip_nat 插件 tag
       ocserv_tags: ["ocserv_user"]        # /vpn 可查询的 ocserv_ctl 插件 tag

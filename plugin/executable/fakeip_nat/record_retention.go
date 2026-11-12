@@ -38,7 +38,7 @@ func parseRecordTTL(raw string) (time.Duration, error) {
 // startRecordRetention launches the background sweep. It is a no-op when the
 // retention is disabled.
 func (p *FakeIPNatPlugin) startRecordRetention() {
-	if p.recordTTL <= 0 {
+	if p.recordTTL <= 0 && (!p.accessLog || p.accessTTL <= 0) {
 		p.L().Info("fakeip nat: record retention disabled", zap.String("record_ttl", "0"))
 		return
 	}
@@ -46,7 +46,8 @@ func (p *FakeIPNatPlugin) startRecordRetention() {
 	p.retentionStop = stop
 	go p.recordRetentionLoop(stop)
 	p.L().Info("fakeip nat: record retention started",
-		zap.Duration("record_ttl", p.recordTTL), zap.Duration("interval", p.retentionInterval()))
+		zap.Duration("record_ttl", p.recordTTL), zap.Duration("access_ttl", p.accessTTL),
+		zap.Duration("interval", p.retentionInterval()))
 }
 
 // stopRecordRetention closes the stop channel exactly once. The loop gets the
@@ -62,6 +63,11 @@ func (p *FakeIPNatPlugin) stopRecordRetention() {
 
 func (p *FakeIPNatPlugin) retentionInterval() time.Duration {
 	interval := p.recordTTL
+	// Both tables age out on one schedule, so the shorter lifetime wins; when
+	// only the access log is retained, its ttl is the only input.
+	if p.accessLog && p.accessTTL > 0 && (interval <= 0 || p.accessTTL < interval) {
+		interval = p.accessTTL
+	}
 	if interval > time.Hour {
 		interval = time.Hour
 	}
@@ -97,6 +103,7 @@ func (p *FakeIPNatPlugin) recordRetentionLoop(stop <-chan struct{}) {
 // created_at, so a database restored from an old backup is not wiped wholesale
 // just because its last_seen column is empty.
 func (p *FakeIPNatPlugin) sweepRecords(ctx context.Context) {
+	p.sweepAccess(ctx)
 	if p.recordTTL <= 0 {
 		return
 	}

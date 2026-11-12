@@ -40,7 +40,21 @@ const (
 	PermConfig     = "config"      // /config read and write
 	PermReload     = "reload"      // /reload confirm
 	PermExecScript = "exec_script" // /exec <tag> <ip> <domain>
-	PermAll        = "admin"       // everything, always granted to role "admin"
+	PermAccess     = "access"      // /access <user> [days]: export visit records
+
+	// PermAll is the wildcard a role may write in allow to mean "everything".
+	PermAll = "all"
+)
+
+// Built-in roles. They are not declared under roles:, they always exist,
+// and a config role may inherit them.
+const (
+	// RoleAdmin observes: status, user management, ocserv, and the access
+	// record export. It cannot touch the config file, run scripts, reload the
+	// process or rewrite fakeip mappings.
+	RoleAdmin = "admin"
+	// RoleSuperAdmin holds every permission, including the write paths above.
+	RoleSuperAdmin = "superadmin"
 )
 
 var allPermissions = []string{
@@ -51,6 +65,16 @@ var allPermissions = []string{
 	PermConfig,
 	PermReload,
 	PermExecScript,
+	PermAccess,
+}
+
+// adminPermissions is the built-in plain administrator: see everything, manage
+// people and the VPN session set, but never change how the process runs.
+var adminPermissions = []string{
+	PermStatus,
+	PermOcserv,
+	PermRadius,
+	PermAccess,
 }
 
 // AdminUser binds one Telegram chat to a role.
@@ -94,9 +118,9 @@ func validPermission(p string) bool {
 // buildAccess resolves the roles into a per-chat permission set once at
 // startup, so a command check never walks the inheritance graph.
 //
-// Role "admin" is built in and always has every permission. Every chat in
-// chat_ids is an administrator too, with default_role (default "admin"), so an
-// existing config that only lists chat_ids keeps full access.
+// Two roles are built in and need no declaration: "superadmin" holds every
+// permission, "admin" only observes and manages people (status, ocserv, radius,
+// access). Every chat in chat_ids gets default_role, which defaults to "admin".
 func buildAccess(args *Args) (*accessTable, error) {
 	t := &accessTable{
 		perms: make(map[int64]map[string]bool),
@@ -115,8 +139,13 @@ func buildAccess(args *Args) (*accessTable, error) {
 			}
 		}
 
-		if name == "" || name == PermAll {
+		switch name {
+		case "", RoleSuperAdmin, PermAll:
 			set := permissionSet(allPermissions...)
+			resolved[name] = set
+			return set, nil
+		case RoleAdmin:
+			set := permissionSet(adminPermissions...)
 			resolved[name] = set
 			return set, nil
 		}
@@ -132,7 +161,9 @@ func buildAccess(args *Args) (*accessTable, error) {
 			if p == "" {
 				continue
 			}
-			if p == PermAll {
+			// "all" is the documented wildcard; "admin" is accepted because
+			// older configs used it in allow lists to mean the same thing.
+			if p == PermAll || p == RoleAdmin {
 				for _, known := range allPermissions {
 					set[known] = true
 				}
@@ -225,6 +256,8 @@ func requiredPermission(cmd string) string {
 		return PermOcserv
 	case "/user":
 		return PermRadius
+	case "/access":
+		return PermAccess
 	case "/config", "/proxy", "/sweep":
 		return PermConfig
 	case "/diag":

@@ -49,7 +49,13 @@ type Args struct {
 	// RecordTTL 是域名映射的保留时长，默认 "168h"（7 天）。超过该时长没有被查询过的
 	// 记录会被后台任务从 SQLite 和内存中删除，释放的虚拟地址重新进入可分配池。
 	// 填 "0" 关闭清理（记录一直保留）。支持 Go 时长语法：168h、24h、30m。
-	RecordTTL  string `yaml:"record_ttl"`
+	RecordTTL string `yaml:"record_ttl"`
+
+	// AccessLog 记录每个源 IP 访问了哪些域名，默认 true。记录写入同一份
+	// SQLite（<table_prefix>_access），供管理端按客户端 IP 导出访问记录。
+	AccessLog *bool `yaml:"access_log"`
+	// AccessTTL 是访问记录的保留时长，默认 "168h"（7 天）；"0" 表示不自动清理。
+	AccessTTL  string `yaml:"access_ttl"`
 	NextHop    string `yaml:"next_hop"`     // 可选：NAT 模式下真实目标 IP 的下一跳网关（不填则用系统默认路由）
 	NextHopDev string `yaml:"next_hop_dev"` // 可选：NAT 模式下下一跳出站网卡名称（不填则不指定 dev）
 
@@ -131,12 +137,16 @@ type FakeIPNatPlugin struct {
 	// A route written by a stopped process is removed again from that record,
 	// not from a scan filtered by hop/device, so cleanup survives a crash and a
 	// configuration change.
-	routesTable   string
-	cidr          string
-	prefix        netip.Prefix
-	maxHosts      uint64 // usable address count inside prefix, broadcast and network excluded
-	ttl           uint32
-	recordTTL     time.Duration
+	routesTable string
+	cidr        string
+	prefix      netip.Prefix
+	maxHosts    uint64 // usable address count inside prefix, broadcast and network excluded
+	ttl         uint32
+	recordTTL   time.Duration
+	// accessLog / accessTTL / accessTable back the per-client visit log.
+	accessLog     bool
+	accessTTL     time.Duration
+	accessTable   string
 	retentionStop chan struct{}
 	retentionOnce sync.Once
 	nextHop       string
@@ -305,6 +315,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if err != nil {
 		return nil, err
 	}
+	accessLog := true
+	if cfg.AccessLog != nil {
+		accessLog = *cfg.AccessLog
+	}
+	accessTTL, err := parseAccessTTL(cfg.AccessTTL)
+	if err != nil {
+		return nil, err
+	}
 	if cfg.RouteTable == "" {
 		cfg.RouteTable = "main"
 	}
@@ -412,6 +430,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	ipTable := cfg.TablePrefix + "_real_ips"
 	routesTable := cfg.TablePrefix + "_routes"
 	stateTable := cfg.TablePrefix + "_plugin_state"
+	accessTable := cfg.TablePrefix + "_access"
 	idxName := "idx_" + cfg.TablePrefix + "_real_ips_domain"
 
 	initSQL := fmt.Sprintf(`
@@ -447,6 +466,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("init tables failed: %w", err)
 	}
+	// The access table is created even when the log is turned off, so enabling
+	// it later does not need a migration step.
+	if err := ensureAccessTable(db, accessTable); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	// Databases created before record_ttl was added have no last_seen column;
 	// "duplicate column name" means the schema is already current.
 	if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN last_seen INTEGER DEFAULT 0", mapTable)); err != nil {
@@ -481,6 +506,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		maxHosts:            maxHosts,
 		ttl:                 cfg.TTL,
 		recordTTL:           recordTTL,
+		accessLog:           accessLog,
+		accessTTL:           accessTTL,
+		accessTable:         accessTable,
 		nextHop:             strings.TrimSpace(cfg.NextHop),
 		nextHopDev:          strings.TrimSpace(cfg.NextHopDev),
 		realIP:              cfg.RealIP,
@@ -1036,6 +1064,9 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 					p.L().Debug("fakeip nat: fake ip answered",
 						zap.String("domain", domain), zap.String("fake_ip", fakeIP),
 						zap.Uint32("ttl", p.ttl), zap.Bool("data_plane_tun", p.useTun))
+					// Who asked for it: the answer is already decided, so a
+					// failed write only costs one log line.
+					p.recordAccess(qCtx, domain, fakeIP)
 
 					newResp := new(dns.Msg)
 					newResp.SetReply(q)

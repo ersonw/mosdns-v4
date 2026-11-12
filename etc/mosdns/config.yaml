@@ -137,6 +137,8 @@ plugins:
       proxy_insecure: true
 #      hop_name_suffix: "mth-remote"   # one DNS label; empty = table_prefix
 #      record_ttl: "168h"              # drop mappings idle this long; empty = 7d, "0" = off
+      access_log: true                # record which client resolved which domain
+      access_ttl: "168h"              # keep access rows this long; empty = 7d, "0" = off
 
   # 6) Workflow, two stages:
   #    a) the query itself matches a CN domain -> ask the local resolver and
@@ -268,6 +270,8 @@ plugins:
   #      ipv4_range: 198.18.0.0/15
   #      ttl: 60
   #      record_ttl: 168h           # mapping lifetime, "0" keeps forever
+  #      access_log: true           # per-client visit log (default true)
+  #      access_ttl: 168h           # visit log lifetime, default 168h, "0" keeps forever
   #      next_hop: 192.168.1.1
   #      next_hop_dev: eth0
   #      realip: false
@@ -931,6 +935,8 @@ servers:
 #       ipv4_range: 198.18.0.0/15
 #       ttl: 60
 #       record_ttl: 168h                # mapping lifetime, "0" keeps forever
+#       access_log: true                # record client ip -> domain (default true)
+#       access_ttl: 168h                # visit log lifetime, empty = 168h, "0" = off
 #       next_hop: ""
 #       next_hop_dev: ""
 #       script: ""                      # deprecated, only logs a warning
@@ -1212,7 +1218,13 @@ servers:
 #   config      - /config show|get|set|add|del|validate, and /proxy /sweep
 #   reload      - /reload confirm
 #   exec_script - /exec <tag> <ip> <domain>, runs an already configured script
-#   admin       - every permission, built in for role "admin"
+#   access      - /access <user|ip> [days], exports visit records as .xlsx
+#   all         - wildcard usable in a role's allow list: every permission
+# Two roles are built in and need no declaration:
+#   admin       - status, ocserv, radius, access (observe + manage people, no
+#                 writes to the config, no reload, no script, no /fip)
+#   superadmin  - every permission above
+# A named role may inherit either of them: inherits: [admin].
 # Args:
 #   token - bot token from @BotFather. Required; empty disables the plugin.
 #   chat_ids - administrator chat ids that use default_role. An old config
@@ -1262,9 +1274,11 @@ servers:
 #       chat_ids: []
 #       admins:
 #         - chat_id: 100000001
-#           role: ops
+#           role: admin            # built in: status, ocserv, radius, access
 #         - chat_id: 100000002
-#           role: senior
+#           role: superadmin       # built in: everything
+#         - chat_id: 100000003
+#           role: senior           # custom role below
 #       roles:
 #         ops:
 #           allow: [fakeip, ocserv]

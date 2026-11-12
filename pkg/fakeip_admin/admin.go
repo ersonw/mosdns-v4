@@ -40,6 +40,18 @@ type Stats struct {
 	Runtime  int // entries in the in-memory domain map
 }
 
+// AccessRecord is one client's visit to one domain: who resolved it, what fake
+// ip it was given, which real address was learned for it, and when.
+type AccessRecord struct {
+	ClientIP  string
+	Domain    string
+	FakeIP    string
+	RealIP    string
+	FirstSeen int64
+	LastSeen  int64
+	Hits      int
+}
+
 // Admin is implemented by fakeip_nat. A control surface resolves a plugin by
 // tag, type-asserts it to Admin, and never needs to know the concrete type.
 type Admin interface {
@@ -50,6 +62,10 @@ type Admin interface {
 	AdminDeleteDomain(ctx context.Context, domain string) (bool, error)
 	AdminClearMappings(ctx context.Context) (int64, error)
 	AdminStats(ctx context.Context) (Stats, error)
+	// AdminAccessRecords returns the visits of the given client addresses,
+	// newest first. since is a unix timestamp; 0 means no lower bound. A
+	// plugin with the access log disabled returns an empty slice.
+	AdminAccessRecords(ctx context.Context, clientIPs []string, since int64, limit int) ([]AccessRecord, error)
 }
 
 // Plane is what the data plane has installed on the machine right now, next to

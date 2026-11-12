@@ -67,7 +67,8 @@ type Args struct {
 	// permission names; a role may inherit other roles.
 	Roles map[string]Role `yaml:"roles"`
 	// DefaultRole is the role of a chat listed only in ChatIDs. Default
-	// "admin", which holds every permission.
+	// "admin", the observe-and-manage role; "superadmin" holds every
+	// permission.
 	DefaultRole string `yaml:"default_role"`
 	// FakeIPTags are the fakeip_nat plugin tags this bot may manage. The
 	// first tag is the default target of /fip; another one is selected with
@@ -102,7 +103,9 @@ func (a *Args) initDefault() {
 	a.RadiusTags = tagList(a.RadiusTags, "radius")
 	a.DefaultRole = strings.TrimSpace(a.DefaultRole)
 	if a.DefaultRole == "" {
-		a.DefaultRole = PermAll
+		// Default to the plain administrator. A config that wants the write
+		// paths has to say so (default_role: superadmin or a chat role).
+		a.DefaultRole = RoleAdmin
 	}
 	for i := range a.Admins {
 		a.Admins[i].Role = strings.TrimSpace(a.Admins[i].Role)
@@ -361,6 +364,8 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 		return p.handleVPN(ctx, fields[1:])
 	case "/user":
 		return p.handleUser(fields[1:]), nil
+	case "/access":
+		return p.handleAccess(ctx, chatID, fields[1:])
 	case "/status":
 		return p.handleStatus(ctx)
 	case "/plugins":
@@ -728,6 +733,8 @@ const helpText = `mosdns admin bot
 /user pass <name> <pass>     replace a password
 /user enable|disable <name>  toggle authentication
 /user sessions [active] [n]  accounting sessions
+/access <user> [days]        export that user's visit records as xlsx (default 7 days)
+/access <ip> [days]          export one client address directly
 /net [tag]                   data plane: device, proxy, mark, rules, routes
 /ledger [tag]                recorded objects a later run would clean
 /sweep [tag] confirm         drop recorded objects this config does not own

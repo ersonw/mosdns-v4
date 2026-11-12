@@ -14,6 +14,7 @@ import (
 	tgbot "github.com/go-telegram/bot"
 
 	"github.com/ersonw/mosdns-v4/coremain"
+	fakeipadmin "github.com/ersonw/mosdns-v4/pkg/fakeip_admin"
 	fakeipnat "github.com/ersonw/mosdns-v4/plugin/executable/fakeip_nat"
 	"go.uber.org/zap"
 )
@@ -24,6 +25,34 @@ type stubAdmin struct {
 	deleted []string
 	put     [][2]string
 	clearN  int64
+	access  []fakeipadmin.AccessRecord
+	// accessErr, when set, makes the access query fail so a caller-side
+	// error path can be exercised.
+	accessErr error
+}
+
+func (s *stubAdmin) AdminAccessRecords(_ context.Context, clientIPs []string, since int64, limit int) ([]fakeipadmin.AccessRecord, error) {
+	if s.accessErr != nil {
+		return nil, s.accessErr
+	}
+	wanted := make(map[string]struct{}, len(clientIPs))
+	for _, ip := range clientIPs {
+		wanted[ip] = struct{}{}
+	}
+	var out []fakeipadmin.AccessRecord
+	for _, r := range s.access {
+		if _, ok := wanted[r.ClientIP]; !ok {
+			continue
+		}
+		if since > 0 && r.LastSeen < since {
+			continue
+		}
+		out = append(out, r)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 func (s *stubAdmin) AdminPutMapping(_ context.Context, domain, fakeIP string) error {
@@ -79,7 +108,9 @@ func (s *stubAdmin) AdminStats(context.Context) (fakeipnat.MappingStats, error) 
 
 func newStubPlugin() *telegramBot {
 	bp := coremain.NewBP("test_bot", PluginType, zap.NewNop(), nil)
-	p := &telegramBot{BP: bp, args: &Args{ChatIDs: []int64{123}, FakeIPTags: []string{"fakeip"}}}
+	// The stub harness exercises every command, so it runs as superadmin. Role
+	// restrictions have their own tests.
+	p := &telegramBot{BP: bp, args: &Args{ChatIDs: []int64{123}, FakeIPTags: []string{"fakeip"}, DefaultRole: RoleSuperAdmin}}
 	p.args.initDefault()
 	// Administration actions are audited; a test keeps them off the real file
 	// so the working tree stays clean. A test that checks the log sets its own.
@@ -325,6 +356,9 @@ func startBot(t *testing.T, p *telegramBot, serverURL string) (cancel context.Ca
 		t.Fatalf("bot.New: %v", err)
 	}
 
+	// Commands that answer with a document (e.g. /access) send through the
+	// plugin's own client, so hand the same instance over.
+	p.tb = tb
 	ctx, cancelFn := context.WithCancel(context.Background())
 	fin := make(chan struct{})
 	go func() {
@@ -519,9 +553,13 @@ func TestRolePermissions(t *testing.T) {
 		t.Fatalf("role B must not edit the config")
 	}
 
-	// chat 123 is only in chat_ids, so it keeps the built-in admin role.
-	if !access.allowed(123, PermConfig) || !access.allowed(123, PermReload) {
-		t.Fatalf("chat_ids entry lost full access: %s", access.permissionNames(123))
+	// chat 123 is only in chat_ids, so it gets the built-in admin role: it can
+	// observe and manage people, but not rewrite config or reload the process.
+	if !access.allowed(123, PermStatus) || !access.allowed(123, PermRadius) || !access.allowed(123, PermAccess) {
+		t.Fatalf("chat_ids entry lost admin rights: %s", access.permissionNames(123))
+	}
+	if access.allowed(123, PermConfig) || access.allowed(123, PermReload) || access.allowed(123, PermExecScript) {
+		t.Fatalf("admin role must not hold write permissions: %s", access.permissionNames(123))
 	}
 	if err := p.require(999, PermStatus); err == nil {
 		t.Fatalf("an unlisted chat must be rejected")
