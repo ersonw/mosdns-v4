@@ -1,5 +1,5 @@
 <component name="ProjectRunConfigurationManager">
-  <configuration default="false" name="go build github.com/ersonw/mosdns-v4" type="GoApplicationRunConfiguration" factoryName="Go Application" nameIsGenerated="true">
+  <configuration default="false" name="go build mosdns-v4" type="GoApplicationRunConfiguration" factoryName="Go Application">
     <module name="mosdns-v4" />
     <working_directory value="$PROJECT_DIR$" />
     <parameters value="start -c etc/mosdns/config.yaml" />

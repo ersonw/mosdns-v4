@@ -1,0 +1,16 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="cross build mosdns-v4" type="GoApplicationRunConfiguration" factoryName="Go Application">
+    <module name="mosdns-v4" />
+    <working_directory value="$PROJECT_DIR$" />
+    <parameters value=" " />
+    <envs>
+      <env name="PATH" value="$PROJECT_DIR$/../sdk/go1.20/bin:/usr/bin:/bin:/usr/sbin:/sbin" />
+      <env name="GOROOT" value="$PROJECT_DIR$/../sdk/go1.20" />
+      <env name="CGO_ENABLED" value="0" />
+    </envs>
+    <kind value="PACKAGE" />
+    <package value="github.com/ersonw/mosdns-v4/tools/crossbuild" />
+    <directory value="$PROJECT_DIR$" />
+    <method v="2" />
+  </configuration>
+</component>
