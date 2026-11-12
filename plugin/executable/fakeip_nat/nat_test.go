@@ -449,3 +449,39 @@ func TestEnsureNFTTableAddsMSSClamp(t *testing.T) {
 		t.Fatalf("mss clamp chain missing: %v", runner.all())
 	}
 }
+
+// TestCleanupDropsStaleNFTTableInTunMode pins the mode-switch case: the tun
+// path installs no nft table, so one that exists was left by a non-tun run and
+// its DNAT chain keeps rewriting destinations in prerouting. Both the shutdown
+// path and the startup helper have to remove it.
+func TestCleanupDropsStaleNFTTableInTunMode(t *testing.T) {
+	runner := &fakeRunner{tableExists: true}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.useTun = true
+
+	p.cleanupStaleNFTTable(context.Background())
+	if _, ok := runner.find("nft delete table ip fakeip_test"); !ok {
+		t.Fatalf("startup did not remove the stale table: %v", runner.all())
+	}
+
+	runner2 := &fakeRunner{tableExists: true}
+	p2 := newNativePlugin(t, runner2, func(context.Context, string) bool { return true })
+	p2.useTun = true
+	p2.cleanupDataPath()
+	if _, ok := runner2.find("nft delete table ip fakeip_test"); !ok {
+		t.Fatalf("shutdown did not remove the stale table: %v", runner2.all())
+	}
+}
+
+// TestCleanupStaleNFTTableToleratesAbsence checks the normal tun start: there is
+// no table to delete, and that must not surface as an error or a panic.
+func TestCleanupStaleNFTTableToleratesAbsence(t *testing.T) {
+	runner := &fakeRunner{failContains: "nft delete table"}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.useTun = true
+
+	p.cleanupStaleNFTTable(context.Background())
+	if _, ok := runner.find("nft delete table ip fakeip_test"); !ok {
+		t.Fatalf("the absence probe was not attempted: %v", runner.all())
+	}
+}

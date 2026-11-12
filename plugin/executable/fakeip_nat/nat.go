@@ -498,11 +498,12 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	// The table now carries the DNAT map, the mark set and the mark chains. On
 	// the non-tun path nothing else owns it, so it goes away with the data path
 	// whether the traffic was rewritten or merely marked.
+	// The delete is attempted in tun mode too: the tun path creates no nft table,
+	// so anything present was left by a short-lived non-tun run and its DNAT
+	// chain would keep rewriting destinations behind the device's back.
 	tableDeleted := false
-	if !p.useTun {
-		if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", p.nftTableName()); err == nil {
-			tableDeleted = true
-		}
+	if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", p.nftTableName()); err == nil {
+		tableDeleted = true
 	}
 
 	p.L().Info("fakeip nat: data path cleaned up",
@@ -844,4 +845,17 @@ func (p *FakeIPNatPlugin) hostRouteTable() string {
 		return "main"
 	}
 	return p.routeTable
+}
+
+// cleanupStaleNFTTable removes the nft table a previous non-tun run left behind.
+// Tun mode installs no table of its own, so its presence means a crash, a
+// SIGKILL or a mode switch: either way the DNAT chain inside it is still hooked
+// in prerouting and would keep rewriting packets the device should have routed.
+func (p *FakeIPNatPlugin) cleanupStaleNFTTable(ctx context.Context) {
+	table := p.nftTableName()
+	if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", table); err != nil {
+		p.L().Debug("fakeip nat: no stale nft table to remove", zap.String("nft_table", table))
+		return
+	}
+	p.L().Info("fakeip nat: removed the nft table a non-tun run left behind", zap.String("nft_table", table))
 }

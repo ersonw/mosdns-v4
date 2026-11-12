@@ -564,6 +564,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// The tun data path is the alternative to per-domain DNAT: it asks the
 	// system for a device and routes the whole ipv4_range into it.
 	if p.useTun {
+		// A crash or a mode switch leaves the previous non-tun nft table behind,
+		// and its DNAT chain still sits in prerouting: it rewrites the destination
+		// before the route lookup, so the packet leaves through main instead of
+		// the device. Tun mode owns no nft table, so the leftover goes first.
+		staleCtx, staleCancel := context.WithTimeout(context.Background(), natTimeout)
+		p.cleanupStaleNFTTable(staleCtx)
+		staleCancel()
+
 		p.L().Debug("fakeip nat: starting tun data path", zap.String("range", p.cidr))
 		if err := p.startTunDataPath(); err != nil {
 			p.L().Error("use_tun is enabled but the tun data path could not start; the plugin has no outlet", zap.Error(err))

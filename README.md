@@ -168,6 +168,9 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   `route_mark` 只打 Error，不影响 DNS 服务；
 - 与 `use_tun` 互斥（tun 自己管整段路由），且仅 Linux 支持，其他平台启动即报错；
 - 清理只做三件事：删 `ip rule`、删专用表的 default、删整张 nft 表，不会残留；
+- `nft delete table` 不再看 `use_tun`：tun 模式自己建不了这张表，存在的只可能是上次非 tun 运行留下的，
+  启动前（`cleanupStaleNFTTable`）与退出时都会删掉。否则它挂在 prerouting 上的 DNAT 会先改写目的地址，
+  包按改写后的真实 IP 从主表走掉，tun 设备根本收不到；
 - 只对非 tun 数据面生效：`use_tun: true` 时打标整体停用（配置加载阶段会直接拒绝这对组合，
   运行时再拦一次），tun 自己已经接管整段路由；
 - 装上后立刻自检并写日志：`route mark: startup check passed`（带 `set` / `set_size` /
