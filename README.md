@@ -178,6 +178,12 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
     因为出口由代理拨号，标记只会和它抢路；
 - NAT 数据面的 postrouting 只做 `ct status dnat masquerade`：被本插件 DNAT 的连接才改写源地址，
   不再按出口网卡匹配，避免把同一网卡上的其它流量（含宿主自身）一起 SNAT；
+- 假段本身有一条独立的例外规则：`ip rule add to <ipv4_range> lookup main prio 5`
+  紧随其后 `ip rule del` 同规格（幂等）。原因是网关常常有自己的策略路由——VyOS 会把所有
+  非 CN 目的地打上 `fwmark 0xa`，在 `prio 10` 查海外表，假 IP（198.18/15 永远不在 CN 集合里）
+  就在查到 `main` 之前被抢走、直接从隧道出去，设备一个包都收不到。这条规则不受 mark 影响，
+  目的地址落在假段就只查 `main`，也就是设备那条 kernel 路由；它装在出口分支之前，
+  所以代理生效时也照样装（代理只影响栈自己拨号的出口）。停机时按同一规格删除。
 - tun 直连出口的 `ip rule from <range> to !<range> lookup <table>` 在启用打标时带
   `prio <route_rule_priority-1>`，保证它先于 `fwmark` 规则命中，插件自己的 socket 不会被自己的标记送回设备；
 - `realip` 且未设 `route_mark` 时启动会打 Warn：每个应答都会往 `route_table`（默认 main）写一条 host route，

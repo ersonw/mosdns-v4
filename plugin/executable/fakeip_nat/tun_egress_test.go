@@ -1,6 +1,7 @@
 package fakeipnat
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -112,5 +113,83 @@ func TestParseBSDDefaultRoute(t *testing.T) {
 	hop, dev := parseBSDDefaultRoute(out)
 	if hop != "192.168.88.1" || dev != "en0" {
 		t.Fatalf("got hop=%q dev=%q", hop, dev)
+	}
+}
+
+// TestFakeRangeRulePinsTheRangeToMain: a gateway with its own policy routing
+// (VyOS marks every non-CN destination into an oversea table at priority 10)
+// intercepts fake destinations before main is consulted. The plugin has to
+// install its own rule ahead of that policy, keyed on the configured range.
+func TestFakeRangeRulePinsTheRangeToMain(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+
+	if _, ok := p.installFakeRangeRule(context.Background()); !ok {
+		t.Fatalf("fake range rule was not installed")
+	}
+
+	calls := strings.Join(runner.all(), "\n")
+	for _, want := range []string{
+		"ip rule del to 198.18.0.0/16 lookup main prio 5",
+		"ip rule add to 198.18.0.0/16 lookup main prio 5",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("missing %q in:\n%s", want, calls)
+		}
+	}
+}
+
+// TestFakeRangeRuleIsInstalledWithAProxy: the proxy only changes the outlet of
+// the stack's own dials. Packets addressed to a fake ip still have to enter the
+// device, so the rule must exist even when the proxy carries the outlet.
+func TestFakeRangeRuleIsInstalledWithAProxy(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+	p.proxyActive = true
+
+	p.setupTunEgress()
+
+	calls := strings.Join(runner.all(), "\n")
+	if !strings.Contains(calls, "ip rule add to 198.18.0.0/16 lookup main prio 5") {
+		t.Fatalf("proxy branch skipped the fake range rule:\n%s", calls)
+	}
+	if strings.Contains(calls, "route replace default") {
+		t.Fatalf("proxy branch installed an outlet route:\n%s", calls)
+	}
+}
+
+// TestFakeRangeRuleCleanupRemovesTheSameSpec: cleanup deletes by the exact spec
+// it added, so a restart cannot accumulate one rule per run.
+func TestFakeRangeRuleCleanupRemovesTheSameSpec(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = true
+
+	cleanup, ok := p.installFakeRangeRule(context.Background())
+	if !ok {
+		t.Fatalf("fake range rule was not installed")
+	}
+	before := len(runner.all())
+	cleanup()
+	after := runner.all()
+	if len(after) != before+1 || after[before] != "ip rule del to 198.18.0.0/16 lookup main prio 5" {
+		t.Fatalf("cleanup did not delete the same spec:\n%s", strings.Join(after, "\n"))
+	}
+}
+
+// TestFakeRangeRuleIsSkippedWithoutPolicyRules: a platform with no ip rule must
+// not attempt to call it.
+func TestFakeRangeRuleIsSkippedWithoutPolicyRules(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.policyRuleSupported = false
+
+	if _, ok := p.installFakeRangeRule(context.Background()); ok {
+		t.Fatalf("rule reported installed without platform support")
+	}
+	if calls := runner.all(); len(calls) != 0 {
+		t.Fatalf("unsupported platform issued commands: %v", calls)
 	}
 }

@@ -230,6 +230,12 @@ type FakeIPNatPlugin struct {
 	tunEgressHop     string
 	tunEgressDev     string
 	tunEgressCleanup func()
+	// tunFakeRuleCleanup removes the rule that pins the fake range to main.
+	tunFakeRuleCleanup func()
+	// policyRuleSupported mirrors supportsNamedRouteTable(): only a platform with
+	// named routing tables and ip rule can pin the fake range ahead of the host
+	// policy routing.
+	policyRuleSupported bool
 
 	// ICMP relay of the tun data path: echo requests are forwarded to the real
 	// ip, and the errors the outlet receives go back to the client with the
@@ -463,24 +469,25 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	bp.L().Debug("fakeip nat: sqlite reachable", zap.String("db_path", cfg.DBPath))
 
 	p := &FakeIPNatPlugin{
-		BP:           bp,
-		db:           db,
-		dbPath:       cfg.DBPath,
-		tablePrefix:  cfg.TablePrefix,
-		mapTable:     mapTable,
-		ipTable:      ipTable,
-		routesTable:  routesTable,
-		cidr:         cfg.IPv4Range,
-		prefix:       prefix,
-		maxHosts:     maxHosts,
-		ttl:          cfg.TTL,
-		recordTTL:    recordTTL,
-		nextHop:      strings.TrimSpace(cfg.NextHop),
-		nextHopDev:   strings.TrimSpace(cfg.NextHopDev),
-		realIP:       cfg.RealIP,
-		realRoutes:   make(map[string]struct{}),
-		taskSem:      make(chan struct{}, defaultTaskConcurrency),
-		taskInFlight: make(map[string]struct{}),
+		BP:                  bp,
+		db:                  db,
+		dbPath:              cfg.DBPath,
+		tablePrefix:         cfg.TablePrefix,
+		mapTable:            mapTable,
+		ipTable:             ipTable,
+		routesTable:         routesTable,
+		cidr:                cfg.IPv4Range,
+		prefix:              prefix,
+		maxHosts:            maxHosts,
+		ttl:                 cfg.TTL,
+		recordTTL:           recordTTL,
+		nextHop:             strings.TrimSpace(cfg.NextHop),
+		nextHopDev:          strings.TrimSpace(cfg.NextHopDev),
+		realIP:              cfg.RealIP,
+		policyRuleSupported: supportsNamedRouteTable(),
+		realRoutes:          make(map[string]struct{}),
+		taskSem:             make(chan struct{}, defaultTaskConcurrency),
+		taskInFlight:        make(map[string]struct{}),
 
 		hopSuffix:         cfg.HopNameSuffix,
 		routeTable:        cfg.RouteTable,

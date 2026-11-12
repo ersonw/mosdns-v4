@@ -15,6 +15,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -23,6 +24,17 @@ import (
 func (p *FakeIPNatPlugin) setupTunEgress() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	// The fake range has to reach the device no matter how the host decides to
+	// route or mark packet destinations: a gateway with its own policy routing
+	// (VyOS marks every non-CN destination into an oversea table) intercepts the
+	// fake addresses before main is ever consulted, and the packets leave the
+	// machine through the tunnel instead of entering the device. This rule is
+	// independent of the outlet, so it is installed before the proxy branch.
+	if cleanup, ok := p.installFakeRangeRule(ctx); ok {
+		p.tunFakeRuleCleanup = cleanup
+	}
+
 	if p.proxyActive {
 		p.L().Debug("tun egress: proxy carries the outlet, host routing left untouched")
 		// The SNAT table belongs to the no-proxy outlet. A run that used it
@@ -120,11 +132,63 @@ func canBindAddress(addr netip.Addr) bool {
 
 // stopTunEgress removes the rule installed for the outlet. The table's default
 // route is deleted with it; nothing else is touched.
+// tunFakeRulePriority puts the fake-range decision ahead of every policy rule a
+// gateway installs for its own traffic. VyOS marks non-CN destinations (which a
+// 198.18/15 address always is) with fwmark 0xa and routes them into an oversea
+// table at priority 10, so without this rule the fake addresses take the tunnel
+// and the device never sees a packet.
+const tunFakeRulePriority = 5
+
+// fakeRangeRuleArgs is the single shape of the rule, used for add and delete so
+// the two can never drift apart.
+func fakeRangeRuleArgs(action, cidr string, prio int) []string {
+	return []string{"rule", action, "to", cidr, "lookup", "main", "prio", strconv.Itoa(prio)}
+}
+
+// installFakeRangeRule pins every packet addressed inside the fake range to the
+// main table, where the kernel route of the device lives. It deliberately
+// ignores marks: whatever fwmark the host policy put on the packet, a fake
+// destination only exists here and can only be answered by the stack.
+func (p *FakeIPNatPlugin) installFakeRangeRule(ctx context.Context) (func(), bool) {
+	if !p.policyRuleSupported {
+		p.L().Debug("tun data path: this platform has no policy rules, the device route is the only match")
+		return nil, false
+	}
+	args := fakeRangeRuleArgs("add", p.cidr, tunFakeRulePriority)
+	delArgs := fakeRangeRuleArgs("del", p.cidr, tunFakeRulePriority)
+	// A run that was killed leaves the rule behind; adding a second copy would
+	// leave a duplicate nobody can tell apart.
+	_, _ = p.runner.Run(ctx, "ip", delArgs...)
+	if _, err := p.runner.Run(ctx, "ip", args...); err != nil {
+		p.L().Warn("tun data path: installing the fake range rule failed",
+			zap.String("to", p.cidr), zap.Int("prio", tunFakeRulePriority), zap.Error(err))
+		return nil, false
+	}
+	p.L().Info("tun data path: fake range pinned to the main table",
+		zap.String("to", p.cidr), zap.Int("prio", tunFakeRulePriority))
+
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+		defer cancel()
+		if _, err := p.runner.Run(ctx, "ip", delArgs...); err != nil {
+			p.L().Debug("tun data path: removing the fake range rule failed",
+				zap.String("to", p.cidr), zap.Error(err))
+			return
+		}
+		p.L().Debug("tun data path: fake range rule removed", zap.String("to", p.cidr))
+	}, true
+}
+
 func (p *FakeIPNatPlugin) stopTunEgress() {
 	cleanup := p.tunEgressCleanup
 	p.tunEgressCleanup = nil
 	if cleanup != nil {
 		cleanup()
+	}
+	fakeRule := p.tunFakeRuleCleanup
+	p.tunFakeRuleCleanup = nil
+	if fakeRule != nil {
+		fakeRule()
 	}
 }
 
