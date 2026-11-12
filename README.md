@@ -192,6 +192,14 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   `mark_chains` / `ip_rule` / `default_route` 五个字段）；任一对象缺失则打 Warn
   `route mark: startup check found the mark path incomplete`，不会等到主表被灌满才发现。
 
+- 设备只收自己的包：`readFromTun` 进栈前先过 `ownsTunDestination`——目的地址必须落在
+  `ipv4_range`、设备自身地址，或本次运行真正路由进设备（打标成功 / 启动时恢复）的真实 IP 集合里，
+  其它 IPv4 包直接丢弃（`fakeip nat: packet for an unowned destination dropped`）。被别的路由
+  塞进设备的流量不会被插件代拨出去；该集合上限 4096 条，超限按最旧淘汰；
+- 清理扫描只删自己的路由：`cleanupDataPath` / `sweepResidualRoutes` / `pruneManagedRoutes`
+  扫到前缀后先过 `foreignRoute`——账本里没有逐条记录、也不是账本行折叠出的聚合块时跳过，
+  运维自己写的同网关路由不会被误删（账本为空的旧场景仍按扫描兜底）。
+
 #### TUN 下的 TCP / UDP / ICMP 语义
 
 TCP、UDP、ICMP echo 三者都按 **SNAT（地址翻译）** 处理，而不是各自独立的替身：

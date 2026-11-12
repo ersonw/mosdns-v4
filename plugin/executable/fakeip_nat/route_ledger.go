@@ -14,6 +14,7 @@ package fakeipnat
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -394,6 +395,50 @@ func (p *FakeIPNatPlugin) sweepLedgerRoutes(ctx context.Context) int {
 //  2. a scan of the routing table for routes that still point at the configured
 //     gateway/device and cover an address this plugin is responsible for. This
 //     catches the routes written by a build that had no ledger.
+//
+// ledgerOwnsPrefix reports whether a route in the kernel came from this plugin:
+// it is either a ledger row verbatim, or exactly the aggregate an earlier
+// collapse pass installed (the union of rows that still point at the same hop).
+// Anything else is the operator's own route and must be left alone.
+func (p *FakeIPNatPlugin) ledgerOwnsPrefix(prefix string) bool {
+	p.ledgerMu.Lock()
+	ledger := p.ledger
+	p.ledgerMu.Unlock()
+	if ledger == nil {
+		return false
+	}
+	rows := ledger.snapshot()
+	if len(rows) == 0 {
+		return false
+	}
+	prefixes := make([]netip.Prefix, 0, len(rows))
+	for _, row := range rows {
+		if row.prefix == prefix {
+			return true
+		}
+		if pfx, err := netip.ParsePrefix(row.prefix); err == nil {
+			prefixes = append(prefixes, pfx)
+		}
+	}
+	for _, pfx := range collapsePrefixes(prefixes) {
+		if pfx.String() == prefix {
+			return true
+		}
+	}
+	return false
+}
+
+// foreignRoute reports whether a scanned prefix has no record in the ledger,
+// which means the scan found somebody else's route that merely looks like ours.
+func (p *FakeIPNatPlugin) foreignRoute(prefix string) bool {
+	if p.ledgerSize() == 0 {
+		// Nothing recorded - an older binary or an empty database - so the
+		// scan is the only trail there is.
+		return false
+	}
+	return !p.ledgerOwnsPrefix(prefix)
+}
+
 func (p *FakeIPNatPlugin) sweepResidualRoutes() {
 	ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
 	defer cancel()
@@ -420,6 +465,11 @@ func (p *FakeIPNatPlugin) sweepResidualRoutes() {
 	for _, prefix := range p.listManagedRoutes(ctx, hop, dev) {
 		scanned++
 		if !manageablePrefix(prefix) || !prefixCoversAny(prefix, known) {
+			continue
+		}
+		if p.foreignRoute(prefix) {
+			p.L().Debug("fakeip nat: residual scan left a route the ledger does not own",
+				zap.String("prefix", prefix), zap.String("next_hop", hop), zap.String("dev", dev))
 			continue
 		}
 		routesDeleted += p.deleteManagedRoutes(ctx, []string{prefix})

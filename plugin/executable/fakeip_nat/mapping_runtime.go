@@ -14,6 +14,7 @@ package fakeipnat
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sync"
 
 	"go.uber.org/zap"
@@ -305,6 +306,13 @@ func (p *FakeIPNatPlugin) restoreRealIPs(ctx context.Context) error {
 			continue
 		}
 		p.runtime.putReal(domain, []string{ip})
+		// A client can still hold the answer this address came from, so the
+		// device has to keep accepting it after a restart.
+		if p.useTun {
+			if addr, perr := netip.ParseAddr(ip); perr == nil {
+				p.rememberRealDst(addr)
+			}
+		}
 		loaded++
 	}
 	if err := rows.Err(); err != nil {

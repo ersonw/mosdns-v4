@@ -142,3 +142,33 @@ func TestLedgerForgetReachesTheDatabase(t *testing.T) {
 		t.Fatalf("ledger rows = %d after the forget was flushed, want 0", got)
 	}
 }
+
+// TestLedgerOwnsOnlyItsRoutes pins the cleanup guard: a scanned prefix is only
+// ours when the ledger recorded it verbatim or it is exactly the aggregate an
+// earlier collapse pass installed. An operator route that merely looks similar
+// stays untouched.
+func TestLedgerOwnsOnlyItsRoutes(t *testing.T) {
+	p := newRealIPPlugin(t, true)
+	ctx := context.Background()
+
+	p.rememberManagedRoute(ctx, "1.2.3.4/32", "11.10.12.1", "wg0")
+	p.rememberManagedRoute(ctx, "1.2.3.5/32", "11.10.12.1", "wg0")
+
+	if !p.ledgerOwnsPrefix("1.2.3.4/32") {
+		t.Fatalf("a recorded prefix must count as ours")
+	}
+	if !p.ledgerOwnsPrefix("1.2.3.4/31") {
+		t.Fatalf("the aggregate of two recorded siblings must count as ours")
+	}
+	for _, foreign := range []string{"1.2.3.0/24", "1.2.0.0/16", "9.9.9.9/32"} {
+		if p.ledgerOwnsPrefix(foreign) {
+			t.Fatalf("%s has no ledger record but was treated as ours", foreign)
+		}
+		if !p.foreignRoute(foreign) {
+			t.Fatalf("%s must be reported as somebody else's route", foreign)
+		}
+	}
+	if p.foreignRoute("1.2.3.4/32") {
+		t.Fatalf("a recorded prefix was reported as foreign")
+	}
+}

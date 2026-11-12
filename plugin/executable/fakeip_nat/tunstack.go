@@ -476,6 +476,104 @@ func (p *FakeIPNatPlugin) dialTarget(localAddr string, port uint16) (string, err
 	return target, nil
 }
 
+// realDestKeep bounds the set of real destinations the device may accept. A
+// destination is only useful while a client still holds the answer it came
+// from, so the set stays small; the oldest entries are dropped first.
+const realDestKeep = 4096
+
+// rememberRealDst records a real destination this plugin routed into the
+// device. Only these addresses are accepted by the device read loop.
+func (p *FakeIPNatPlugin) rememberRealDst(addr netip.Addr) {
+	if !addr.IsValid() || !addr.Is4() {
+		return
+	}
+	key := addr.String()
+	now := time.Now().Unix()
+	p.realDestMu.Lock()
+	if p.realDest == nil {
+		p.realDest = make(map[string]int64, 8)
+	}
+	p.realDest[key] = now
+	if len(p.realDest) > realDestKeep {
+		oldestKey, oldest := "", now
+		for k, at := range p.realDest {
+			if at < oldest || oldestKey == "" {
+				oldestKey, oldest = k, at
+			}
+		}
+		delete(p.realDest, oldestKey)
+	}
+	p.realDestMu.Unlock()
+}
+
+// ownsRealDst reports whether a real destination was recorded by this run.
+// Realip without marks writes host routes instead, and those packets reach the
+// device too, so the routing table entry is accepted as ownership.
+func (p *FakeIPNatPlugin) ownsRealDst(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	p.realDestMu.Lock()
+	if p.realDest != nil {
+		if _, ok := p.realDest[addr.String()]; ok {
+			p.realDestMu.Unlock()
+			return true
+		}
+	}
+	p.realDestMu.Unlock()
+	if p.markRoutingEnabled() {
+		// Mark routing is the only way in for a real destination then: an
+		// unrecorded address was never marked, so it is not ours.
+		return false
+	}
+	// Route split: the ledger names the addresses this plugin wrote a route
+	// for, and the route is what brought the packet into the device.
+	return p.routeCoversAddr(addr)
+}
+
+// routeCoversAddr reports whether a managed route covers addr. It is used only
+// for the route-split data path, where the routing table entry is what brought
+// the packet into the device.
+func (p *FakeIPNatPlugin) routeCoversAddr(addr netip.Addr) bool {
+	p.ledgerMu.Lock()
+	ledger := p.ledger
+	p.ledgerMu.Unlock()
+	if ledger == nil {
+		return false
+	}
+	for _, row := range ledger.snapshot() {
+		prefix, err := netip.ParsePrefix(row.prefix)
+		if err != nil {
+			continue
+		}
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// ownsTunDestination reports whether a packet read from the device belongs to
+// this plugin. Anything else was routed into the device by somebody else's
+// rule and has to be dropped rather than relayed to the outlet.
+func (p *FakeIPNatPlugin) ownsTunDestination(pkt []byte) bool {
+	if len(pkt) < ipv4HeaderMinLen || pkt[0]>>4 != 4 {
+		return false
+	}
+	total := int(binary.BigEndian.Uint16(pkt[2:4]))
+	if total < ipv4HeaderMinLen || total > len(pkt) {
+		return false
+	}
+	dst := netip.AddrFrom4([4]byte{pkt[16], pkt[17], pkt[18], pkt[19]})
+	if dst == p.reservedAddr() {
+		return true
+	}
+	if p.isFakeAddr(dst) {
+		return true
+	}
+	return p.ownsRealDst(dst)
+}
+
 // isFakeAddr reports whether addr is one of the addresses this plugin itself
 // hands out. Anything stored or resolved that lands inside this range is
 // unusable as a destination: it only exists inside this plugin's own table.

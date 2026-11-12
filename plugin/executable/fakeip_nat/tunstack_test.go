@@ -209,3 +209,58 @@ func TestDialTargetAcceptsRealDestination(t *testing.T) {
 		}
 	}
 }
+
+// TestOwnsTunDestination pins the inlet filter: the device accepts only the
+// addresses this plugin put there, so a packet another route pushed into it is
+// dropped instead of being dialled out.
+func TestOwnsTunDestination(t *testing.T) {
+	p := newNativePlugin(t, &fakeRunner{}, nil)
+	p.useTun = true
+	p.realIP = true
+	p.routeMark = 256
+
+	fake := buildUDPPacket(t, "172.16.0.9", "198.18.0.5", 40000, 53, []byte("x"))
+	if !p.ownsTunDestination(fake) {
+		t.Fatalf("a fake destination must be accepted")
+	}
+	if !p.ownsTunDestination(buildUDPPacket(t, "172.16.0.9", p.reservedAddr().String(), 40000, 53, []byte("x"))) {
+		t.Fatalf("the device's own address must be accepted")
+	}
+
+	real := buildUDPPacket(t, "172.16.0.9", "93.184.216.34", 40000, 53, []byte("x"))
+	if p.ownsTunDestination(real) {
+		t.Fatalf("an unrecorded real destination must be dropped")
+	}
+	addr, err := netip.ParseAddr("93.184.216.34")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	p.rememberRealDst(addr)
+	if !p.ownsTunDestination(real) {
+		t.Fatalf("a recorded real destination must be accepted")
+	}
+
+	if p.ownsTunDestination([]byte{0x60, 0, 0, 0}) {
+		t.Fatalf("a non-ipv4 packet must be dropped")
+	}
+	if p.ownsTunDestination(real[:ipv4HeaderMinLen-1]) {
+		t.Fatalf("a truncated packet must be dropped")
+	}
+}
+
+// TestRealDestinationSetIsBounded keeps the ownership set from growing without
+// limit on a long-lived process.
+func TestRealDestinationSetIsBounded(t *testing.T) {
+	p := newNativePlugin(t, &fakeRunner{}, nil)
+	p.useTun = true
+	for i := 0; i < realDestKeep+64; i++ {
+		addr := netip.AddrFrom4([4]byte{10, byte(i / 256), byte(i % 256), 1})
+		p.rememberRealDst(addr)
+	}
+	p.realDestMu.Lock()
+	size := len(p.realDest)
+	p.realDestMu.Unlock()
+	if size > realDestKeep {
+		t.Fatalf("ownership set holds %d entries, cap is %d", size, realDestKeep)
+	}
+}

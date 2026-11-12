@@ -250,6 +250,13 @@ type FakeIPNatPlugin struct {
 	// startup from SQLite and, on the NAT path, reconciled against the nft map.
 	runtime *runtimeMap
 
+	// realDest is the set of real destinations this run routed into the device
+	// on purpose (their mark put them there). The device read loop accepts a
+	// destination only when it is in this set, so a packet another route pushed
+	// into the device is dropped instead of being dialled out.
+	realDestMu sync.Mutex
+	realDest   map[string]int64
+
 	// tunStack is the userspace stack that terminates the traffic arriving on
 	// the device; tunCancel stops the device read/write loops on shutdown.
 	tunStack   *tunStack

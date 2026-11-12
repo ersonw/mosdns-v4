@@ -171,6 +171,16 @@ func (p *FakeIPNatPlugin) readFromTun(ctx context.Context, d tunDevice, st *tunS
 				ce.Write(zap.Int("len", n), zap.String("packet", desc))
 			}
 		}
+		// The device is this plugin's inlet, not a general packet sink: a
+		// packet some other route pushed into it has no mapping and no outlet
+		// assignment, so it is dropped here instead of being handed to the
+		// stack and dialled out.
+		if !p.ownsTunDestination(buf[:n]) {
+			if ce := p.L().Check(zap.DebugLevel, "fakeip nat: packet for an unowned destination dropped"); ce != nil {
+				ce.Write(zap.Int("len", n))
+			}
+			continue
+		}
 		// A packet whose TTL ran out is answered here, because the stack never
 		// forwards: this is the first hop traceroute sees.
 		if reply, drop := st.precheck(buf[:n]); drop {

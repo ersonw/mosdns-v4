@@ -260,6 +260,13 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 	// needs no route of its own, so an empty next_hop must not skip the write.
 	if p.markActiveNow() {
 		if err := p.markRealIP(ctx, ip); err == nil {
+			// The mark is what routes this destination into the device, so the
+			// device read loop has to recognise it as this plugin's own.
+			if p.useTun {
+				if addr, perr := netip.ParseAddr(ip); perr == nil {
+					p.rememberRealDst(addr)
+				}
+			}
 			p.L().Debug("fakeip nat: real ip marked for the dedicated table",
 				zap.String("real_ip", ip), zap.String("route_table", p.routeTable))
 			return
@@ -344,6 +351,9 @@ func (p *FakeIPNatPlugin) pruneManagedRoutes(ctx context.Context, hop, dev strin
 	pruned := 0
 	for _, prefix := range p.listManagedRoutes(ctx, hop, dev) {
 		if !manageablePrefix(prefix) || prefixCoversAny(prefix, known) {
+			continue
+		}
+		if p.foreignRoute(prefix) {
 			continue
 		}
 		pruned += p.deleteManagedRoutes(ctx, []string{prefix})
@@ -494,6 +504,11 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	if hop != "" || dev != "" {
 		for _, prefix := range p.listManagedRoutes(ctx, hop, dev) {
 			if !manageablePrefix(prefix) || !prefixCoversAny(prefix, known) {
+				continue
+			}
+			if p.foreignRoute(prefix) {
+				p.L().Debug("fakeip nat: cleanup left a route the ledger does not own",
+					zap.String("prefix", prefix), zap.String("next_hop", hop), zap.String("dev", dev))
 				continue
 			}
 			routesDeleted += p.deleteManagedRoutes(ctx, []string{prefix})
