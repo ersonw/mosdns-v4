@@ -70,10 +70,10 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler dns_h
 	}
 
 	httpOpts := http_handler.HandlerOpts{
-		DNSHandler:   dnsHandler,
-		Path:         cfg.URLPath,
-		SrcIPHeader:  cfg.GetUserIPFromHeader,
-		Logger:       m.logger,
+		DNSHandler:  dnsHandler,
+		Path:        cfg.URLPath,
+		SrcIPHeader: cfg.GetUserIPFromHeader,
+		Logger:      m.logger,
 	}
 
 	httpHandler, err := http_handler.NewHandler(httpOpts)
@@ -185,13 +185,15 @@ func createUnixListener(network, address string) (net.Listener, error) {
 		return nil, err
 	}
 
-	// Set up a signal handler to remove the socket file when the program is terminated
+	// Remove the socket file when the program is terminated. This handler must
+	// not exit: the shutdown coordinator owns the exit, and calling os.Exit here
+	// skips every plugin Close and leaves the data plane objects behind.
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
+		signal.Stop(c)
 		os.Remove(address)
-		os.Exit(0)
 	}()
 
 	return l, nil

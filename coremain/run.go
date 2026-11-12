@@ -28,9 +28,11 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 type serverFlags struct {
@@ -95,6 +97,37 @@ func Run() error {
 }
 
 func StartServer(sf *serverFlags) error {
+	return startServer(sf, true)
+}
+
+// watchShutdownSignals turns SIGTERM and SIGINT into the close signal RunMosdns
+// waits on. Without it the default signal action kills the process and no plugin
+// Close runs, which is exactly how data plane objects survive a restart. A
+// repeated signal exits immediately: the first one is not making progress.
+func watchShutdownSignals() func() {
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		shuttingDown := false
+		for sig := range sigChan {
+			if shuttingDown {
+				mlog.L().Warn("forced exit on a repeated signal", zap.String("signal", sig.String()))
+				os.Exit(1)
+			}
+			shuttingDown = true
+			if !RequestShutdown("shutdown requested by " + sig.String()) {
+				mlog.L().Warn("signal with nothing to shut down", zap.String("signal", sig.String()))
+				os.Exit(1)
+			}
+			mlog.L().Info("shutdown started", zap.String("signal", sig.String()))
+		}
+	}()
+	return func() { signal.Stop(sigChan) }
+}
+
+// startServer runs the server. handleSignals is false when the caller is the
+// service wrapper, which owns SIGTERM itself and stops through Stop.
+func startServer(sf *serverFlags, handleSignals bool) error {
 	if sf.cpu > 0 {
 		runtime.GOMAXPROCS(sf.cpu)
 	}
@@ -127,6 +160,11 @@ func StartServer(sf *serverFlags) error {
 	cfgPath := v.ConfigFileUsed()
 	if err := mergeInclude(cfg, 0, []string{cfgPath}, []string{tryGetAbsPath(cfgPath)}); err != nil {
 		return fmt.Errorf("failed to load sub config file, %w", err)
+	}
+
+	if handleSignals {
+		stopWatching := watchShutdownSignals()
+		defer stopWatching()
 	}
 
 	if err := RunMosdns(cfg); err != nil {

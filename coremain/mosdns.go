@@ -36,6 +36,7 @@ import (
 	"net/http/pprof"
 	"runtime"
 	"runtime/debug"
+	"sync"
 	"time"
 )
 
@@ -59,6 +60,76 @@ type Mosdns struct {
 	sc *safe_close.SafeClose
 }
 
+// The service wrapper and the signal handler need a way to ask the running
+// instance to close. RunMosdns owns the instance and the channel that closes
+// once its close pass is over, so it publishes both here: a caller outside the
+// process' main goroutine cannot reach them otherwise.
+var (
+	activeMu   sync.Mutex
+	active     *Mosdns
+	activeDone chan struct{}
+)
+
+func registerActive(m *Mosdns) chan struct{} {
+	done := make(chan struct{})
+	activeMu.Lock()
+	active, activeDone = m, done
+	activeMu.Unlock()
+	return done
+}
+
+func clearActive(m *Mosdns, done chan struct{}) {
+	activeMu.Lock()
+	if active == m {
+		active, activeDone = nil, nil
+	}
+	activeMu.Unlock()
+	close(done)
+}
+
+// ErrShutdownRequested marks a close that was asked for on purpose - a signal,
+// a service stop - so the caller can exit quietly instead of reporting a failure
+// and having the service manager count the stop as a crash.
+var ErrShutdownRequested = errors.New("shutdown requested")
+
+// RequestShutdown asks the running instance to start its close pass. It reports
+// false when nothing is up yet or when the instance already finished closing.
+func RequestShutdown(reason string) bool {
+	activeMu.Lock()
+	m, done := active, activeDone
+	activeMu.Unlock()
+	if m == nil || done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+	}
+	m.GetSafeClose().SendCloseSignal(fmt.Errorf("%w: %s", ErrShutdownRequested, reason))
+	return true
+}
+
+// WaitShutdown blocks until the running instance finished closing every plugin.
+// A timeout is returned as false so the caller can still exit instead of
+// hanging the stop.
+func WaitShutdown(timeout time.Duration) bool {
+	activeMu.Lock()
+	done := activeDone
+	activeMu.Unlock()
+	if done == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
 func RunMosdns(cfg *Config) error {
 	lg, err := mlog.NewLogger(&cfg.Log)
 	if err != nil {
@@ -74,6 +145,9 @@ func RunMosdns(cfg *Config) error {
 		metricsReg:  newMetricsReg(),
 		sc:          safe_close.NewSafeClose(),
 	}
+
+	done := registerActive(m)
+	defer clearActive(m, done)
 
 	m.httpAPIMux.Handle("/metrics", promhttp.HandlerFor(m.metricsReg, promhttp.HandlerOpts{}))
 	m.httpAPIMux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -196,7 +270,11 @@ func RunMosdns(cfg *Config) error {
 	<-m.sc.ReceiveCloseSignal()
 	m.sc.Done()
 	m.sc.CloseWait()
-	return m.sc.Err()
+	if err := m.sc.Err(); errors.Is(err, ErrShutdownRequested) {
+		return nil
+	} else {
+		return err
+	}
 }
 
 func (m *Mosdns) addPlugin(p Plugin) {

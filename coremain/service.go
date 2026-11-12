@@ -44,16 +44,39 @@ type serverService struct {
 	f *serverFlags
 }
 
+const serviceShutdownTimeout = 20 * time.Second
+
 func (ss *serverService) Start(s service.Service) error {
 	mlog.L().Info("starting service", zap.String("platform", s.Platform()))
 	go func() {
-		err := StartServer(ss.f)
-		mlog.L().Fatal("server exited", zap.Error(err))
+		// The service wrapper owns SIGTERM on this path: Stop drives the
+		// shutdown, and a second handler would race with it.
+		err := startServer(ss.f, false)
+		if err != nil {
+			mlog.L().Error("server exited", zap.Error(err))
+			os.Exit(1)
+		}
+		mlog.L().Info("server exited after shutdown")
 	}()
 	return nil
 }
 
+// Stop is the only callback the service wrapper gives before it lets the process
+// exit, and the process exit is immediate: the library calls Stop and then
+// returns from Run. Without driving the close signal here, no plugin Close ever
+// runs, and everything the data plane installed (nft tables, ip rules, routes)
+// stays behind. Waiting for the close pass keeps the process alive until the
+// cleanup is actually written.
 func (ss *serverService) Stop(s service.Service) error {
+	mlog.L().Info("service stop requested")
+	if !RequestShutdown("service stopped by the service manager") {
+		mlog.L().Warn("service stop: no running instance to shut down")
+		return nil
+	}
+	if !WaitShutdown(serviceShutdownTimeout) {
+		mlog.L().Warn("service stop: shutdown did not finish in time",
+			zap.Duration("timeout", serviceShutdownTimeout))
+	}
 	return nil
 }
 
