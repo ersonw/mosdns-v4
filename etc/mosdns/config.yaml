@@ -26,6 +26,11 @@
 #   - Three packages (padding, query_summary, misc_optm) only expose preset
 #     plugins (tags starting with "_"); they cannot be declared with a
 #     "type:" entry. See "PRESET PLUGINS" at the bottom.
+#   - A runnable full example - one instance of every plugin type with every
+#     option set, plus every top-level key - lives in
+#     etc/mosdns/config-full.yaml. Copy from it instead of assembling a
+#     plugin from the fragments below; coremain/config_example_test.go decodes
+#     that file, so its key names are known-good for this binary.
 # =============================================================================
 
 
