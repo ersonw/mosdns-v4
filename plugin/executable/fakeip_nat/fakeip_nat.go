@@ -316,27 +316,8 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if routeRulePriority == 0 {
 		routeRulePriority = 1000
 	}
-	// Mark routing moves the mapped addresses out of the routing table, so it
-	// only makes sense where a named table exists, where the tun path is not
-	// already responsible for them, and where the table is not the main one —
-	// piling marks into main is the shape this option exists to avoid.
-	if cfg.RouteMark != 0 {
-		if routeRulePriority < 1 || routeRulePriority > 32766 {
-			return nil, fmt.Errorf("invalid route_rule_priority %d: must be between 1 and 32766", routeRulePriority)
-		}
-		if !supportsNamedRouteTable() {
-			return nil, fmt.Errorf("route_mark is only supported on linux")
-		}
-		// In tun mode the marks are what pulls realip answers into the device, so
-		// the combination only makes sense there with realip. Fakeip already
-		// enters the device as a whole range, and marking would steer the stack's
-		// own dials back into it.
-		if cfg.UseTun && !cfg.RealIP {
-			return nil, fmt.Errorf("route_mark with use_tun needs realip: marking the real answers is what routes them into the device")
-		}
-		if cfg.RouteTable == "main" {
-			return nil, fmt.Errorf("route_mark needs route_table to name a dedicated table, not main")
-		}
+	if err := validateRouteMark(cfg, routeRulePriority); err != nil {
+		return nil, err
 	}
 	if cfg.HopNameSuffix == "" {
 		// Reuse the table prefix so a deployment names its hops after its
@@ -681,12 +662,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// touches prefixes the ledger does not own.
 	p.deferStartup("residual-routes", p.sweepResidualRoutes)
 
-	// In tun mode the mark path belongs to realip: fakeip already routes the
-	// whole range into the device, so there is nothing for a mark to decide. The
-	// config loader rejects that combination; this keeps a programmatically
-	// built plugin from installing objects nobody asked for.
-	if p.routeMark != 0 && p.useTun && !p.realIP {
-		p.L().Warn("route_mark is ignored in tun mode without realip: the tun data path owns the fake range",
+	// A proxied outlet carries the answers itself, so in tun + fakeip the mark has
+	// nothing to steer and stays uninstalled; the same configuration keeps the
+	// mark active when no proxy answers. This is a run-time decision, not a
+	// configuration error.
+	if p.routeMark != 0 && p.useTun && !p.realIP && !p.markRoutingEnabled() {
+		p.L().Debug("fakeip nat: route_mark inactive, the proxy carries the answers",
 			zap.Uint32("route_mark", p.routeMark))
 	}
 
@@ -760,6 +741,29 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	return p, nil
 }
 
+// validateRouteMark checks the values the mark path has to turn into commands.
+// It deliberately says nothing about which data path or which mode the run uses:
+// a combination is never a configuration error, it only decides at run time
+// whether the mark applies (see markRoutingEnabled). Rejecting combinations here
+// used to take the whole resolver down on a start, which is what this signature
+// of validation exists to avoid.
+func validateRouteMark(cfg *Args, routeRulePriority int) error {
+	if cfg.RouteMark == 0 {
+		return nil
+	}
+	if routeRulePriority < 1 || routeRulePriority > 32766 {
+		return fmt.Errorf("invalid route_rule_priority %d: must be between 1 and 32766", routeRulePriority)
+	}
+	if !supportsNamedRouteTable() {
+		return fmt.Errorf("route_mark is only supported on linux")
+	}
+	// Piling marks into main is the shape this option exists to avoid.
+	if cfg.RouteTable == "main" {
+		return fmt.Errorf("route_mark needs route_table to name a dedicated table, not main")
+	}
+	return nil
+}
+
 // startTunDataPath brings up the userspace stack and the device loops. It runs
 // as a goroutine because the socket layer must never block Init: coremain only
 // waits for Init, and a failure here is degraded, not fatal.
@@ -827,6 +831,23 @@ func (p *FakeIPNatPlugin) stopTunDataPath() {
 	if st != nil {
 		st.close()
 	}
+}
+
+// markAnsweredIPs adds the real destinations of one answer to the mark set, off
+// the answer path: the nft write is one exec call and the client does not need
+// the element to exist before it is told the fake ip.
+func (p *FakeIPNatPlugin) markAnsweredIPs(ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), natTimeout)
+		defer cancel()
+		if err := p.markRealIPs(ctx, ips); err != nil {
+			p.L().Warn("fakeip nat: marking the answered real ips failed",
+				zap.Strings("real_ips", ips), zap.Error(err))
+		}
+	}()
 }
 
 // startRouteAggregation runs the managed-route collapse on a timer. The scan
@@ -989,6 +1010,13 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 					// produce an A record with a nil IP.
 					p.L().Error("invalid allocated fake ip", zap.String("domain", domain), zap.String("fake_ip", fakeIP), zap.Error(err))
 				} else {
+					// tun + fakeip learns its real destinations from the answer
+					// rather than from a DNAT write, so this is where the mark
+					// set is fed. The write is not on the answer path: the client
+					// may not connect for another few milliseconds.
+					if p.useTun && p.markActiveNow() {
+						p.markAnsweredIPs(realIPs)
+					}
 					// Wait for the data plane before answering: a client that
 					// receives a fake IP while the DNAT entry is still missing
 					// can only fail, which is what "the mapping exists but the

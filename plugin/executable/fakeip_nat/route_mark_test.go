@@ -348,21 +348,24 @@ func TestDefaultRoutePresent(t *testing.T) {
 	}
 }
 
-// TestMarkRoutingSkipsTunModeWithoutRealIP pins the remaining limit: fakeip +
-// tun already enters the device as a whole range, so a mark would only steer
-// the stack's own dials back into it. Neither setup nor cleanup touches the
-// kernel in that shape.
-func TestMarkRoutingSkipsTunModeWithoutRealIP(t *testing.T) {
+// TestMarkRoutingStaysOffWhenTheProxyCarriesTheAnswers pins the one case that
+// still skips the mark: tun + fakeip with a parsed proxy. The relay dials those
+// destinations itself, so a mark would only fight the outlet. Cleanup still
+// removes what the configuration installed, because a later run without a proxy
+// turns the same configuration back on.
+func TestMarkRoutingStaysOffWhenTheProxyCarriesTheAnswers(t *testing.T) {
 	runner := &fakeRunner{}
 	p := newMarkPlugin(t, runner)
 	p.useTun = true
+	p.proxyActive = true
 
 	if p.markRoutingEnabled() {
-		t.Fatalf("mark routing must stay disabled with fakeip in tun mode")
+		t.Fatalf("mark routing must stay disabled when the proxy carries the answers")
 	}
 	p.cleanupMarkRouting(context.Background())
-	if calls := runner.all(); len(calls) != 0 {
-		t.Fatalf("cleanup in tun mode issued commands: %v", calls)
+	calls := strings.Join(runner.all(), "\n")
+	if !strings.Contains(calls, "ip rule del fwmark") {
+		t.Fatalf("cleanup left the recorded mark path behind:\n%s", calls)
 	}
 }
 

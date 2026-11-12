@@ -35,18 +35,25 @@ import (
 // place to look.
 const markSetName = "real_ipv4"
 
-// markRoutingEnabled reports whether mark routing applies to this run. In the
-// NAT data path it replaces the per-address host routes. In tun mode it is the
-// realip data path: the answers keep their real addresses, so marking them is
-// what decides that those destinations are the plugin's business and have to
-// enter the device instead of leaving through the host default route. With
-// fakeip + tun there is nothing to mark: the whole range already enters the
-// device, and the stack dials the real ip itself.
+// markRoutingEnabled reports whether mark routing applies to this run, and it is
+// a run-time answer because the proxy decides part of it.
+//
+//   - NAT data path: the mark replaces the per-address host routes.
+//   - tun + realip: the answers keep their real addresses, so the mark is what
+//     decides those destinations belong to the plugin and have to enter the
+//     device. A proxy does not change that, the device is still the way in.
+//   - tun + fakeip: the answers are fake and the whole range enters the device
+//     by route, so the only destinations worth marking are the real ones the
+//     stack dials itself; the mark sends them to next_hop/next_hop_dev. A proxy
+//     dials those for the plugin instead, so the mark would only fight it.
 func (p *FakeIPNatPlugin) markRoutingEnabled() bool {
 	if p.routeMark == 0 {
 		return false
 	}
-	return !p.useTun || p.realIP
+	if p.useTun && !p.realIP && p.proxyActive {
+		return false
+	}
+	return true
 }
 
 // markActiveNow reports whether mark routing is fully installed: table, set,
@@ -152,7 +159,10 @@ func (p *FakeIPNatPlugin) setupMarkRouting(ctx context.Context) error {
 	//   would bypass the device entirely, which is exactly what this mode
 	//   exists to avoid.
 	var hop, dev string
-	if p.useTun {
+	if p.useTun && p.realIP {
+		// The marked destinations are the real answers a client asks for: they
+		// have to enter the device, where the proxy - or the pinned outlet
+		// route - takes over.
 		dev = p.tunDev
 		if dev == "" {
 			return fmt.Errorf("mark routing in tun mode needs the tun device, which is not up")
@@ -211,6 +221,23 @@ func (p *FakeIPNatPlugin) markRuleArgs(action string) []string {
 	}
 }
 
+// markRealIPs adds several destinations at once. One nft call per answer keeps
+// the tun + fakeip path as cheap as the NAT path's per-address writes.
+func (p *FakeIPNatPlugin) markRealIPs(ctx context.Context, ips []string) error {
+	if len(ips) == 0 {
+		return nil
+	}
+	table := p.nftTableName()
+	if err := p.ensureMarkTable(ctx, table); err != nil {
+		return err
+	}
+	element := "{ " + strings.Join(ips, ", ") + " }"
+	if _, err := p.runner.Run(ctx, "nft", "add", "element", "ip", table, markSetName, element); err != nil {
+		return fmt.Errorf("nft add element %s %s: %w", table, markSetName, err)
+	}
+	return nil
+}
+
 // markRealIP adds one destination to the set that nft marks. This is the
 // replacement for writing a /32 host route: the address never touches a
 // routing table.
@@ -229,7 +256,7 @@ func (p *FakeIPNatPlugin) markRealIP(ctx context.Context, ip string) error {
 // dedicated table, then marks the path as gone. The nft objects are dropped by
 // cleanupDataPath together with the rest of the table.
 func (p *FakeIPNatPlugin) cleanupMarkRouting(ctx context.Context) {
-	if !p.markRoutingEnabled() {
+	if p.routeMark == 0 {
 		return
 	}
 	if _, err := p.runner.Run(ctx, "ip", p.markRuleArgs("del")...); err != nil {
