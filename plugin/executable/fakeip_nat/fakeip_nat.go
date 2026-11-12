@@ -594,7 +594,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			}
 			probeStarted := time.Now()
 			probeCtx, probeCancel := context.WithTimeout(context.Background(), probeBudget)
-			p.L().Debug("fakeip nat: probing proxy egress", zap.String("proxy", redactProxy(cfg.Proxy)))
+			// Info, not Debug: when a start hangs, the last line before the gap
+			// is what names the phase it hung in.
+			p.L().Info("fakeip nat: probing proxy egress", zap.String("proxy", redactProxy(cfg.Proxy)))
 			if err := probeEgress(probeCtx, dialer); err != nil {
 				p.L().Warn("proxy is not usable, falling back to direct egress",
 					zap.String("proxy", redactProxy(cfg.Proxy)), zap.Error(err))
@@ -649,7 +651,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		p.cleanupStaleNFTTable(staleCtx)
 		staleCancel()
 
-		p.L().Debug("fakeip nat: starting tun data path", zap.String("range", p.cidr))
+		// Same reason as the probe above: this line is the boundary between
+		// "stuck before the device" and "stuck while bringing the device up".
+		p.L().Info("fakeip nat: starting tun data path", zap.String("range", p.cidr))
 		tunStarted := time.Now()
 		if err := p.startTunDataPath(); err != nil {
 			p.L().Error("use_tun is enabled but the tun data path could not start; the plugin has no outlet", zap.Error(err))
