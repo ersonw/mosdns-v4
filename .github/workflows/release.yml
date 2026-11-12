@@ -36,7 +36,7 @@ jobs:
           cache: true
 
       # VERSION is the tag name and is what the binary reports. SLUG is the same
-      # string with slashes replaced, because a version such as dev/4.0-abc
+      # string with slashes replaced, because a version such as dev/abc
       # cannot appear in a file name.
       - name: resolve version
         run: |

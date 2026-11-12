@@ -31,7 +31,7 @@ import (
 )
 
 var (
-	version = "dev/4.0"
+	version = "dev"
 )
 
 func init() {

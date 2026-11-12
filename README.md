@@ -472,12 +472,12 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
 本地交叉编译：
 
 ```bash
-go run ./tools/crossbuild                 # 全部目标，版本号取 dev/4.0-<git describe>
+go run ./tools/crossbuild                 # 全部目标，版本号取 dev/<git describe>
 go run ./tools/crossbuild -version v4.0.1 # 固定版本号
 go run ./tools/crossbuild linux/amd64     # 只编指定目标
 ```
 
-产物在 `build/`，版本号经 `-ldflags -X main.version` 注入；不传 `-version` 且 git 也无答案时不注入，`main.version` 保持默认 `dev/4.0`。
+产物在 `build/`，版本号经 `-ldflags -X main.version` 注入；不传 `-version` 且 git 也无答案时不注入，`main.version` 保持默认 `dev`。
 
 GitHub Actions：
 

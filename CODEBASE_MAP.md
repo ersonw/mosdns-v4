@@ -20,7 +20,7 @@
 | 项 | 值 |
 |---|---|
 | module | `github.com/ersonw/mosdns-v4` |
-| 版本变量 | `main.go:34` `version = "dev/4.0"` |
+| 版本变量 | `main.go:34` `version = "dev"` |
 | Go 文件 / 总行数 | 173 / 24,178 |
 | `pkg` 下包数 | 35 |
 | 插件目录 | 27（25 executable + 2 matcher） |

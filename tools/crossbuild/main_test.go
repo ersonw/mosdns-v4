@@ -29,7 +29,7 @@ func TestResolveVersionPrefixesTheGitAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVersion: %v", err)
 	}
-	if v != "dev/4.0-v4.0.0-12-gabc123" {
+	if v != "dev/v4.0.0-12-gabc123" {
 		t.Fatalf("version = %q", v)
 	}
 }
@@ -41,13 +41,13 @@ func TestResolveVersionAcceptsTheCommitOnlyAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveVersion: %v", err)
 	}
-	if v != "dev/4.0-7d4d98a" {
+	if v != "dev/7d4d98a" {
 		t.Fatalf("version = %q", v)
 	}
 }
 
 // When git cannot answer, nothing is injected and main.version keeps its own
-// default instead of becoming "dev/4.0-" with nothing behind it.
+// default instead of becoming "dev/" with nothing behind it.
 func TestResolveVersionWithoutGitInjectsNothing(t *testing.T) {
 	gitDescribe = func() (string, error) { return "", errNoGit }
 	v, err := resolveVersion("")
@@ -66,8 +66,8 @@ func TestResolveVersionWithoutGitInjectsNothing(t *testing.T) {
 }
 
 func TestBuildArgsCarryTheVersionInOneArgument(t *testing.T) {
-	args := buildArgs("build/mosdns-linux-amd64", "dev/4.0-7d4d98a")
-	want := "-ldflags=-X main.version=dev/4.0-7d4d98a"
+	args := buildArgs("build/mosdns-linux-amd64", "dev/7d4d98a")
+	want := "-ldflags=-X main.version=dev/7d4d98a"
 	found := false
 	for _, a := range args {
 		if a == want {
@@ -82,7 +82,7 @@ func TestBuildArgsCarryTheVersionInOneArgument(t *testing.T) {
 // A space would split the -X assignment and the build would fail with an error
 // that does not mention the version.
 func TestCheckVersionRejectsWhitespace(t *testing.T) {
-	if _, err := checkVersion("dev/4.0 two"); err == nil {
+	if _, err := checkVersion("dev/two words"); err == nil {
 		t.Fatalf("a version with a space must be rejected")
 	}
 }

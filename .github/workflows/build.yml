@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to stamp (default: dev/4.0-<git describe>)"
+        description: "Version to stamp (default: dev/<git describe>)"
         required: false
         type: string
 

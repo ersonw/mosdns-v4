@@ -8,10 +8,10 @@
 //
 // The version the binary reports is injected through -ldflags. Passing it
 // explicitly is optional: without -version the tool asks git for
-// `describe --tags --long --always` and prefixes the answer with "dev/4.0-",
+// `describe --tags --long --always` and prefixes the answer with "dev/",
 // which is how a local build still says which commit it came from. When git
 // cannot answer either (no repository, no tags and no history), nothing is
-// injected and main.version keeps its own "dev/4.0" default.
+// injected and main.version keeps its own "dev" default.
 //
 // Usage:
 //
@@ -63,7 +63,7 @@ func run() error {
 	fs := flag.NewFlagSet("crossbuild", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	explicit := fs.String("version", "", "version to inject into main.version; "+
-		"default: \"dev/4.0-\" + git describe --tags --long --always")
+		"default: \"dev/\" + git describe --tags --long --always")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -157,7 +157,7 @@ func buildArgs(bin, version string) []string {
 }
 
 // versionPrefix marks a version that came from git rather than from a release.
-const versionPrefix = "dev/4.0-"
+const versionPrefix = "dev/"
 
 // gitDescribe answers with the nearest tag, the distance to it, and the short
 // commit; with no tags at all it answers with the commit alone. It is a variable
