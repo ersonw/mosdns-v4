@@ -227,7 +227,13 @@ func TestOwnsTunDestination(t *testing.T) {
 		t.Fatalf("the device's own address must be accepted")
 	}
 
-	real := buildUDPPacket(t, "172.16.0.9", "93.184.216.34", 40000, 53, []byte("x"))
+	// DNS is the one foreign destination the device carries, so the unowned
+	// case has to be an ordinary flow.
+	if !p.ownsTunDestination(buildUDPPacket(t, "172.16.0.9", "93.184.216.34", 40000, 53, []byte("x"))) {
+		t.Fatalf("DNS to a real address must be carried")
+	}
+
+	real := buildUDPPacket(t, "172.16.0.9", "93.184.216.34", 40000, 443, []byte("x"))
 	if p.ownsTunDestination(real) {
 		t.Fatalf("an unrecorded real destination must be dropped")
 	}

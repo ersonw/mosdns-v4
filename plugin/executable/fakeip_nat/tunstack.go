@@ -187,7 +187,11 @@ func (t *tunStack) precheck(pkt []byte) (reply []byte, drop bool) {
 		// answer names the device itself as the destination, so it keeps the
 		// device address: the client is probing this address.
 		if pkt[9] == protoUDP {
-			return buildICMPPortUnreachable(t.local, src, pkt[:total]), true
+			// DNS on the device address is answered by the relay in relayUDP,
+			// so it must reach the stack instead of being refused here.
+			if !dnsPacket(pkt[:total]) {
+				return buildICMPPortUnreachable(t.local, src, pkt[:total]), true
+			}
 		}
 		return nil, false
 	}
@@ -247,6 +251,11 @@ func (p *FakeIPNatPlugin) startStack(t *tunStack) {
 // relayTCP terminates one TCP connection and relays it to the outlet.
 func (p *FakeIPNatPlugin) relayTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
+
+	if dnsFlow(id.LocalPort) {
+		p.relayTunDNSTCP(r)
+		return
+	}
 
 	// Resolve the target before touching the endpoint: a fake ip that is not in
 	// the mapping table has no route, and that branch must not leave the client
@@ -311,6 +320,11 @@ func (p *FakeIPNatPlugin) relayTCP(r *tcp.ForwarderRequest) {
 // of a client traceroute are handed to the hop prober instead.
 func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
 	id := r.ID()
+
+	if dnsFlow(id.LocalPort) {
+		p.relayTunDNSUDP(r)
+		return
+	}
 
 	var wq waiter.Queue
 	ep, epErr := r.CreateEndpoint(&wq)
@@ -553,6 +567,39 @@ func (p *FakeIPNatPlugin) routeCoversAddr(addr netip.Addr) bool {
 	return false
 }
 
+// tunDNSResolver is where DNS addressed to the device's own address is relayed.
+// On a box that runs this plugin the host resolver is mosdns itself, which is
+// why the answer the client receives is the fake ip it needs.
+const tunDNSResolver = "127.0.0.1:53"
+
+// dnsPacket reports whether the packet is a DNS request: UDP or TCP to port 53.
+// A tun data path that cannot carry DNS leaves every client that resolves
+// through the device without an answer, so this is the one destination class
+// the device accepts even though it belongs to somebody else's socket.
+func dnsPacket(pkt []byte) bool {
+	if len(pkt) < ipv4HeaderMinLen || pkt[0]>>4 != 4 {
+		return false
+	}
+	ihl := int(pkt[0]&0x0f) * 4
+	proto := pkt[9]
+	if proto != protoUDP && proto != protoTCP {
+		return false
+	}
+	if ihl < ipv4HeaderMinLen || len(pkt) < ihl+udpHeaderLen {
+		return false
+	}
+	return binary.BigEndian.Uint16(pkt[ihl+2:ihl+4]) == 53
+}
+
+// dnsFlow reports whether an intercepted flow is DNS. Every DNS flow is relayed
+// to the host resolver whichever address the client aimed at: a fake-ip gateway
+// only works when the resolver that hands out the fake addresses is the one that
+// answers, and a direct socket avoids binding the range address for a flow that
+// must reach the host anyway.
+func dnsFlow(port uint16) bool {
+	return port == 53
+}
+
 // ownsTunDestination reports whether a packet read from the device belongs to
 // this plugin. Anything else was routed into the device by somebody else's
 // rule and has to be dropped rather than relayed to the outlet.
@@ -569,6 +616,9 @@ func (p *FakeIPNatPlugin) ownsTunDestination(pkt []byte) bool {
 		return true
 	}
 	if p.isFakeAddr(dst) {
+		return true
+	}
+	if dnsPacket(pkt) {
 		return true
 	}
 	return p.ownsRealDst(dst)
@@ -688,4 +738,83 @@ func (t *tunStack) writeOut(pkt []byte) error {
 	defer t.writeMu.Unlock()
 	_, err := t.dev.Write(pkt)
 	return err
+}
+
+// relayTunDNSUDP answers one DNS request addressed to the device itself by
+// forwarding the datagram to the host resolver. The client keeps using the
+// device address, so nothing but this relay has to know where DNS really runs.
+func (p *FakeIPNatPlugin) relayTunDNSUDP(r *udp.ForwarderRequest) {
+	var wq waiter.Queue
+	ep, epErr := r.CreateEndpoint(&wq)
+	if epErr != nil {
+		p.L().Debug("tun dns: create endpoint failed", zap.Error(tunError(epErr)))
+		return
+	}
+	local := gonet.NewUDPConn(&wq, ep)
+	defer local.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tunDialTimeout)
+	defer cancel()
+	var d net.Dialer
+	remote, dialErr := d.DialContext(ctx, "udp", tunDNSResolver)
+	if dialErr != nil {
+		p.L().Warn("tun dns: dial the host resolver failed", zap.String("resolver", tunDNSResolver), zap.Error(dialErr))
+		return
+	}
+	defer remote.Close()
+	p.L().Debug("tun dns: query relayed to the host resolver", zap.String("resolver", tunDNSResolver))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, tunUDPMaxDatagram)
+		for {
+			n, err := remote.Read(buf)
+			if err != nil {
+				return
+			}
+			if _, err := local.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+	buf := make([]byte, tunUDPMaxDatagram)
+	for {
+		n, err := local.Read(buf)
+		if err != nil {
+			break
+		}
+		if _, err := remote.Write(buf[:n]); err != nil {
+			break
+		}
+	}
+	_ = remote.Close()
+	<-done
+}
+
+// relayTunDNSTCP is the stream version: a resolver that truncates over UDP is
+// retried over TCP, and that connection is aimed at the device address too.
+func (p *FakeIPNatPlugin) relayTunDNSTCP(r *tcp.ForwarderRequest) {
+	var wq waiter.Queue
+	ep, epErr := r.CreateEndpoint(&wq)
+	if epErr != nil {
+		r.Complete(true)
+		p.L().Debug("tun dns: create endpoint failed", zap.Error(tunError(epErr)))
+		return
+	}
+	r.Complete(false)
+	local := gonet.NewTCPConn(&wq, ep)
+	defer local.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), tunDialTimeout)
+	defer cancel()
+	var d net.Dialer
+	remote, dialErr := d.DialContext(ctx, "tcp", tunDNSResolver)
+	if dialErr != nil {
+		p.L().Warn("tun dns: dial the host resolver failed", zap.String("resolver", tunDNSResolver), zap.Error(dialErr))
+		return
+	}
+	defer remote.Close()
+	p.L().Debug("tun dns: tcp query relayed to the host resolver", zap.String("resolver", tunDNSResolver))
+	pipeConns(local, remote)
 }

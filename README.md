@@ -206,6 +206,10 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   启动时据此精确删除（日志 `route mark: removing the mark path a previous build left behind`）；
   从 tun 切回 nft 时则删掉 tun 出口的 SNAT 表与 `from <range>` 的规则（不改那张表的 default
   路由，因为它可能是机器自己在用的表）；
+- tun 数据面能承载 DNS：`readFromTun` 对目的端口 53 的包（UDP/TCP）放行，`relayUDP`/`relayTCP`
+  把 DNS 一律转到本机解析器 `127.0.0.1:53`（也就是 mosdns 自己），所以客户端把 DNS 指到
+  tun 网关地址、或指到公网解析器但被路由进 tun，都能拿到应答（`tun dns: query relayed to the
+  host resolver`）；设备地址上非 53 的 UDP 仍按原样回 ICMP port unreachable；
 - 清理前先判存在性：`nft list table` 不存在就只记 Debug，存在但 `delete` 失败则 Warn
   （`fakeip nat: removing the stale nft table failed` / `tun egress: removing the snat table failed`）；
   `nft` 本身不在 PATH 时单独 Warn，避免把"删不掉"伪装成"本来就没有"；
