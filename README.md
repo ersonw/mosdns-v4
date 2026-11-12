@@ -206,6 +206,9 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   启动时据此精确删除（日志 `route mark: removing the mark path a previous build left behind`）；
   从 tun 切回 nft 时则删掉 tun 出口的 SNAT 表与 `from <range>` 的规则（不改那张表的 default
   路由，因为它可能是机器自己在用的表）；
+- 清理前先判存在性：`nft list table` 不存在就只记 Debug，存在但 `delete` 失败则 Warn
+  （`fakeip nat: removing the stale nft table failed` / `tun egress: removing the snat table failed`）；
+  `nft` 本身不在 PATH 时单独 Warn，避免把"删不掉"伪装成"本来就没有"；
 - 启动时校验已有 nft 表：`ensureNFTTable` 读回 `nft list table`，若 postrouting 仍是旧版的
   `oifname <dev> masquerade`、或缺少当前的 DNAT/drop/mss 规则，就删表重建（日志
   `fakeip nat: rebuilding the nft table so its rules match the configuration`），

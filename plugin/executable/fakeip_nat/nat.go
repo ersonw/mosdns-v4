@@ -9,6 +9,7 @@ package fakeipnat
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -60,6 +61,14 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) (string,
 	defer cancel()
 	out, err := exec.CommandContext(runCtx, name, args...).CombinedOutput()
 	return string(out), err
+}
+
+// commandMissing reports whether err says the executable itself was not found.
+// On a router that usually means the service PATH has no /usr/sbin, which turns
+// every cleanup into a silent no-op, so the caller has to say it out loud.
+func commandMissing(err error) bool {
+	var execErr *exec.Error
+	return errors.As(err, &execErr)
 }
 
 func (p *FakeIPNatPlugin) nftTableName() string {
@@ -963,9 +972,28 @@ func (p *FakeIPNatPlugin) hostRouteTable() string {
 // in prerouting and would keep rewriting packets the device should have routed.
 func (p *FakeIPNatPlugin) cleanupStaleNFTTable(ctx context.Context) {
 	table := p.nftTableName()
+	// This table's DNAT chain is still wired into prerouting, so "the delete
+	// failed" cannot be folded into "there was nothing to delete": existence is
+	// checked first and a failure is reported at warning level.
+	if _, err := p.runner.Run(ctx, "nft", "list", "table", "ip", table); err != nil {
+		p.reportListFailure(err, table)
+		return
+	}
 	if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", table); err != nil {
-		p.L().Debug("fakeip nat: no stale nft table to remove", zap.String("nft_table", table))
+		p.L().Warn("fakeip nat: removing the stale nft table failed",
+			zap.String("nft_table", table), zap.Error(err))
 		return
 	}
 	p.L().Info("fakeip nat: removed the nft table a non-tun run left behind", zap.String("nft_table", table))
+}
+
+// reportListFailure separates "the table is already gone" from "nft could not be
+// run at all": the first is routine, the second leaves a hooked chain behind.
+func (p *FakeIPNatPlugin) reportListFailure(err error, table string) {
+	if commandMissing(err) {
+		p.L().Warn("fakeip nat: nft is not available, stale tables cannot be checked or removed",
+			zap.String("nft_table", table), zap.Error(err))
+		return
+	}
+	p.L().Debug("fakeip nat: no stale nft table to remove", zap.String("nft_table", table))
 }

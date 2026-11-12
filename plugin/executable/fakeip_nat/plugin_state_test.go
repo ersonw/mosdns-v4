@@ -2,6 +2,8 @@ package fakeipnat
 
 import (
 	"context"
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -176,5 +178,42 @@ func TestNonTunStartCleansTunOutlet(t *testing.T) {
 	}
 	if strings.Contains(calls, "route del") {
 		t.Fatalf("the sweep deleted a route it cannot own:\n%s", calls)
+	}
+}
+
+// TestStaleNFTCleanupSkipsAbsentTable keeps the startup clean quiet: an object
+// that is already gone must not produce a delete, which would otherwise look
+// like a failure in the journal.
+func TestStaleNFTCleanupSkipsAbsentTable(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.cleanupStaleNFTTable(context.Background())
+	if calls := strings.Join(runner.all(), "\n"); strings.Contains(calls, "nft delete") {
+		t.Fatalf("an absent table still produced a delete:\n%s", calls)
+	}
+}
+
+// TestStaleSNATCleanupSkipsAbsentTable is the same for the proxied outlet.
+func TestStaleSNATCleanupSkipsAbsentTable(t *testing.T) {
+	runner := &fakeRunner{failContains: "nft list table ip " + "test_tun_snat"}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	p.removeStaleTunSNAT(context.Background())
+	if calls := strings.Join(runner.all(), "\n"); strings.Contains(calls, "nft delete") {
+		t.Fatalf("an absent table still produced a delete:\n%s", calls)
+	}
+}
+
+// TestCommandMissingTellsThemApart pins the difference the cleanup log depends
+// on: a missing binary is not the same as a missing table.
+func TestCommandMissingTellsThemApart(t *testing.T) {
+	_, err := exec.Command("definitely-not-a-real-binary-9f31", "--version").Output()
+	if err == nil {
+		t.Fatal("the probe binary unexpectedly exists")
+	}
+	if !commandMissing(err) {
+		t.Fatalf("a missing binary was not recognised: %v", err)
+	}
+	if commandMissing(fmt.Errorf("exit status 1")) {
+		t.Fatal("an ordinary command failure was treated as a missing binary")
 	}
 }

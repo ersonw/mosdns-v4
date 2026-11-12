@@ -115,11 +115,24 @@ func (p *FakeIPNatPlugin) removeStaleMarkPath(ctx context.Context, mark uint32, 
 // reaches setupTunEgress' install path, so nothing else would ever remove it.
 func (p *FakeIPNatPlugin) removeStaleTunSNAT(ctx context.Context) {
 	table := p.tunSNATTableName()
-	if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", table); err == nil {
-		p.L().Info("tun egress: removed the snat table a proxied run does not use", zap.String("nft_table", table))
-	} else {
-		p.L().Debug("tun egress: no snat table to remove", zap.String("nft_table", table))
+	// A delete that fails looks exactly like a delete that had nothing to do,
+	// so existence is decided first: the difference between "gone already" and
+	// "still hooked in postrouting" is what the log has to report.
+	if _, err := p.runner.Run(ctx, "nft", "list", "table", "ip", table); err != nil {
+		if commandMissing(err) {
+			p.L().Warn("tun egress: nft is not available, the snat table cannot be checked or removed",
+				zap.String("nft_table", table), zap.Error(err))
+		} else {
+			p.L().Debug("tun egress: no snat table to remove", zap.String("nft_table", table))
+		}
+		return
 	}
+	if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", table); err != nil {
+		p.L().Warn("tun egress: removing the snat table failed",
+			zap.String("nft_table", table), zap.Error(err))
+		return
+	}
+	p.L().Info("tun egress: removed the snat table a proxied run does not use", zap.String("nft_table", table))
 }
 
 // markInNFT finds the mark value inside the nft table the plugin owns: the mark

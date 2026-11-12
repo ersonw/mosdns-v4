@@ -480,13 +480,17 @@ func TestCleanupDropsStaleNFTTableInTunMode(t *testing.T) {
 // TestCleanupStaleNFTTableToleratesAbsence checks the normal tun start: there is
 // no table to delete, and that must not surface as an error or a panic.
 func TestCleanupStaleNFTTableToleratesAbsence(t *testing.T) {
-	runner := &fakeRunner{failContains: "nft delete table"}
+	runner := &fakeRunner{}
 	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
 	p.useTun = true
 
 	p.cleanupStaleNFTTable(context.Background())
-	if _, ok := runner.find("nft delete table ip fakeip_test"); !ok {
-		t.Fatalf("the absence probe was not attempted: %v", runner.all())
+	calls := strings.Join(runner.all(), "\n")
+	if !strings.Contains(calls, "nft list table ip fakeip_test") {
+		t.Fatalf("existence was not checked before deleting: %v", runner.all())
+	}
+	if strings.Contains(calls, "nft delete") {
+		t.Fatalf("an absent table still produced a delete: %v", runner.all())
 	}
 }
 
