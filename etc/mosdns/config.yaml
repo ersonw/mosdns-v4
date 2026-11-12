@@ -827,11 +827,11 @@ servers:
 # Permissions are role based. Every administrator chat gets one role, a role
 # holds permissions and may inherit other roles, and the inherited set is
 # unioned. Permission names:
-#   status      - /status /plugins /plugin /perm
-#   fakeip      - /fip plus /list /stats /lookup /rev /del /clear
+#   status      - /status /plugins /plugin /perm /net /ledger /audit
+#   fakeip      - /fip plus /list /stats /lookup /rev /del /clear, and /diag
 #   ocserv      - /vpn (occtl passthrough, including kick/term)
 #   radius      - /user (add/delete/disable RADIUS accounts, accounting sessions)
-#   config      - /config show|get|set|add|del|validate
+#   config      - /config show|get|set|add|del|validate, and /proxy /sweep
 #   reload      - /reload confirm
 #   exec_script - /exec <tag> <ip> <domain>, runs an already configured script
 #   admin       - every permission, built in for role "admin"
@@ -850,9 +850,32 @@ servers:
 #                 target. Default [radius].
 #   config_path - config file /config edits. Default: -c from the command line,
 #                 else etc/mosdns/config.yaml.
+#   audit_log - file that receives one JSON line per administration action
+#               (/config /proxy /sweep /reload /exec /fip), read back by
+#               /audit. Values are stripped: a config write keeps the key path,
+#               a proxy change keeps the verb. Default: <config dir>/
+#               telegram_bot_audit.log.
 #   proxy - optional HTTP(S) or SOCKS5 proxy for api.telegram.org.
 #   api_base - Telegram API root, for a mirror or tests.
 #   poll_timeout - long-polling timeout in seconds. Default 30.
+#
+# Data plane commands, all resolved by tag from fakeip_tags:
+#   /net [tag]      what is installed: plane (tun/nft), device, ipv4_range,
+#                   proxy on/off, mark on/off and table, outlet table, size of
+#                   the nft mark set, our lines of `ip rule show`, and the
+#                   default route of each table we own.
+#   /ledger [tag]   the fake_range_rule / tun_egress records a later run would
+#                   clean with, next to the live object counts.
+#   /sweep [tag] confirm
+#                   remove recorded objects the running configuration does not
+#                   own. Safe while the plugin is up; use it after a kill -9.
+#   /diag <domain> [tag]
+#                   one domain end to end: fake ip, real ips learned so far,
+#                   outlet (proxy or next_hop), mark state.
+#   /proxy [tag] | /proxy on <url> | /proxy off
+#                   read or write the fakeip proxy. Writes the config (backup
+#                   taken) and needs /reload confirm to take effect.
+#   /audit [n]      the last n administration actions.
 # -----------------------------------------------------------------------------
 #   - tag: admin_bot
 #     type: telegram_bot
@@ -875,6 +898,7 @@ servers:
 #       ocserv_tags: [ocserv]
 #       radius_tags: [radius]
 #       config_path: etc/mosdns/config.yaml
+#       audit_log: ""                     # default <config dir>/telegram_bot_audit.log
 #       proxy: ""
 #       api_base: https://api.telegram.org
 #       poll_timeout: 30

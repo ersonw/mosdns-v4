@@ -89,6 +89,9 @@ type Args struct {
 	// ConfigPath is the mosdns config file /config edits. Empty means:
 	// take -c from the process arguments, else "etc/mosdns/config.yaml".
 	ConfigPath string `yaml:"config_path"`
+	// AuditLog is where administration actions are appended, one JSON object per
+	// line. Empty means "<config dir>/telegram_bot_audit.log".
+	AuditLog string `yaml:"audit_log"`
 	// Proxy is an optional HTTP(S) or SOCKS5 proxy for api.telegram.org,
 	// e.g. "socks5://127.0.0.1:1080".
 	Proxy string `yaml:"proxy"`
@@ -200,6 +203,7 @@ type telegramBot struct {
 	adminMu    sync.Mutex
 	admin      mappingAdmin
 	adminCache map[string]mappingAdmin
+	plane      planeAdmin // set by tests; production resolves by tag
 
 	ocservMu    sync.Mutex
 	ocserv      ocservAdmin
@@ -332,7 +336,7 @@ func (p *telegramBot) onUpdate(ctx context.Context, b *tgbot.Bot, update *models
 }
 
 // handleText parses one command and returns the reply text.
-func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string) (string, error) {
+func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string) (reply string, err error) {
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) == 0 {
 		return "", nil
@@ -344,6 +348,19 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 
 	if err := p.require(chatID, requiredPermission(cmd)); err != nil {
 		return err.Error(), nil
+	}
+
+	// Every command that changes the system or the config file leaves one line
+	// in the audit log, whether it succeeded or not. The detail is sanitised
+	// before it is written, so no credential ends up in the file.
+	if isAuditedCommand(cmd) {
+		defer func() {
+			detail := auditDetail(cmd, fields[1:])
+			if err != nil {
+				detail = strings.TrimSpace(detail + " failed: " + err.Error())
+			}
+			p.recordAudit(chatID, cmd, detail)
+		}()
 	}
 
 	switch cmd {
@@ -370,6 +387,18 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 		return p.handleReload(fields[1:])
 	case "/exec":
 		return p.handleExec(ctx, fields[1:])
+	case "/net":
+		return p.handleNet(ctx, fields[1:])
+	case "/ledger":
+		return p.handleLedger(ctx, fields[1:])
+	case "/sweep":
+		return p.handleSweep(ctx, fields[1:])
+	case "/diag":
+		return p.handleDiag(ctx, fields[1:])
+	case "/proxy":
+		return p.handleProxy(ctx, fields[1:])
+	case "/audit":
+		return p.handleAudit(fields[1:])
 	case "/perm", "/whoami":
 		return p.handlePerm(chatID), nil
 	// Short forms kept for muscle memory; they are aliases of /fip <sub>.
@@ -710,6 +739,13 @@ const helpText = `mosdns admin bot
 /user pass <name> <pass>     replace a password
 /user enable|disable <name>  toggle authentication
 /user sessions [active] [n]  accounting sessions
+/net [tag]                   data plane: device, proxy, mark, rules, routes
+/ledger [tag]                recorded objects a later run would clean
+/sweep [tag] confirm         drop recorded objects this config does not own
+/diag <domain> [tag]         mapping, real ips and outlet for one domain
+/proxy [tag]                 proxy state of the fakeip plugin
+/proxy on <url>|off          write the proxy, then /reload confirm
+/audit [n]                   last administration actions
 /status                      process and plugin summary
 /plugins                     loaded plugins and their capabilities
 /plugin <tag>                one plugin: type, capabilities, config args

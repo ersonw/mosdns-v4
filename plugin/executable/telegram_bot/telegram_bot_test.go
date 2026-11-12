@@ -81,6 +81,9 @@ func newStubPlugin() *telegramBot {
 	bp := coremain.NewBP("test_bot", PluginType, zap.NewNop(), nil)
 	p := &telegramBot{BP: bp, args: &Args{ChatIDs: []int64{123}, FakeIPTag: "fakeip"}}
 	p.args.initDefault()
+	// Administration actions are audited; a test keeps them off the real file
+	// so the working tree stays clean. A test that checks the log sets its own.
+	p.args.AuditLog = os.DevNull
 	if acc, err := buildAccess(p.args); err == nil {
 		p.access = acc
 	}

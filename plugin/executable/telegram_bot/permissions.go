@@ -225,8 +225,10 @@ func requiredPermission(cmd string) string {
 		return PermOcserv
 	case "/user":
 		return PermRadius
-	case "/config":
+	case "/config", "/proxy", "/sweep":
 		return PermConfig
+	case "/diag":
+		return PermFakeIP
 	case "/reload":
 		return PermReload
 	case "/exec":

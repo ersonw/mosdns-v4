@@ -246,17 +246,21 @@ func (p *FakeIPNatPlugin) removeRecordedTunEgress(ctx context.Context, state str
 // sweepRecordedTunState removes exactly what the previous run recorded and keeps
 // what this run is about to own, so an edited range, an edited table or a switch
 // back to the NAT data path cannot leave a rule nobody can find again.
-func (p *FakeIPNatPlugin) sweepRecordedTunState(ctx context.Context, keepFakeRule, keepEgress string) {
+func (p *FakeIPNatPlugin) sweepRecordedTunState(ctx context.Context, keepFakeRule, keepEgress string) []string {
 	prevFakeRule, prevEgress := p.loadTunState(ctx)
+	var removed []string
 	if prevFakeRule != "" && prevFakeRule != keepFakeRule {
 		p.removeRecordedFakeRule(ctx, prevFakeRule)
+		removed = append(removed, "fake rule "+prevFakeRule)
 	}
 	if prevEgress != "" && prevEgress != keepEgress {
 		p.removeRecordedTunEgress(ctx, prevEgress)
+		removed = append(removed, "outlet "+prevEgress)
 	}
 	if prevFakeRule != keepFakeRule || prevEgress != keepEgress {
 		p.saveTunState(ctx, keepFakeRule, keepEgress)
 	}
+	return removed
 }
 
 // removeStaleMarkPath deletes the policy rule and the default route a previous

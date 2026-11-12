@@ -51,3 +51,45 @@ type Admin interface {
 	AdminClearMappings(ctx context.Context) (int64, error)
 	AdminStats(ctx context.Context) (Stats, error)
 }
+
+// Plane is what the data plane has installed on the machine right now, next to
+// the state the plugin recorded for a later cleanup. It exists so a control
+// surface can answer "what is actually running" without shell access: every
+// field is read from the plugin or from the kernel, never guessed.
+type Plane struct {
+	DataPlane   string            // "tun" or "nft"
+	Device      string            // tun device name, empty on the nft plane
+	Range       string            // ipv4_range
+	ProxyActive bool              // the proxy carries the answers
+	MarkEnabled bool              // route marking is in effect for this configuration
+	RouteMark   uint32            // route_mark value, 0 when unset
+	RouteTable  string            // table the mark rule points at
+	OutletTable string            // table the stack's own dials use (tun plane)
+	RealIPs     int               // elements in the nft mark set
+	Rules       []string          // our lines of "ip rule show"
+	Routes      []string          // default route of each table we own
+	Recorded    map[string]string // plugin_state rows a later run uses to clean
+}
+
+// Diagnosis answers "what happens to this domain": its mapping, the real
+// addresses the plane learned for it, and where the stack would dial from.
+type Diagnosis struct {
+	Domain      string
+	FakeIP      string
+	CreatedAt   int64
+	RealIPs     []string
+	RealIPKnown bool // false when the plane has not learned any real address yet
+	ProxyActive bool
+	Outlet      string // human readable: "proxy", "tun next_hop ...", "nft"
+	Marked      bool   // the mark path is in effect, so those warns can fire
+}
+
+// PlaneAdmin is implemented by a fakeip plugin next to Admin. It is a separate
+// interface so a surface that only lists mappings keeps working unchanged.
+type PlaneAdmin interface {
+	AdminPlane(ctx context.Context) (Plane, error)
+	AdminDiagnose(ctx context.Context, domain string) (Diagnosis, error)
+	// AdminSweep removes the objects a previous run recorded that this run does
+	// not own, and returns a line per removed object.
+	AdminSweep(ctx context.Context) ([]string, error)
+}

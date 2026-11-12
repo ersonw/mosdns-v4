@@ -378,8 +378,13 @@ accounting[0].secret = 换成一串随机字符
 长轮询 Telegram Bot，用来在没有 SSH 的场合看状态、改配置、跑脚本。启动即开始拉取
 `getUpdates`，`token` 缺失或 `chat_ids` 为空时插件保持禁用（不建连、不占线程）。每个 chat 绑定
 一个角色，角色决定它能发哪些命令；只列在 `chat_ids` 里的 chat 用 `default_role`（默认 `admin`）。
-常用命令：`/status`、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
+常用命令：`/status`、`/net`（数据面观测：tun 设备、代理是否生效、打标与表号、本插件在
+`ip rule show` 里的规则、出口表的 default、nft 标记集合大小）、`/ledger`（账本里记了哪些待清理对象）、
+`/sweep`（按账本删掉当前配置不拥有的残留，`kill -9` 之后可以手动收尾）、`/diag <domain>`（一次诊断：
+假 IP、已学到的真实 IP、出口是代理还是 `next_hop`）、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
 `/vpn`（查 ocserv 在线用户）、`/user`（增删改 RADIUS 账号、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
+`/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
+`/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、
 `/reload`（给进程发关闭信号，靠外部 supervisor 重新拉起）。`proxy` 可让 API 请求走
 HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
 插件之间通过 `fakeip_tags` / `ocserv_tags` / `radius_tags` 定位目标：列表第一个是默认，
@@ -401,6 +406,7 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       ocserv_tags: ["ocserv_user"]        # /vpn 可查询的 ocserv_ctl 插件 tag
       radius_tags: ["radius"]             # /user 可管理的 radius 插件 tag
       config_path: etc/mosdns/config.yaml # /config 改写的文件，留空取 -c 参数
+      audit_log: ""                       # 审计日志，留空取配置目录下 telegram_bot_audit.log
       proxy: ""                           # 例如 socks5://127.0.0.1:1080
       api_base: https://api.telegram.org
       poll_timeout: 30
