@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Add, delete or clean domains in a plain-text list.
+
+Input is messy by nature: URLs, wildcards, ports, trailing notes and pasted
+chat lines. Every line is reduced to bare lower-case domains first, validated
+against DNS label rules, then merged into the file as a sorted set.
+
+Examples:
+  python3 domain_manage.py google.com
+  python3 domain_manage.py add https://foo.com/path 'bar.com (backup)'
+  python3 domain_manage.py del foo.com
+  python3 domain_manage.py clean                 # rewrite the file, drop junk
+  cat list.txt | python3 domain_manage.py
+"""
+
+import ipaddress
+import os
+import re
+import stat
+import sys
+import tempfile
+
+DEFAULT_DOMAIN_FILE = "/etc/mosdns/rule/oversea_domains.txt"
+
+# A DNS name candidate. The lookarounds keep it from matching a suffix of a
+# longer broken token such as "foo_bar.com" or "foo..bar.com".
+_DOMAIN_RE = re.compile(
+    r"(?<![a-z0-9_.-])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?![a-z0-9_-])",
+    re.IGNORECASE,
+)
+
+
+def normalize_domain(candidate):
+    """Return a bare valid domain or None.
+
+    Drops the trailing dot, lower-cases, rejects IP literals, single labels,
+    empty labels, labels over 63 bytes and a numeric TLD. IDN input has to be
+    punycode already, because the regex only accepts ASCII.
+    """
+    if not candidate:
+        return None
+    domain = candidate.strip().strip(".").lower()
+    if not domain or len(domain) > 253:
+        return None
+    labels = domain.split(".")
+    if len(labels) < 2:
+        return None
+    for label in labels:
+        if not 1 <= len(label) <= 63:
+            return None
+        if label[0] == "-" or label[-1] == "-":
+            return None
+        if not re.fullmatch(r"[a-z0-9-]+", label):
+            return None
+    # A numeric TLD is never a domain, and this also rejects IPv4 literals.
+    if not any(ch.isalpha() for ch in labels[-1]):
+        return None
+    try:
+        ipaddress.ip_address(domain)
+        return None
+    except ValueError:
+        pass
+    return domain
+
+
+def extract_domains(line):
+    """Pull domains out of one raw line.
+
+    A URL contributes only its host, so a query string carrying another
+    domain does not leak into the list. Free-form lines (wildcards, ports,
+    trailing notes) fall back to scanning every domain-like token.
+    """
+    text = line.strip().lstrip("\ufeff")
+    if not text or text.startswith("#"):
+        return []
+
+    host = None
+    if "://" in text:
+        try:
+            from urllib.parse import urlsplit
+
+            host = urlsplit(text.split()[0]).hostname
+        except ValueError:
+            host = None
+    if host:
+        domain = normalize_domain(host)
+        if domain:
+            return [domain]
+
+    found = []
+    for match in _DOMAIN_RE.finditer(text):
+        domain = normalize_domain(match.group(0))
+        if domain:
+            found.append(domain)
+    return found
+
+
+def load_domains(path):
+    """Read the file and normalize every entry.
+
+    Returns (domains, cleaned, dropped). cleaned counts lines that were not
+    already a bare domain (URL, wildcard, duplicate text); dropped counts
+    lines with no usable domain at all.
+    """
+    domains = set()
+    cleaned = 0
+    dropped = 0
+    if not os.path.exists(path):
+        return domains, cleaned, dropped
+    if os.path.isdir(path):
+        raise SystemExit(f"Error: {path} is a directory")
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            text = line.strip()
+            if not text or text.startswith("#"):
+                continue
+            found = extract_domains(text)
+            if not found:
+                dropped += 1
+                cleaned += 1
+                continue
+            if len(found) != 1 or text.lower().rstrip(".") != found[0]:
+                cleaned += 1
+            domains.update(found)
+    return domains, cleaned, dropped
+
+
+def save_domains(path, domains):
+    """Write a sorted list atomically, keeping the original file mode."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".domain_manage.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for domain in sorted(domains):
+                f.write(domain + "\n")
+        try:
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        except FileNotFoundError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+USAGE = """Usage:
+  python3 domain_manage.py [file_path] domain1 [domain2 ...]
+  python3 domain_manage.py add|del [file_path] domain1 [domain2 ...]
+  python3 domain_manage.py clean [file_path]
+  cat domain_list.txt | python3 domain_manage.py [add|del] [file_path]
+
+Action defaults to add. file_path defaults to """ + DEFAULT_DOMAIN_FILE + """
+URLs, wildcards, ports and trailing notes are reduced to bare domains."""
+
+
+def parse_args(argv):
+    """Parse action / optional file / domains without argparse.
+
+    argparse cannot accept an optional path before the domains, and the old
+    script allowed exactly that ("script /path/file.txt domain").
+    """
+    args = list(argv)
+    if args and args[0] in ("-h", "--help"):
+        print(USAGE)
+        raise SystemExit(0)
+
+    action = "add"
+    if args and args[0].lower() in ("add", "del", "clean"):
+        action = args.pop(0).lower()
+
+    path = DEFAULT_DOMAIN_FILE
+    if args:
+        first = args[0].strip()
+        if "/" in first or first.lower().endswith((".txt", ".conf", ".list")):
+            path = args.pop(0)
+
+    return action, path, args
+
+
+def main(argv=None):
+    action, path, inputs = parse_args(sys.argv[1:] if argv is None else argv)
+
+    # Pipe mode only when nothing was passed as positional domains. clean
+    # never reads stdin, so "clean /path/file" cannot hang on a pipe.
+    if action != "clean" and not inputs and not sys.stdin.isatty():
+        raw = sys.stdin.read()
+        inputs = raw.splitlines()
+
+    valid = []
+    skipped = 0
+    for line in inputs:
+        found = extract_domains(line)
+        if not found:
+            skipped += 1
+            continue
+        valid.extend(found)
+
+    unique_input = set(valid)
+    duplicate_input = len(valid) - len(unique_input)
+
+    existing, cleaned, dropped = load_domains(path)
+    original = len(existing)
+
+    if action != "clean" and not unique_input:
+        print("Error: no valid domain found in input", file=sys.stderr)
+        return 1
+
+    changed = 0
+    if action == "add":
+        for domain in unique_input:
+            if domain not in existing:
+                existing.add(domain)
+                changed += 1
+    elif action == "del":
+        for domain in unique_input:
+            if domain in existing:
+                existing.discard(domain)
+                changed += 1
+
+    # clean rewrites even when only the existing entries needed fixing.
+    if changed > 0 or (action == "clean" and cleaned > 0):
+        save_domains(path, existing)
+
+    print(f"File     : {path}")
+    print(f"Action   : {action}")
+    print(f"Input    : {len(inputs)} lines, {len(unique_input)} valid"
+          f", {duplicate_input} duplicate, {skipped} skipped")
+    print(f"Existing : {original} entries, {cleaned} normalized/dropped"
+          f" ({dropped} with no domain)")
+    print(f"Changed  : {changed} entries")
+    print(f"Total    : {len(existing)} entries")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
