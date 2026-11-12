@@ -177,9 +177,24 @@ type FakeIPNatPlugin struct {
 	aggMu   sync.Mutex
 	aggStop chan struct{}
 	aggDone chan struct{}
-	natMu   sync.Mutex // serializes nft / ip command sequences
-	runner  cmdRunner
-	probe   func(ctx context.Context, ip string) bool
+	// ledger keeps every installed prefix in memory and writes it behind, so an
+	// answer never waits on SQLite for a route it just installed.
+	ledger   *routeLedger
+	ledgerMu sync.Mutex
+	// maintMu guards the maintenance loop: it flushes the ledger and re-resolves
+	// the system default route, none of which belongs on the answer path.
+	maintMu   sync.Mutex
+	maintStop chan struct{}
+	maintDone chan struct{}
+	// sysHop / sysDev cache the system default route for the same reason: a
+	// shell call per answer is what made the fallback look slow.
+	sysMu    sync.Mutex
+	sysHop   string
+	sysDev   string
+	sysValid bool
+	natMu    sync.Mutex // serializes nft / ip command sequences
+	runner   cmdRunner
+	probe    func(ctx context.Context, ip string) bool
 
 	// TUN data path: the whole ipv4_range is routed to a device requested from
 	// the system instead of being DNAT-ed hop by hop.
@@ -294,8 +309,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		if !supportsNamedRouteTable() {
 			return nil, fmt.Errorf("route_mark is only supported on linux")
 		}
-		if cfg.UseTun {
-			return nil, fmt.Errorf("route_mark and use_tun are mutually exclusive")
+		// In tun mode the marks are what pulls realip answers into the device, so
+		// the combination only makes sense there with realip. Fakeip already
+		// enters the device as a whole range, and marking would steer the stack's
+		// own dials back into it.
+		if cfg.UseTun && !cfg.RealIP {
+			return nil, fmt.Errorf("route_mark with use_tun needs realip: marking the real answers is what routes them into the device")
 		}
 		if cfg.RouteTable == "main" {
 			return nil, fmt.Errorf("route_mark needs route_table to name a dedicated table, not main")
@@ -475,6 +494,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	p.conn = newConntrack(defaultConntrackSize, defaultConntrackTTL)
 	p.runtime = newRuntimeMap()
 
+	// The ledger is read once here: the sweep below and every later cleanup
+	// work from this copy instead of querying SQLite again.
+	ledgerCtx, ledgerCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := p.loadLedger(ledgerCtx); err != nil {
+		p.L().Warn("fakeip nat: load route ledger into memory failed", zap.Error(err))
+	}
+	ledgerCancel()
+
 	// Restore what earlier runs already mapped before any traffic arrives, so
 	// the first query for a known domain is answered from memory.
 	restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -487,17 +514,24 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if !p.useTun && !p.realIP {
 		p.reconcileFirewallMappings(restoreCtx)
 	}
+	if err := p.restoreRealIPs(restoreCtx); err != nil {
+		p.L().Warn("fakeip nat: restore real ip table failed", zap.Error(err))
+	}
 	restoreCancel()
 
 	// Stale mappings are dropped in the background, so a database that has been
 	// growing for months does not need a manual vacuum.
 	p.startRecordRetention()
 
+	// Everything the data path needs is now in memory: the maintenance loop only
+	// keeps the durable copies fresh.
+	p.startMaintenance()
+
 	// The proxy is the outlet of the tun data path only: the NAT data path is
 	// kernel DNAT and never sees the connection. An unusable proxy degrades to
 	// direct egress instead of blocking startup, but it is logged as an error.
-	if cfg.RealIP && cfg.UseTun {
-		p.L().Warn("realip has no effect with use_tun: the tun data path routes the whole fake range instead of real IPs")
+	if cfg.RealIP && cfg.UseTun && !p.markRoutingEnabled() {
+		p.L().Warn("realip has no effect with use_tun unless route_mark is set: without marks the answers keep their real addresses but nothing routes them into the device")
 	}
 	if cfg.Proxy != "" {
 		dialer, err := newEgress(cfg.Proxy, cfg.ProxyInsecure)
@@ -587,13 +621,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// before the first route of this run is written, so the two never mix.
 	p.sweepResidualRoutes()
 
-	// Mark routing belongs to the non-tun data path only: with a tun device the
-	// whole ipv4_range is already routed into it, so marking would steer the
-	// same packets twice. The config loader rejects route_mark + use_tun, and
-	// this second check keeps a programmatically built plugin from installing
-	// objects nobody asked for.
-	if p.routeMark != 0 && p.useTun {
-		p.L().Warn("route_mark is ignored in tun mode: the tun data path owns the mapped addresses",
+	// In tun mode the mark path belongs to realip: fakeip already routes the
+	// whole range into the device, so there is nothing for a mark to decide. The
+	// config loader rejects that combination; this keeps a programmatically
+	// built plugin from installing objects nobody asked for.
+	if p.routeMark != 0 && p.useTun && !p.realIP {
+		p.L().Warn("route_mark is ignored in tun mode without realip: the tun data path owns the fake range",
 			zap.Uint32("route_mark", p.routeMark))
 	}
 
@@ -776,6 +809,12 @@ func (p *FakeIPNatPlugin) stopRouteAggregation() {
 func (p *FakeIPNatPlugin) Close() error {
 	p.L().Debug("fakeip nat: closing plugin")
 	p.stopRouteAggregation()
+	p.stopMaintenance()
+	// The routes are about to be deleted, so the record is flushed once before
+	// that: a crash in the middle of the cleanup still leaves a complete ledger.
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), natTimeout)
+	p.flushLedger(flushCtx)
+	flushCancel()
 	p.cleanupDataPath()
 	p.stopRecordRetention()
 	p.stopTunDataPath()
@@ -1090,8 +1129,21 @@ func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, real
 		return nil
 	}
 	b.WriteString(" ON CONFLICT(domain, real_ip) DO UPDATE SET last_seen = excluded.last_seen")
-	_, err := p.db.ExecContext(ctx, b.String(), args...)
-	return err
+	if _, err := p.db.ExecContext(ctx, b.String(), args...); err != nil {
+		return err
+	}
+	// The write went through, so the memory table takes the same rows: the next
+	// lookup is answered without asking SQLite again.
+	if p.runtime != nil {
+		kept := make([]string, 0, len(realIPs))
+		for _, ip := range realIPs {
+			if !p.isFakeAddrString(ip) {
+				kept = append(kept, ip)
+			}
+		}
+		p.runtime.putReal(domain, kept)
+	}
+	return nil
 }
 
 // dispatchNAT maps one fake ip to a real ip and reports whether the data plane

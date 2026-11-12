@@ -97,3 +97,24 @@ func TestReconcileFirewallMappings(t *testing.T) {
 		t.Fatalf("refilled mapping has no host route, calls: %v", fr.all())
 	}
 }
+
+// TestRuntimeRealIPsSurviveAndDrop pins the newest-ip cache: a realip run fills
+// it without a byDomain entry, and an expired domain must not keep its
+// addresses alive after the entry is removed.
+func TestRuntimeRealIPsSurviveAndDrop(t *testing.T) {
+	m := newRuntimeMap()
+	m.putReal("a.example", []string{"93.184.216.34"})
+	if got := m.realSize(); got != 1 {
+		t.Fatalf("realSize = %d, want 1", got)
+	}
+	if ips := m.realsOf("a.example"); len(ips) != 1 || ips[0] != "93.184.216.34" {
+		t.Fatalf("realsOf = %v", ips)
+	}
+	m.remove("a.example")
+	if ips := m.realsOf("a.example"); len(ips) != 0 {
+		t.Fatalf("removed domain still holds %v", ips)
+	}
+	if got := m.realSize(); got != 0 {
+		t.Fatalf("realSize = %d after removal, want 0", got)
+	}
+}

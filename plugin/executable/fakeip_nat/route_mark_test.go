@@ -41,9 +41,9 @@ func TestMarkRoutingInstallsSetChainsAndRule(t *testing.T) {
 	want := []string{
 		"nft add set ip fakeip_test real_ipv4",
 		"nft add chain ip fakeip_test mark_prerouting",
-		"nft add rule ip fakeip_test mark_prerouting ip daddr @real_ipv4 meta mark set 256",
+		"nft add rule ip fakeip_test mark_prerouting ip daddr @real_ipv4 ip saddr != 198.18.0.0/16 meta mark set 256",
 		"nft add chain ip fakeip_test mark_output",
-		"nft add rule ip fakeip_test mark_output ip daddr @real_ipv4 meta mark set 256",
+		"nft add rule ip fakeip_test mark_output ip daddr @real_ipv4 ip saddr != 198.18.0.0/16 meta mark set 256",
 		"ip route replace default via 10.9.8.7 dev eth1 table oversea",
 		"ip rule add fwmark 256 lookup oversea prio 1000",
 	}
@@ -348,20 +348,48 @@ func TestDefaultRoutePresent(t *testing.T) {
 	}
 }
 
-// TestMarkRoutingSkipsTunMode pins the non-tun-only rule: with use_tun the
-// marking path is disabled even when route_mark is set, so neither setup nor
-// cleanup touches the kernel.
-func TestMarkRoutingSkipsTunMode(t *testing.T) {
+// TestMarkRoutingSkipsTunModeWithoutRealIP pins the remaining limit: fakeip +
+// tun already enters the device as a whole range, so a mark would only steer
+// the stack's own dials back into it. Neither setup nor cleanup touches the
+// kernel in that shape.
+func TestMarkRoutingSkipsTunModeWithoutRealIP(t *testing.T) {
 	runner := &fakeRunner{}
 	p := newMarkPlugin(t, runner)
 	p.useTun = true
 
 	if p.markRoutingEnabled() {
-		t.Fatalf("mark routing must stay disabled in tun mode")
+		t.Fatalf("mark routing must stay disabled with fakeip in tun mode")
 	}
 	p.cleanupMarkRouting(context.Background())
 	if calls := runner.all(); len(calls) != 0 {
 		t.Fatalf("cleanup in tun mode issued commands: %v", calls)
+	}
+}
+
+// TestMarkRoutingInTunModePointsTheTableAtTheDevice covers the realip + tun
+// shape: the marked destinations are routed into the device the plugin owns,
+// not at a next hop, because the device is what carries them (through the
+// proxy, or the outlet route when there is none).
+func TestMarkRoutingInTunModePointsTheTableAtTheDevice(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newMarkPlugin(t, runner)
+	p.useTun = true
+	p.realIP = true
+	p.tunDev = "mth0"
+	p.nextHop = "10.9.8.7"
+	p.nextHopDev = "eth1"
+
+	if !p.markRoutingEnabled() {
+		t.Fatalf("mark routing must be enabled for realip in tun mode")
+	}
+	if err := p.setupMarkRouting(context.Background()); err != nil {
+		t.Fatalf("setupMarkRouting failed: %v", err)
+	}
+	if _, ok := runner.find("ip route replace default dev mth0 table oversea"); !ok {
+		t.Fatalf("marked traffic was not pointed at the device:\n%s", strings.Join(runner.all(), "\n"))
+	}
+	if _, ok := runner.find("via 10.9.8.7"); ok {
+		t.Fatalf("tun mode must not route marked traffic at the next hop:\n%s", strings.Join(runner.all(), "\n"))
 	}
 }
 

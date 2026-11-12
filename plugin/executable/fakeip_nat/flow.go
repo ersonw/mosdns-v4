@@ -224,6 +224,24 @@ func (p *FakeIPNatPlugin) domainForFakeIP(ctx context.Context, fakeIP string) (s
 // fake address, or a row written before this guard existed, would otherwise
 // become the destination every outlet is told to reach.
 func (p *FakeIPNatPlugin) primaryRealIP(ctx context.Context, domain string) (netip.Addr, error) {
+	// The startup load keeps the newest few real ips of every domain in memory,
+	// and every answer that records ips updates it, so the normal path never
+	// reaches SQLite.
+	if p.runtime != nil {
+		for _, raw := range p.runtime.realsOf(domain) {
+			if p.isFakeAddrString(raw) {
+				continue
+			}
+			addr, err := netip.ParseAddr(raw)
+			if err != nil || !addr.Is4() {
+				continue
+			}
+			p.L().Debug("fakeip nat: real ip selected from the memory table",
+				zap.String("domain", domain), zap.String("real_ip", addr.String()))
+			return addr, nil
+		}
+	}
+
 	const scanLimit = 64
 	rows, err := p.db.QueryContext(ctx,
 		"SELECT real_ip FROM "+p.ipTable+" WHERE domain = ? ORDER BY last_seen DESC LIMIT ?",
@@ -250,6 +268,9 @@ func (p *FakeIPNatPlugin) primaryRealIP(ctx context.Context, domain string) (net
 			p.L().Debug("fakeip nat: stored real ip is invalid",
 				zap.String("domain", domain), zap.String("real_ip", raw))
 			continue
+		}
+		if p.runtime != nil {
+			p.runtime.putReal(domain, []string{addr.String()})
 		}
 		p.L().Debug("fakeip nat: real ip selected", zap.String("domain", domain), zap.String("real_ip", addr.String()))
 		return addr, nil

@@ -14,6 +14,7 @@ package fakeipnat
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -27,42 +28,203 @@ type ledgerRoute struct {
 	routeTable string
 }
 
-// rememberManagedRoute records a prefix that was just installed. The write is
-// best effort: losing the row leaves one route behind, which is strictly better
-// than failing the data path.
+// routeLedger holds the rows in memory and writes them behind. A route is
+// installed while an answer is being produced, so a SQLite round trip per
+// prefix is paid on every answer; the rows are flushed by the maintenance loop
+// and once more before the plugin removes its routes.
+//
+// The memory copy is also what the cleanup reads: once loaded, no step of the
+// data path or of the sweep has to ask SQLite again.
+type routeLedger struct {
+	mu      sync.Mutex
+	rows    map[string]ledgerRoute // prefix -> row as installed
+	dirty   map[string]bool        // prefixes written since the last flush
+	removed map[string]bool        // prefixes forgotten since the last flush
+	loaded  bool
+}
+
+func newRouteLedger() *routeLedger {
+	return &routeLedger{
+		rows:    make(map[string]ledgerRoute),
+		dirty:   make(map[string]bool),
+		removed: make(map[string]bool),
+	}
+}
+
+func (l *routeLedger) remember(r ledgerRoute) {
+	if r.prefix == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rows[r.prefix] = r
+	l.dirty[r.prefix] = true
+	delete(l.removed, r.prefix)
+}
+
+func (l *routeLedger) forget(prefix string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.rows[prefix]; ok {
+		delete(l.rows, prefix)
+	}
+	delete(l.dirty, prefix)
+	l.removed[prefix] = true
+}
+
+func (l *routeLedger) replace(rows []ledgerRoute) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rows = make(map[string]ledgerRoute, len(rows))
+	for _, r := range rows {
+		l.rows[r.prefix] = r
+	}
+	l.dirty = make(map[string]bool)
+	l.removed = make(map[string]bool)
+	l.loaded = true
+}
+
+// mergeLoaded adds the rows read from SQLite without dropping anything the
+// data path already recorded since startup.
+func (l *routeLedger) mergeLoaded(rows []ledgerRoute) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range rows {
+		if _, ok := l.rows[r.prefix]; ok {
+			continue
+		}
+		l.rows[r.prefix] = r
+	}
+	l.loaded = true
+}
+
+func (l *routeLedger) snapshot() []ledgerRoute {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]ledgerRoute, 0, len(l.rows))
+	for _, r := range l.rows {
+		out = append(out, r)
+	}
+	return out
+}
+
+func (l *routeLedger) size() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.rows)
+}
+
+func (l *routeLedger) isLoaded() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.loaded
+}
+
+// takePending hands the writes and deletions since the last flush to the
+// caller, so a failed transaction can put them back with restore.
+func (l *routeLedger) takePending() ([]ledgerRoute, []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.dirty) == 0 && len(l.removed) == 0 {
+		return nil, nil
+	}
+	upserts := make([]ledgerRoute, 0, len(l.dirty))
+	for prefix := range l.dirty {
+		if r, ok := l.rows[prefix]; ok {
+			upserts = append(upserts, r)
+		}
+	}
+	deletes := make([]string, 0, len(l.removed))
+	for prefix := range l.removed {
+		deletes = append(deletes, prefix)
+	}
+	l.dirty = make(map[string]bool)
+	l.removed = make(map[string]bool)
+	return upserts, deletes
+}
+
+func (l *routeLedger) restorePending(upserts []ledgerRoute, deletes []string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, r := range upserts {
+		l.dirty[r.prefix] = true
+	}
+	for _, prefix := range deletes {
+		l.removed[prefix] = true
+	}
+}
+
+func (l *routeLedger) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.rows = make(map[string]ledgerRoute)
+	l.dirty = make(map[string]bool)
+	l.removed = make(map[string]bool)
+}
+
+// rememberManagedRoute records a prefix that was just installed. It only
+// touches memory: the answer path must not wait on the database.
 func (p *FakeIPNatPlugin) rememberManagedRoute(ctx context.Context, prefix, hop, dev string) {
 	if p.routesTable == "" {
 		return
 	}
-	_, err := p.db.ExecContext(ctx,
-		fmt.Sprintf("INSERT INTO %s (prefix, next_hop, dev, route_table, created_at) VALUES (?, ?, ?, ?, ?) "+
-			"ON CONFLICT(prefix) DO UPDATE SET next_hop = excluded.next_hop, dev = excluded.dev, route_table = excluded.route_table",
-			p.routesTable),
-		prefix, hop, dev, p.hostRouteTable(), time.Now().Unix())
-	if err != nil {
-		p.L().Warn("fakeip nat: record managed route failed",
-			zap.String("prefix", prefix), zap.String("route_table", p.hostRouteTable()), zap.Error(err))
+	if p.ledger == nil {
+		p.ledger = newRouteLedger()
 	}
+	p.ledger.remember(ledgerRoute{prefix: prefix, nextHop: hop, dev: dev, routeTable: p.hostRouteTable()})
 }
 
 // forgetManagedRoute drops a prefix from the ledger once it no longer exists in
 // the routing table.
 func (p *FakeIPNatPlugin) forgetManagedRoute(ctx context.Context, prefix string) {
-	if p.routesTable == "" {
+	if p.routesTable == "" || p.ledger == nil {
 		return
 	}
-	if _, err := p.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE prefix = ?", p.routesTable), prefix); err != nil {
-		p.L().Debug("fakeip nat: forget managed route failed",
-			zap.String("prefix", prefix), zap.Error(err))
-	}
+	p.ledger.forget(prefix)
 }
 
-// ledgerRoutes reads every recorded prefix with the values it was installed
-// with.
+// loadLedger fills the memory copy once, at startup. A failure is not fatal:
+// the plugin keeps running with whatever it could read.
+func (p *FakeIPNatPlugin) loadLedger(ctx context.Context) error {
+	if p.routesTable == "" {
+		p.ledger = newRouteLedger()
+		return nil
+	}
+	if p.ledger == nil {
+		p.ledger = newRouteLedger()
+	}
+	routes, err := p.readLedger(ctx)
+	if err != nil {
+		return err
+	}
+	p.ledger.replace(routes)
+	p.L().Debug("fakeip nat: route ledger loaded into memory", zap.Int("rows", len(routes)))
+	return nil
+}
+
+// ledgerRoutes returns every recorded prefix with the values it was installed
+// with. Once loaded this is a memory read; SQLite is only asked when nothing
+// has been loaded yet (a unit test, or a plugin built without Init).
 func (p *FakeIPNatPlugin) ledgerRoutes(ctx context.Context) ([]ledgerRoute, error) {
 	if p.routesTable == "" {
 		return nil, nil
 	}
+	if p.ledger == nil {
+		p.ledger = newRouteLedger()
+	}
+	if !p.ledger.isLoaded() {
+		// Rows written before the load are not lost: the database fills the gaps
+		// and anything already in memory wins.
+		routes, err := p.readLedger(ctx)
+		if err != nil {
+			return nil, err
+		}
+		p.ledger.mergeLoaded(routes)
+	}
+	return p.ledger.snapshot(), nil
+}
+
+func (p *FakeIPNatPlugin) readLedger(ctx context.Context) ([]ledgerRoute, error) {
 	rows, err := p.db.QueryContext(ctx,
 		fmt.Sprintf("SELECT prefix, next_hop, dev, route_table FROM %s", p.routesTable))
 	if err != nil {
@@ -81,14 +243,117 @@ func (p *FakeIPNatPlugin) ledgerRoutes(ctx context.Context) ([]ledgerRoute, erro
 	return out, rows.Err()
 }
 
+// flushLedger writes the pending rows and deletions in one transaction. Called
+// from the maintenance loop and on shutdown; a failure puts them back so the
+// next tick retries instead of silently dropping the record.
+func (p *FakeIPNatPlugin) flushLedger(ctx context.Context) {
+	if p.routesTable == "" || p.ledger == nil {
+		return
+	}
+	upserts, deletes := p.ledger.takePending()
+	if len(upserts) == 0 && len(deletes) == 0 {
+		return
+	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		p.ledger.restorePending(upserts, deletes)
+		p.L().Warn("fakeip nat: flush route ledger failed", zap.Error(err))
+		return
+	}
+	for _, prefix := range deletes {
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE prefix = ?", p.routesTable), prefix); err != nil {
+			_ = tx.Rollback()
+			p.ledger.restorePending(upserts, deletes)
+			p.L().Warn("fakeip nat: flush route ledger failed", zap.Error(err))
+			return
+		}
+	}
+	for _, r := range upserts {
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("INSERT INTO %s (prefix, next_hop, dev, route_table, created_at) VALUES (?, ?, ?, ?, ?) "+
+				"ON CONFLICT(prefix) DO UPDATE SET next_hop = excluded.next_hop, dev = excluded.dev, route_table = excluded.route_table",
+				p.routesTable),
+			r.prefix, r.nextHop, r.dev, r.routeTable, time.Now().Unix()); err != nil {
+			_ = tx.Rollback()
+			p.ledger.restorePending(upserts, deletes)
+			p.L().Warn("fakeip nat: flush route ledger failed", zap.Error(err))
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		p.ledger.restorePending(upserts, deletes)
+		p.L().Warn("fakeip nat: flush route ledger failed", zap.Error(err))
+		return
+	}
+	p.L().Debug("fakeip nat: route ledger flushed", zap.Int("upserts", len(upserts)), zap.Int("deletes", len(deletes)))
+}
+
 // clearLedger empties the record after its prefixes were removed.
 func (p *FakeIPNatPlugin) clearLedger(ctx context.Context) {
 	if p.routesTable == "" {
 		return
 	}
+	if p.ledger != nil {
+		p.ledger.reset()
+	}
 	if _, err := p.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", p.routesTable)); err != nil {
 		p.L().Warn("fakeip nat: clear route ledger failed", zap.Error(err))
 	}
+}
+
+// startMaintenance runs the loop that keeps the durable copies fresh without
+// putting any of that work on the answer path: the route ledger is flushed and
+// the system default route is re-resolved for the next data path use.
+func (p *FakeIPNatPlugin) startMaintenance() {
+	if p.useTun {
+		return
+	}
+	p.maintMu.Lock()
+	if p.maintStop != nil {
+		p.maintMu.Unlock()
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	p.maintStop, p.maintDone = stop, done
+	p.maintMu.Unlock()
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(routeAggInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				p.flushLedger(context.Background())
+				return
+			case <-ticker.C:
+				p.flushLedger(context.Background())
+				p.refreshFallbackHopDev()
+			}
+		}
+	}()
+	p.L().Debug("fakeip nat: maintenance loop started",
+		zap.Duration("interval", routeAggInterval), zap.Int("ledger_rows", p.ledgerSize()))
+}
+
+func (p *FakeIPNatPlugin) stopMaintenance() {
+	p.maintMu.Lock()
+	stop, done := p.maintStop, p.maintDone
+	p.maintStop, p.maintDone = nil, nil
+	p.maintMu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	<-done
+}
+
+func (p *FakeIPNatPlugin) ledgerSize() int {
+	if p.ledger == nil {
+		return 0
+	}
+	return p.ledger.size()
 }
 
 // sweepLedgerRoutes deletes every prefix the ledger names, using the route table

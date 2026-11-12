@@ -433,10 +433,20 @@ func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
 // the egress can dial. With a working proxy the domain goes straight to the
 // proxy, otherwise the fake IP is resolved back to the most recent real IP.
 func (p *FakeIPNatPlugin) dialTarget(localAddr string, port uint16) (string, error) {
-	fake, err := netip.ParseAddr(localAddr)
+	addr, err := netip.ParseAddr(localAddr)
 	if err != nil {
 		return "", fmt.Errorf("unexpected destination %q: %w", localAddr, err)
 	}
+	// A real destination reaches the device when the mark path routed it here.
+	// There is no fake ip to resolve, so the address itself is the target, and
+	// the proxy or the pinned outlet carries it like any other flow.
+	if !p.isFakeAddr(addr) {
+		target := net.JoinHostPort(addr.String(), strconv.Itoa(int(port)))
+		p.L().Debug("fakeip nat: real destination enters the device",
+			zap.String("destination", addr.String()), zap.String("target", target))
+		return target, nil
+	}
+	fake := addr
 	ctx, cancel := context.WithTimeout(context.Background(), tunTargetTimeout)
 	defer cancel()
 
@@ -506,10 +516,19 @@ func (p *FakeIPNatPlugin) fakeTarget(target string) bool {
 // when a proxy is configured: the supported proxies only carry TCP, so a UDP
 // flow must leave direct and must never be handed a domain.
 func (p *FakeIPNatPlugin) realTarget(localAddr string, port uint16) (string, error) {
-	fake, err := netip.ParseAddr(localAddr)
+	addr, err := netip.ParseAddr(localAddr)
 	if err != nil {
 		return "", fmt.Errorf("unexpected destination %q: %w", localAddr, err)
 	}
+	// UDP of a real destination: the address is already the target, and UDP
+	// always leaves direct because the supported proxies carry TCP only.
+	if !p.isFakeAddr(addr) {
+		target := net.JoinHostPort(addr.String(), strconv.Itoa(int(port)))
+		p.L().Debug("fakeip nat: real udp destination enters the device",
+			zap.String("destination", addr.String()), zap.String("target", target))
+		return target, nil
+	}
+	fake := addr
 	ctx, cancel := context.WithTimeout(context.Background(), tunTargetTimeout)
 	defer cancel()
 

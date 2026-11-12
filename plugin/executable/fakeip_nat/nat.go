@@ -250,13 +250,9 @@ func parseNFTMappings(out string) map[string]string {
 // applyHostRoute points a real ip at the egress gateway. Without next_hop and
 // next_hop_dev there is nothing to steer, so the route is skipped.
 func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev string) {
-	if hop == "" && dev == "" {
-		p.L().Debug("fakeip nat: host route skipped, no next hop and no device", zap.String("real_ip", ip))
-		return
-	}
 	// Mark routing carries the mapped addresses as nft set members instead of
-	// host routes. A success here means there is nothing left to write: the
-	// dedicated table already routes every marked destination.
+	// host routes. It is checked before the gateway: under marks the address
+	// needs no route of its own, so an empty next_hop must not skip the write.
 	if p.markActiveNow() {
 		if err := p.markRealIP(ctx, ip); err == nil {
 			p.L().Debug("fakeip nat: real ip marked for the dedicated table",
@@ -266,6 +262,10 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 			p.L().Warn("fakeip nat: marking the real ip failed, falling back to a host route",
 				zap.String("real_ip", ip), zap.Error(err))
 		}
+	}
+	if hop == "" && dev == "" {
+		p.L().Debug("fakeip nat: host route skipped, no next hop and no device", zap.String("real_ip", ip))
+		return
 	}
 
 	// Mark routing owns route_table, so a fallback host route goes to the table
@@ -616,13 +616,17 @@ func (p *FakeIPNatPlugin) syncRealRoutes(ctx context.Context, ips []string) {
 	ctx, cancel := context.WithTimeout(ctx, natTimeout)
 	defer cancel()
 
-	hop, dev := p.nextHop, p.nextHopDev
-	if hop == "" && dev == "" {
-		hop, dev = p.systemDefaultRoute(ctx)
-	}
-	if hop == "" && dev == "" {
-		p.L().Debug("realip: no next hop and no device, routes not installed")
-		return
+	// Under marks the addresses only go into the nft set, so no gateway is
+	// needed; resolving one would be a wasted call on the answer path.
+	var hop, dev string
+	if !p.markActiveNow() {
+		// Resolved once and cached: this runs on every answer, and asking the
+		// kernel for the default route each time is a process spawn per query.
+		hop, dev = p.fallbackHopDev(ctx)
+		if hop == "" && dev == "" {
+			p.L().Debug("realip: no next hop and no device, routes not installed")
+			return
+		}
 	}
 
 	p.natMu.Lock()
@@ -730,6 +734,42 @@ func (p *FakeIPNatPlugin) dbCandidates(ctx context.Context, domain string) ([]st
 
 // systemDefaultRoute is the fallback for configurations without next_hop. The
 // command shape is platform specific, so the query lives in default_route_*.go.
+// fallbackHopDev returns the gateway/device a host route should use when the
+// configuration left them empty. The system default route is resolved once and
+// cached: this sits on the answer path, where a shell call per query is the
+// difference between a fast and a slow plugin. refreshFallbackHopDev is called
+// by the maintenance loop, so a default route change is picked up within one
+// interval instead of never.
+func (p *FakeIPNatPlugin) fallbackHopDev(ctx context.Context) (hop, dev string) {
+	if p.nextHop != "" || p.nextHopDev != "" {
+		return p.nextHop, p.nextHopDev
+	}
+	p.sysMu.Lock()
+	defer p.sysMu.Unlock()
+	if p.sysValid {
+		return p.sysHop, p.sysDev
+	}
+	hop, dev = p.systemDefaultRoute(ctx)
+	if hop != "" || dev != "" {
+		p.sysHop, p.sysDev, p.sysValid = hop, dev, true
+		p.L().Debug("fakeip nat: system default route cached",
+			zap.String("next_hop", hop), zap.String("dev", dev))
+	}
+	return hop, dev
+}
+
+// refreshFallbackHopDev drops the cached default route so the next data path
+// use resolves it again. Called from the maintenance loop; the lock is taken so
+// a refresh cannot race a read.
+func (p *FakeIPNatPlugin) refreshFallbackHopDev() {
+	if p.nextHop != "" || p.nextHopDev != "" {
+		return
+	}
+	p.sysMu.Lock()
+	p.sysValid = false
+	p.sysMu.Unlock()
+}
+
 func (p *FakeIPNatPlugin) systemDefaultRoute(ctx context.Context) (hop, dev string) {
 	hop, dev = readSystemDefaultRoute(ctx, p.runner)
 	if hop != "" || dev != "" {

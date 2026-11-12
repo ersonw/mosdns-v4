@@ -3,6 +3,7 @@ package fakeipnat
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -183,5 +184,28 @@ func TestStackAnswersSYNFromFakeIP(t *testing.T) {
 	const synAck = 0x12
 	if flags&synAck != synAck {
 		t.Fatalf("tcp flags = %#x, want SYN|ACK", flags)
+	}
+}
+
+// TestDialTargetAcceptsRealDestination covers the realip + tun shape: a marked
+// destination has already been routed into the device, so the stack has to dial
+// the address itself instead of looking for a fake ip mapping that cannot exist.
+func TestDialTargetAcceptsRealDestination(t *testing.T) {
+	p := newNativePlugin(t, &fakeRunner{}, nil)
+	for _, in := range []struct {
+		addr string
+		port uint16
+	}{{"93.184.216.34", 443}, {"203.0.113.9", 80}} {
+		target, err := p.dialTarget(in.addr, in.port)
+		if err != nil {
+			t.Fatalf("dialTarget(%s) failed: %v", in.addr, err)
+		}
+		want := fmt.Sprintf("%s:%d", in.addr, in.port)
+		if target != want {
+			t.Fatalf("target = %q, want %q", target, want)
+		}
+		if p.isFakeAddrString(in.addr) {
+			t.Fatalf("%s must not be treated as a fake address", in.addr)
+		}
 	}
 }

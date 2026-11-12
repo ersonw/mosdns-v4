@@ -25,8 +25,18 @@ func TestLedgerRecordsInstalledRoutes(t *testing.T) {
 	p.applyHostRoute(ctx, "1.2.3.4", "11.10.12.1", "wg0")
 	p.applyHostRoute(ctx, "5.6.7.8", "11.10.12.1", "wg0")
 
+	// The answer path must not wait on SQLite: both rows are in memory, and the
+	// database still has none.
+	if got := p.ledgerSize(); got != 2 {
+		t.Fatalf("memory rows = %d, want 2", got)
+	}
+	if got := ledgerRowCount(t, p); got != 0 {
+		t.Fatalf("database rows = %d before the flush, want 0", got)
+	}
+
+	p.flushLedger(ctx)
 	if got := ledgerRowCount(t, p); got != 2 {
-		t.Fatalf("ledger rows = %d, want 2", got)
+		t.Fatalf("ledger rows = %d after the flush, want 2", got)
 	}
 
 	routes, err := p.ledgerRoutes(ctx)
@@ -108,5 +118,27 @@ func TestCleanupEmptiesTheLedger(t *testing.T) {
 	runner := p.runner.(*fakeRunner)
 	if !strings.Contains(strings.Join(runner.all(), "\n"), "1.2.3.4") {
 		t.Fatalf("cleanup issued no command for the recorded prefix: %v", runner.all())
+	}
+}
+
+// TestLedgerForgetReachesTheDatabase pins the other direction: a prefix removed
+// from memory is deleted from the record by the next flush, not immediately.
+func TestLedgerForgetReachesTheDatabase(t *testing.T) {
+	p := newRealIPPlugin(t, true)
+	ctx := context.Background()
+
+	p.rememberManagedRoute(ctx, "1.2.3.4/32", "11.10.12.1", "wg0")
+	p.flushLedger(ctx)
+	if got := ledgerRowCount(t, p); got != 1 {
+		t.Fatalf("ledger rows = %d after the first flush, want 1", got)
+	}
+
+	p.forgetManagedRoute(ctx, "1.2.3.4/32")
+	if got := ledgerRowCount(t, p); got != 1 {
+		t.Fatalf("the forget should not hit the database, rows = %d", got)
+	}
+	p.flushLedger(ctx)
+	if got := ledgerRowCount(t, p); got != 0 {
+		t.Fatalf("ledger rows = %d after the forget was flushed, want 0", got)
 	}
 }

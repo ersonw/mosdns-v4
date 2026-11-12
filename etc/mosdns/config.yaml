@@ -508,6 +508,16 @@ servers:
 #            and has no effect. Omit it in new configs.
 #   route_table - NAT mode: routing table that receives the host routes.
 #                 Default: "main"
+#   route_mark - non-zero = switch the split from host routes to destination
+#                marks. The real answers go into the nft set <table> real_ipv4
+#                and packets whose destination is in that set are marked, then
+#                looked up in route_table. Linux only.
+#                NAT mode: the dedicated table points at next_hop.
+#                TUN mode: only valid together with realip; the dedicated table
+#                points at the tun device, so marked traffic enters it.
+#                Default: 0 (off)
+#   route_rule_priority - priority of the "fwmark <route_mark> lookup
+#                <route_table>" rule. Default: 1000
 #   route_aggregation - NAT mode: aggregate /32 host routes into strict
 #                       supernets to shrink the route table. Default: true
 #   tun_route_table - TUN mode, direct outlet only: dedicated routing table.
@@ -523,8 +533,14 @@ servers:
 #            the fake IP. The reply waits until the mapping is in place, so a
 #            client never holds a fake IP the data plane cannot serve.
 #            true = do not allocate a fake IP and do not write DNAT; answer the
-#            real IPs as-is and only install a host route to next_hop for each
-#            of them (pure routing split). Has no effect with use_tun.
+#            real IPs as-is and only split them (pure routing split): a host
+#            route per address, or, when route_mark is set, one nft set member
+#            that the marked packets are routed by.
+#            With use_tun: true this needs route_mark. The marked answers keep
+#            their real IPs, the dedicated table routes them INTO the tun
+#            device (not at a next hop), and the stack dials them there -
+#            through the proxy when one is configured, otherwise direct via the
+#            pinned next_hop / next_hop_dev outlet.
 #            Default: false
 #   use_tun - false = built-in nftables NAT (default); true = TUN data plane.
 #             TUN mode needs root/CAP_NET_ADMIN and a working TUN driver

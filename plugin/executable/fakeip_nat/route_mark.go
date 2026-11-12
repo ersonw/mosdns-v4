@@ -35,13 +35,19 @@ import (
 // place to look.
 const markSetName = "real_ipv4"
 
-// markRoutingEnabled reports whether mark routing applies to this run: the
-// operator asked for it and the tun data path is not already responsible for
-// the mapped addresses. In tun mode the whole ipv4_range is routed into the
-// device, so marking would only duplicate what the device route does; the
-// config loader rejects that combination, and this keeps the data path honest
-// if a plugin is built programmatically.
-func (p *FakeIPNatPlugin) markRoutingEnabled() bool { return p.routeMark != 0 && !p.useTun }
+// markRoutingEnabled reports whether mark routing applies to this run. In the
+// NAT data path it replaces the per-address host routes. In tun mode it is the
+// realip data path: the answers keep their real addresses, so marking them is
+// what decides that those destinations are the plugin's business and have to
+// enter the device instead of leaving through the host default route. With
+// fakeip + tun there is nothing to mark: the whole range already enters the
+// device, and the stack dials the real ip itself.
+func (p *FakeIPNatPlugin) markRoutingEnabled() bool {
+	if p.routeMark == 0 {
+		return false
+	}
+	return !p.useTun || p.realIP
+}
 
 // markActiveNow reports whether mark routing is fully installed: table, set,
 // mark rules, default route and the ip rule. Calling it before setup finished
@@ -91,14 +97,20 @@ func (p *FakeIPNatPlugin) ensureMarkTable(ctx context.Context, table string) err
 		{args: []string{"add", "chain", "ip", table, "mark_prerouting",
 			"{ type filter hook prerouting priority 0; policy accept; }"}},
 		{args: []string{"add", "rule", "ip", table, "mark_prerouting",
-			"ip", "daddr", "@" + markSetName, "meta", "mark", "set", mark}},
+			"ip", "daddr", "@" + markSetName, "ip", "saddr", "!=", p.cidr,
+			"meta", "mark", "set", mark}},
 		// Locally generated traffic is routed before the output hook runs, so
 		// this chain has to be of type "route": that type re-runs the lookup
 		// when a hook changes the mark.
 		{args: []string{"add", "chain", "ip", table, "mark_output",
 			"{ type route hook output priority 0; policy accept; }"}},
+		// The source condition keeps the plugin's own outlet sockets out of the
+		// set they are marking: those bind a source inside the range, and a mark
+		// on them would send the socket that carries the traffic back into the
+		// device it came from.
 		{args: []string{"add", "rule", "ip", table, "mark_output",
-			"ip", "daddr", "@" + markSetName, "meta", "mark", "set", mark}},
+			"ip", "daddr", "@" + markSetName, "ip", "saddr", "!=", p.cidr,
+			"meta", "mark", "set", mark}},
 	}
 
 	created := 0
@@ -132,12 +144,27 @@ func (p *FakeIPNatPlugin) setupMarkRouting(ctx context.Context) error {
 		return err
 	}
 
-	hop, dev := p.nextHop, p.nextHopDev
-	if hop == "" && dev == "" {
-		hop, dev = p.systemDefaultRoute(ctx)
-	}
-	if hop == "" && dev == "" {
-		return fmt.Errorf("no next hop and no device to route marked traffic")
+	// Two shapes reach this point:
+	//   NAT path: the marked destinations leave through the configured gateway.
+	//   tun + realip: marked destinations are routed into the device the plugin
+	//   already owns, which is where the proxy - or, without one, the pinned
+	//   outlet route - takes over. Pointing the table at the next hop instead
+	//   would bypass the device entirely, which is exactly what this mode
+	//   exists to avoid.
+	var hop, dev string
+	if p.useTun {
+		dev = p.tunDev
+		if dev == "" {
+			return fmt.Errorf("mark routing in tun mode needs the tun device, which is not up")
+		}
+	} else {
+		hop, dev = p.nextHop, p.nextHopDev
+		if hop == "" && dev == "" {
+			hop, dev = p.systemDefaultRoute(ctx)
+		}
+		if hop == "" && dev == "" {
+			return fmt.Errorf("no next hop and no device to route marked traffic")
+		}
 	}
 
 	// The dedicated table holds one route only: everything that arrives here is

@@ -25,14 +25,78 @@ type runtimeMap struct {
 	byDomain map[string]string // domain -> fake ip
 	byFake   map[string]string // fake ip -> domain ("" means reserved, owner unknown)
 	lastSeen map[string]int64  // domain -> last query (unix seconds, memory only)
+	// realByDomain is the newest real ips of a domain, most recent first. It is
+	// the read path for primaryRealIP: the table is loaded once at startup and
+	// kept current by every answer that records ips, so a data path decision
+	// never waits on SQLite.
+	realByDomain map[string][]string
 }
 
 func newRuntimeMap() *runtimeMap {
 	return &runtimeMap{
-		byDomain: make(map[string]string),
-		byFake:   make(map[string]string),
-		lastSeen: make(map[string]int64),
+		byDomain:     make(map[string]string),
+		byFake:       make(map[string]string),
+		lastSeen:     make(map[string]int64),
+		realByDomain: make(map[string][]string),
 	}
+}
+
+// realKeepPerDomain bounds the per-domain list: only the newest few are ever
+// consulted, and an unbounded list would grow with every answer.
+const realKeepPerDomain = 8
+
+// putReal merges the real ips of a domain into the memory table, newest first,
+// dropping duplicates and addresses of the plugin's own range.
+func (m *runtimeMap) putReal(domain string, ips []string) {
+	if domain == "" || len(ips) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	merged := make([]string, 0, realKeepPerDomain)
+	seen := make(map[string]struct{}, realKeepPerDomain)
+	for _, ip := range ips {
+		if ip == "" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		merged = append(merged, ip)
+		if len(merged) == realKeepPerDomain {
+			break
+		}
+	}
+	for _, ip := range m.realByDomain[domain] {
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		merged = append(merged, ip)
+		if len(merged) == realKeepPerDomain {
+			break
+		}
+	}
+	m.realByDomain[domain] = merged
+}
+
+func (m *runtimeMap) realsOf(domain string) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ips := m.realByDomain[domain]
+	if len(ips) == 0 {
+		return nil
+	}
+	out := make([]string, len(ips))
+	copy(out, ips)
+	return out
+}
+
+func (m *runtimeMap) realSize() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.realByDomain)
 }
 
 // put records a domain <-> fake ip relation, replacing a stale one on either
@@ -64,6 +128,7 @@ func (m *runtimeMap) clear() {
 	m.byDomain = make(map[string]string)
 	m.byFake = make(map[string]string)
 	m.lastSeen = make(map[string]int64)
+	m.realByDomain = make(map[string][]string)
 }
 
 func (m *runtimeMap) remove(domain string) {
@@ -72,6 +137,9 @@ func (m *runtimeMap) remove(domain string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Realip runs leave no byDomain entry behind, so the newest-ip cache is
+	// dropped on its own: an expired domain must not keep its addresses alive.
+	delete(m.realByDomain, domain)
 	fakeIP, ok := m.byDomain[domain]
 	if !ok {
 		return
@@ -211,6 +279,42 @@ func (p *FakeIPNatPlugin) restoreRuntimeMappings(ctx context.Context) error {
 	return nil
 }
 
+// restoreRealIPs loads the newest real ips of every domain once at startup. The
+// rows arrive ordered by last_seen, and putReal keeps only the first few per
+// domain, so the memory table stays bounded even on a long-lived database.
+func (p *FakeIPNatPlugin) restoreRealIPs(ctx context.Context) error {
+	query := fmt.Sprintf("SELECT domain, real_ip FROM %s ORDER BY last_seen DESC", p.ipTable)
+	rows, err := p.db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("query real ips: %w", err)
+	}
+	defer rows.Close()
+
+	loaded := 0
+	for rows.Next() {
+		var domain, ip string
+		if err := rows.Scan(&domain, &ip); err != nil {
+			return fmt.Errorf("scan real ip: %w", err)
+		}
+		// An address of this range is not a real target, and storing it would
+		// hand every later lookup a fake ip.
+		if p.isFakeAddrString(ip) {
+			continue
+		}
+		if len(p.runtime.realsOf(domain)) >= realKeepPerDomain {
+			continue
+		}
+		p.runtime.putReal(domain, []string{ip})
+		loaded++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate real ips: %w", err)
+	}
+	p.L().Info("fakeip nat: real ip table restored",
+		zap.Int("domains", p.runtime.realSize()), zap.Int("entries", loaded), zap.String("source", "sqlite"))
+	return nil
+}
+
 // reconcileFirewallMappings makes the NAT data path consistent with the runtime
 // table: database rows the nft map is missing are re-applied with their newest
 // real ip, and fake ips that only the map knows are reserved.
@@ -229,10 +333,7 @@ func (p *FakeIPNatPlugin) reconcileFirewallMappings(ctx context.Context) {
 
 	// The host routes are part of the same state: a refilled DNAT element
 	// without a route to its real ip is just as broken as a missing element.
-	hop, dev := p.nextHop, p.nextHopDev
-	if hop == "" && dev == "" {
-		hop, dev = p.systemDefaultRoute(ctx)
-	}
+	hop, dev := p.fallbackHopDev(ctx)
 
 	refilled := 0
 	for domain, fakeIP := range p.runtime.snapshotByDomain() {

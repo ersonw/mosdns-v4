@@ -23,9 +23,9 @@ prerouting/forward/postrouting），探测候选真实 IP 的可达性，写 `/3
       next_hop_dev: "eth0"
       route_table: "main"       # 默认 main；自定义表名仅 Linux 支持，macOS/Windows 回退 main
       route_aggregation: true   # 默认 true：每 30 秒扫描路由表，把指向出口的 /32 聚合为 CIDR
-      route_mark: 0             # 默认 0 关闭；非 0 表示按目的地址打标分流（见下文，与 use_tun 互斥）
+      route_mark: 0             # 默认 0 关闭；非 0 表示按目的地址打标分流（见下文；tun 模式下仅 realip 生效）
       route_rule_priority: 1000 # 打标模式下那条 ip rule 的优先级，与既有策略规则冲突时调大
-      realip: false             # 默认 false（发 fake IP）；true 则不分配假 IP、不做 DNAT，只给真实 IP 写出口路由
+      realip: false             # 默认 false（发 fake IP）；true 则不分配假 IP、不做 DNAT，只按真实 IP 分流（配 route_mark 时打标，tun 下进设备）
       mss_clamp: 0              # 默认 0 关闭；出口隧道 MTU 1400 时填 1360，改写 SYN/SYN-ACK 的 MSS
 ```
 
@@ -166,13 +166,22 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
 - 集合写入失败会回落成写 host route 并打 Warn，数据面不断流；此时路由写进 **main**（专用表只留给带标记的包，
   把回落路由写进去等于白写），账本同样记 `main`，停机时按记录原样删除；nft 对象或 `ip rule` 装不上时整体回落，
   `route_mark` 只打 Error，不影响 DNS 服务；
-- 与 `use_tun` 互斥（tun 自己管整段路由），且仅 Linux 支持，其他平台启动即报错；
+- 仅 Linux 支持，其他平台启动即报错；
+- 两种数据面都可用，但语义不同：
+  - 非 tun：打标替代「每个真实 IP 写一条 /32」，命中目标的包查专用表，主表不被灌满；
+  - tun + `realip`：DNS 答案保持真实 IP，打标把它们**路由进 tun 网卡**（专用表 default 为 `dev <tun_dev>`），
+    再交给出口——配了 `proxy` 就走代理，没配就按 `next_hop`/`next_hop_dev`（未填则取系统默认路由）
+    钉住的出口路由直连；`tun + fakeip` 不用打标（整段假 IP 本来就进设备），配置阶段直接拒绝这对组合；
+- 打标规则带源地址条件 `ip saddr != <ipv4_range>`：插件自己拨号的 socket 源地址落在该网段，
+  若被标记就会把承载流量的 socket 又送进设备，形成回环；
+- tun + realip 时 netstack 接受非假 IP 的目的地址：这类包是被标记路由进来的，直接以该地址为出口目标，
+  不再反查 fake IP 映射；
 - 清理只做三件事：删 `ip rule`、删专用表的 default、删整张 nft 表，不会残留；
 - `nft delete table` 不再看 `use_tun`：tun 模式自己建不了这张表，存在的只可能是上次非 tun 运行留下的，
   启动前（`cleanupStaleNFTTable`）与退出时都会删掉。否则它挂在 prerouting 上的 DNAT 会先改写目的地址，
   包按改写后的真实 IP 从主表走掉，tun 设备根本收不到；
-- 只对非 tun 数据面生效：`use_tun: true` 时打标整体停用（配置加载阶段会直接拒绝这对组合，
-  运行时再拦一次），tun 自己已经接管整段路由；
+- `use_tun` + 未开 `realip` 时打标整体停用（配置加载阶段会直接拒绝这对组合，运行时再拦一次），
+  tun 自己已经接管整段假 IP 路由；
 - 装上后立刻自检并写日志：`route mark: startup check passed`（带 `set` / `set_size` /
   `mark_chains` / `ip_rule` / `default_route` 五个字段）；任一对象缺失则打 Warn
   `route mark: startup check found the mark path incomplete`，不会等到主表被灌满才发现。
