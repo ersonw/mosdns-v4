@@ -8,7 +8,6 @@
       <env name="GOARCH" value="amd64" />
       <env name="GOOS" value="darwin" />
     </envs>
-    <sudo value="true" />
     <kind value="PACKAGE" />
     <package value="github.com/ersonw/mosdns-v4" />
     <directory value="$PROJECT_DIR$" />
