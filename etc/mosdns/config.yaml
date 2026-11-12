@@ -418,11 +418,8 @@ plugins:
   #          allow: [exec_script, config, reload]
   #      default_role: admin
   #      fakeip_tags: [test_fakeip]
-  #      fakeip_tag: ""
   #      ocserv_tags: [test_ocserv]
-  #      ocserv_tag: ""
   #      radius_tags: [test_radius]
-  #      radius_tag: ""
   #      config_path: /etc/mosdns/config-full.yaml
   #      audit_log: ""
   #      proxy: ""
@@ -1276,11 +1273,8 @@ servers:
 #           allow: [exec_script, config, reload]
 #       default_role: admin
 #       fakeip_tags: [fakeip]
-#       fakeip_tag: ""                    # single-value alias of fakeip_tags
 #       ocserv_tags: [ocserv]
-#       ocserv_tag: ""                    # single-value alias of ocserv_tags
 #       radius_tags: [radius]
-#       radius_tag: ""                    # single-value alias of radius_tags
 #       config_path: etc/mosdns/config.yaml
 #       audit_log: ""                     # default <config dir>/telegram_bot_audit.log
 #       proxy: ""

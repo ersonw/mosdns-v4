@@ -79,7 +79,7 @@ func (s *stubAdmin) AdminStats(context.Context) (fakeipnat.MappingStats, error) 
 
 func newStubPlugin() *telegramBot {
 	bp := coremain.NewBP("test_bot", PluginType, zap.NewNop(), nil)
-	p := &telegramBot{BP: bp, args: &Args{ChatIDs: []int64{123}, FakeIPTag: "fakeip"}}
+	p := &telegramBot{BP: bp, args: &Args{ChatIDs: []int64{123}, FakeIPTags: []string{"fakeip"}}}
 	p.args.initDefault()
 	// Administration actions are audited; a test keeps them off the real file
 	// so the working tree stays clean. A test that checks the log sets its own.
@@ -256,7 +256,7 @@ func TestArgsDisabledWithoutTokenOrChat(t *testing.T) {
 	if !a.enabled() {
 		t.Fatalf("token + chat must enable the bot")
 	}
-	if a.APIBase != "https://api.telegram.org" || a.PollTimeout != 30 || a.FakeIPTag != "fakeip" {
+	if a.APIBase != "https://api.telegram.org" || a.PollTimeout != 30 {
 		t.Fatalf("defaults not applied: %+v", a)
 	}
 	if len(a.FakeIPTags) != 1 || a.FakeIPTags[0] != "fakeip" {
@@ -380,8 +380,8 @@ func TestBotIgnoresUnauthorizedChat(t *testing.T) {
 	}
 }
 
-func TestTagListMergesSingleAndList(t *testing.T) {
-	a := &Args{FakeIPTags: []string{"fakeip", "fakeip2"}, FakeIPTag: "fakeip2"}
+func TestTagListDropsDuplicates(t *testing.T) {
+	a := &Args{FakeIPTags: []string{"fakeip", "fakeip2", "fakeip2"}}
 	a.initDefault()
 	if len(a.FakeIPTags) != 2 {
 		t.Fatalf("duplicate tag was not collapsed: %v", a.FakeIPTags)
@@ -481,7 +481,7 @@ func TestRolePermissions(t *testing.T) {
 			"fakeip_admin": {Allow: []string{PermFakeIP}},
 			"ops":          {Inherits: []string{"fakeip_admin"}, Allow: []string{PermOcserv, PermExecScript}},
 		},
-		FakeIPTag: "fakeip",
+		FakeIPTags: []string{"fakeip"},
 	}
 	args.initDefault()
 	access, err := buildAccess(args)

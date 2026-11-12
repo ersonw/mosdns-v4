@@ -1,5 +1,9 @@
 # ADD  
+```shell
+git tag v4.0.0 && git push origin v4.0.0     # 触发 release
+gh workflow run release.yml -f version=v4.0.0 # 或手动
 
+```
 ### exec_script
 ```yaml
   - tag: call_route_script
@@ -388,7 +392,7 @@ accounting[0].secret = 换成一串随机字符
 `/reload`（给进程发关闭信号，靠外部 supervisor 重新拉起）。`proxy` 可让 API 请求走
 HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
 插件之间通过 `fakeip_tags` / `ocserv_tags` / `radius_tags` 定位目标：列表第一个是默认，
-`fakeip_tag` / `ocserv_tag` / `radius_tag` 是旧配置的单值写法，仍兼容。
+其余用命令的第一个参数点名（如 `/fip <tag> stats`）。这三项是列表，不再接受单值写法。
 ```yaml
   - tag: tg
     type: telegram_bot

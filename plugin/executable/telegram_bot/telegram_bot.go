@@ -73,19 +73,12 @@ type Args struct {
 	// first tag is the default target of /fip; another one is selected with
 	// "/fip <tag> <sub>". Default ["fakeip"].
 	FakeIPTags []string `yaml:"fakeip_tags"`
-	// FakeIPTag is the single-value form of FakeIPTags, kept for configs
-	// written before the list existed.
-	FakeIPTag string `yaml:"fakeip_tag"`
 	// OcservTags are the ocserv_ctl plugin tags used by /vpn. The first tag
 	// is the default target. Default ["ocserv"].
 	OcservTags []string `yaml:"ocserv_tags"`
-	// OcservTag is the single-value form of OcservTags.
-	OcservTag string `yaml:"ocserv_tag"`
 	// RadiusTags are the radius plugin tags used by /user. The first tag is
 	// the default target. Default ["radius"].
 	RadiusTags []string `yaml:"radius_tags"`
-	// RadiusTag is the single-value form of RadiusTags.
-	RadiusTag string `yaml:"radius_tag"`
 	// ConfigPath is the mosdns config file /config edits. Empty means:
 	// take -c from the process arguments, else "etc/mosdns/config.yaml".
 	ConfigPath string `yaml:"config_path"`
@@ -104,12 +97,9 @@ type Args struct {
 
 func (a *Args) initDefault() {
 	a.Token = strings.TrimSpace(a.Token)
-	a.FakeIPTags = mergeTagList(a.FakeIPTags, a.FakeIPTag, "fakeip")
-	a.OcservTags = mergeTagList(a.OcservTags, a.OcservTag, "ocserv")
-	a.RadiusTags = mergeTagList(a.RadiusTags, a.RadiusTag, "radius")
-	a.FakeIPTag = a.FakeIPTags[0]
-	a.OcservTag = a.OcservTags[0]
-	a.RadiusTag = a.RadiusTags[0]
+	a.FakeIPTags = tagList(a.FakeIPTags, "fakeip")
+	a.OcservTags = tagList(a.OcservTags, "ocserv")
+	a.RadiusTags = tagList(a.RadiusTags, "radius")
 	a.DefaultRole = strings.TrimSpace(a.DefaultRole)
 	if a.DefaultRole == "" {
 		a.DefaultRole = PermAll
@@ -131,10 +121,10 @@ func (a *Args) enabled() bool {
 	return a.Token != "" && (len(a.ChatIDs) > 0 || len(a.Admins) > 0)
 }
 
-// mergeTagList combines the list form and the legacy single-value form, drops
-// duplicates, and falls back to one default tag.
-func mergeTagList(list []string, single, def string) []string {
-	seen := make(map[string]struct{}, len(list)+2)
+// tagList trims a configured tag list, drops duplicates, and falls back to one
+// default tag so a command always has a target.
+func tagList(list []string, def string) []string {
+	seen := make(map[string]struct{}, len(list)+1)
 	var out []string
 	add := func(t string) {
 		t = strings.TrimSpace(t)
@@ -150,7 +140,6 @@ func mergeTagList(list []string, single, def string) []string {
 	for _, t := range list {
 		add(t)
 	}
-	add(single)
 	if len(out) == 0 {
 		add(def)
 	}
