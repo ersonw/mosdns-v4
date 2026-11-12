@@ -10,7 +10,7 @@ import (
 )
 
 func TestTunRoutePlan(t *testing.T) {
-	plan := tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100")
+	plan := tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100", "")
 	if len(plan) != 4 {
 		t.Fatalf("plan has %d steps, want 4", len(plan))
 	}
@@ -29,19 +29,26 @@ func TestTunRoutePlan(t *testing.T) {
 	}
 
 	// Without a device the gateway alone still describes the table.
-	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "", "100")
+	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "", "100", "")
 	if got := strings.Join(plan[0], " "); got != "ip route replace default via 192.168.1.1 table 100" {
 		t.Fatalf("gateway-only route = %q", got)
 	}
 
 	// Without a gateway the device alone carries the default route.
-	plan = tunRoutePlan("198.18.0.0/15", "", "en0", "100")
+	plan = tunRoutePlan("198.18.0.0/15", "", "en0", "100", "")
 	if got := strings.Join(plan[0], " "); got != "ip route replace default dev en0 table 100" {
 		t.Fatalf("device-only route = %q", got)
 	}
 
+	// With mark routing the outlet rule carries an explicit priority so it is
+	// consulted before the mark rule instead of landing behind it.
+	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100", "999")
+	if got := strings.Join(plan[3], " "); got != "ip rule add from 198.18.0.0/15 to ! 198.18.0.0/15 lookup 100 prio 999" {
+		t.Fatalf("prioritized rule add step = %q", got)
+	}
+
 	// Neither one: nothing can be installed.
-	if plan := tunRoutePlan("198.18.0.0/15", "", "", "100"); plan != nil {
+	if plan := tunRoutePlan("198.18.0.0/15", "", "", "100", ""); plan != nil {
 		t.Fatalf("plan without gateway or device = %v, want nil", plan)
 	}
 }

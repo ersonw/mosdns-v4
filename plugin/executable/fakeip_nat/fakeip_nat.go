@@ -533,6 +533,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if cfg.RealIP && cfg.UseTun && !p.markRoutingEnabled() {
 		p.L().Warn("realip has no effect with use_tun unless route_mark is set: without marks the answers keep their real addresses but nothing routes them into the device")
 	}
+	// Without marks every answer writes one host route to the real address, and
+	// into the main table by default: that is a global change the whole box
+	// pays for. Marks keep the same split in the plugin's own nft set.
+	if cfg.RealIP && !cfg.UseTun && !p.markRoutingEnabled() {
+		p.L().Warn("realip without route_mark writes one host route per answer into the routing table",
+			zap.String("route_table", p.hostRouteTable()),
+			zap.String("hint", "set route_mark to keep the split inside the plugin's nft set instead"))
+	}
 	if cfg.Proxy != "" {
 		dialer, err := newEgress(cfg.Proxy, cfg.ProxyInsecure)
 		if err != nil {

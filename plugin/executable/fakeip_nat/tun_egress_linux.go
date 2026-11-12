@@ -8,6 +8,7 @@ package fakeipnat
 
 import (
 	"context"
+	"strconv"
 
 	"go.uber.org/zap"
 )
@@ -17,7 +18,14 @@ func (p *FakeIPNatPlugin) installTunEgressRoute(ctx context.Context) (func(), bo
 	if table == "" {
 		table = "main"
 	}
-	plan := tunRoutePlan(p.cidr, p.tunEgressHop, p.tunEgressDev, table)
+	// The outlet rule must win over the mark rule, so it gets the priority just
+	// ahead of it; without mark routing there is nothing to race with and the
+	// kernel default keeps the rule where it always was.
+	prio := ""
+	if p.markRoutingEnabled() && p.routeRulePriority > 1 {
+		prio = strconv.Itoa(int(p.routeRulePriority - 1))
+	}
+	plan := tunRoutePlan(p.cidr, p.tunEgressHop, p.tunEgressDev, table, prio)
 	if len(plan) == 0 {
 		p.L().Warn("tun egress: neither gateway nor device is known, route table not installed")
 		return nil, false

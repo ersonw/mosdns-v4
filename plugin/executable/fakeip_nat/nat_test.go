@@ -260,7 +260,7 @@ func TestEnsureNFTTableCreatesOnce(t *testing.T) {
 		"nft add map ip fakeip_test dnat_map",
 		"nft add rule ip fakeip_test prerouting ip daddr 198.18.0.0/16 dnat to ip daddr map @dnat_map",
 		"nft add rule ip fakeip_test forward ip daddr 198.18.0.0/16 drop",
-		"nft add rule ip fakeip_test postrouting oifname eth0 masquerade",
+		"nft add rule ip fakeip_test postrouting ct status dnat masquerade",
 	} {
 		if _, ok := runner.find(want); !ok {
 			t.Fatalf("missing command %q in %v", want, runner.all())

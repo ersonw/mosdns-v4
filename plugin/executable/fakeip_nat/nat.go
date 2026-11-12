@@ -194,7 +194,12 @@ func (p *FakeIPNatPlugin) ensureNFTTable(ctx context.Context, table, dev string)
 		{"add", "chain", "ip", table, "postrouting", "{ type nat hook postrouting priority 100; policy accept; }"},
 	}
 	if dev != "" {
-		setup = append(setup, []string{"add", "rule", "ip", table, "postrouting", "oifname", dev, "masquerade"})
+		// Only the connections this table rewrote are masqueraded. A bare
+		// "oifname <dev> masquerade" also matches every other flow leaving that
+		// interface - the host's own traffic and whatever another firewall rule
+		// set up - and silently SNATs it.
+		setup = append(setup, []string{"add", "rule", "ip", table, "postrouting",
+			"ct", "status", "dnat", "masquerade"})
 	}
 	if p.mssClamp > 0 {
 		mss := fmt.Sprint(p.mssClamp)

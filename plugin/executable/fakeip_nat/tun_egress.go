@@ -138,7 +138,7 @@ func (p *FakeIPNatPlugin) stopTunEgress() {
 // and without the destination check that packet would be pulled into the
 // egress table and sent straight out of the physical interface, bypassing the
 // tun entirely.
-func tunRoutePlan(cidr, hop, dev, table string) [][]string {
+func tunRoutePlan(cidr, hop, dev, table, prio string) [][]string {
 	var route []string
 	switch {
 	case hop != "" && dev != "":
@@ -150,11 +150,18 @@ func tunRoutePlan(cidr, hop, dev, table string) [][]string {
 	default:
 		return nil
 	}
+	// prio is optional. When mark routing is on, the outlet rule has to be
+	// consulted before "fwmark <mark> lookup <table>": otherwise the sockets the
+	// stack opens are marked again and steered back into the device.
+	add := []string{"ip", "rule", "add", "from", cidr, "to", "!", cidr, "lookup", table}
+	if prio != "" {
+		add = append(add, "prio", prio)
+	}
 	return [][]string{
 		route,
 		{"ip", "rule", "del", "from", cidr, "lookup", table},
 		{"ip", "rule", "del", "from", cidr, "to", "!", cidr, "lookup", table},
-		{"ip", "rule", "add", "from", cidr, "to", "!", cidr, "lookup", table},
+		add,
 	}
 }
 

@@ -172,6 +172,12 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   - tun + `realip`：DNS 答案保持真实 IP，打标把它们**路由进 tun 网卡**（专用表 default 为 `dev <tun_dev>`），
     再交给出口——配了 `proxy` 就走代理，没配就按 `next_hop`/`next_hop_dev`（未填则取系统默认路由）
     钉住的出口路由直连；`tun + fakeip` 不用打标（整段假 IP 本来就进设备），配置阶段直接拒绝这对组合；
+- NAT 数据面的 postrouting 只做 `ct status dnat masquerade`：被本插件 DNAT 的连接才改写源地址，
+  不再按出口网卡匹配，避免把同一网卡上的其它流量（含宿主自身）一起 SNAT；
+- tun 直连出口的 `ip rule from <range> to !<range> lookup <table>` 在启用打标时带
+  `prio <route_rule_priority-1>`，保证它先于 `fwmark` 规则命中，插件自己的 socket 不会被自己的标记送回设备；
+- `realip` 且未设 `route_mark` 时启动会打 Warn：每个应答都会往 `route_table`（默认 main）写一条 host route，
+  整机选路都会受影响，打标才是推荐形态；
 - 打标规则带源地址条件 `ip saddr != <ipv4_range>`：插件自己拨号的 socket 源地址落在该网段，
   若被标记就会把承载流量的 socket 又送进设备，形成回环；
 - tun + realip 时 netstack 接受非假 IP 的目的地址：这类包是被标记路由进来的，直接以该地址为出口目标，
