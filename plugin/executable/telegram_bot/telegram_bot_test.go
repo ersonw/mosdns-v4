@@ -491,6 +491,7 @@ func TestRolePermissions(t *testing.T) {
 
 	p := newStubPlugin()
 	p.args = args
+	p.args.AuditLog = os.DevNull
 	p.access = access
 	ctx := context.Background()
 
