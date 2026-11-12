@@ -620,6 +620,13 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 	p.tunMTU = mtu
 
+	// An older build recorded nothing, so its mark rule can only be found from
+	// the mark its nft table still carries. This runs before the stale nft
+	// table is dropped, which is the only place that value survives.
+	legacyCtx, legacyCancel := context.WithTimeout(context.Background(), natTimeout)
+	p.sweepLegacyMarkPath(legacyCtx)
+	legacyCancel()
+
 	// The tun data path is the alternative to per-domain DNAT: it asks the
 	// system for a device and routes the whole ipv4_range into it.
 	if p.useTun {
@@ -639,6 +646,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			// address has to be assigned before it can be bound as a source.
 			p.setupTunEgress()
 		}
+	} else {
+		// Switching away from tun leaves that run's outlet behind: a SNAT table
+		// in postrouting and a policy rule for the range.
+		nftCtx, nftCancel := context.WithTimeout(context.Background(), natTimeout)
+		p.cleanupStaleTunEgress(nftCtx)
+		nftCancel()
 	}
 
 	// A previous process may have stopped without cleaning up: a crash, a SIGKILL

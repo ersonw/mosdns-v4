@@ -27,6 +27,7 @@ type fakeRunner struct {
 	ifaces       map[string]bool   // `ifconfig X` answers; nil means every probe succeeds
 	routes       string            // output of `ip -4 route show`
 	tableDump    string            // output of `nft list table`
+	ruleShow     string            // output of `ip rule show`
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
@@ -51,6 +52,8 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 			return "", fmt.Errorf("no map")
 		}
 		return f.mappings, nil
+	case call == "ip rule show":
+		return f.ruleShow, nil
 	case call == "ip route show default":
 		return "default via 10.0.0.1 dev eth0", nil
 	case call == "ip -4 route show" || strings.HasPrefix(call, "ip -4 route show table "):

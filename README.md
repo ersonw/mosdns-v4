@@ -202,6 +202,10 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   `route mark: removed the policy rule a previous run installed`）；有代理时启动先删掉
   `<table_prefix>_tun_snat` 这张只属于直连出口的表（日志
   `tun egress: removed the snat table a proxied run does not use`），避免模式切换后残留；
+- 更早的构建没有状态表，它留下的 `ip rule fwmark ...` 仍可从自己的 nft 表里把标记读出来，
+  启动时据此精确删除（日志 `route mark: removing the mark path a previous build left behind`）；
+  从 tun 切回 nft 时则删掉 tun 出口的 SNAT 表与 `from <range>` 的规则（不改那张表的 default
+  路由，因为它可能是机器自己在用的表）；
 - 启动时校验已有 nft 表：`ensureNFTTable` 读回 `nft list table`，若 postrouting 仍是旧版的
   `oifname <dev> masquerade`、或缺少当前的 DNAT/drop/mss 规则，就删表重建（日志
   `fakeip nat: rebuilding the nft table so its rules match the configuration`），
