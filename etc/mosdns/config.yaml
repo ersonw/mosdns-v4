@@ -139,6 +139,7 @@ plugins:
 #      record_ttl: "168h"              # drop mappings idle this long; empty = 7d, "0" = off
       access_log: true                # record which client resolved which domain
       access_ttl: "168h"              # keep access rows this long; empty = 7d, "0" = off
+      timezone: Asia/Shanghai         # render stored unix timestamps; empty = Asia/Shanghai
 
   # 6) Workflow, two stages:
   #    a) the query itself matches a CN domain -> ask the local resolver and
@@ -361,25 +362,35 @@ plugins:
   #      mask6: 32
   #
   ## ---- ocserv_ctl -----------------------------------------------------------
-  #  - tag: test_ocserv
-  #    type: ocserv_ctl
-  #    args:
-  #      socket: /run/ocserv/occtl.socket
-  #      addr: ""
-  #      occtl_path: occtl
-  #      timeout: 3
-  #      cache_ttl: 15
-  #      mark: 0
+  - tag: test_ocserv
+    type: ocserv_ctl
+    args:
+        socket: auto
+        addr: ""
+        occtl_path: occtl
+        timeout: 3
+        cache_ttl: 15
+        mark: 0
+        config_path: /run/ocserv/dyize/ocserv.conf
+        systemd_unit: ocserv
+        systemctl_path: /usr/bin/systemctl
+        disable_restart: false
+        event_socket: /run/mosdns/ocserv-updown.sock
+        event_log: /config/ocserv-events.jsonl
+        event_buffer: 500
+        timezone: Asia/Shanghai
   #
   ## ---- radius ---------------------------------------------------------------
-  #  - tag: test_radius
-  #    type: radius
-  #    args:
-  #      listen: 0.0.0.0:1812
-  #      accounting_listen: 0.0.0.0:1813
-  #      secret: "change-me-to-the-ocserv-secret"
-  #      db_path: /etc/mosdns/radius.db
-  #
+  - tag: test_radius
+    type: radius
+    args:
+        listen: 0.0.0.0:1812
+        accounting_listen: 0.0.0.0:1813
+        secret: "change-me-to-the-ocserv-secret"
+        db_path: etc/mosdns/radius.db
+        ocserv_config: /run/ocserv/dyize/ocserv.conf
+        timezone: Asia/Shanghai
+
   ## ---- redirect -------------------------------------------------------------
   #  - tag: test_redirect
   #    type: redirect
@@ -404,32 +415,44 @@ plugins:
   #      duration: 500
   #
   ## ---- telegram_bot ---------------------------------------------------------
-  #  - tag: test_bot
-  #    type: telegram_bot
-  #    args:
-  #      token: ""                  # empty disables the plugin
-  #      chat_ids: [100000001]
-  #      admins:
-  #        - chat_id: 100000001
-  #          role: ops
-  #        - chat_id: 100000002
-  #          role: senior
-  #      roles:
-  #        ops:
-  #          allow: [fakeip, ocserv]
-  #        senior:
-  #          inherits: [ops]
-  #          allow: [status, exec_script, config, reload]
-  #      default_role: admin
-  #      fakeip_tags: [test_fakeip]
-  #      ocserv_tags: [test_ocserv]
-  #      radius_tags: [test_radius]
-  #      config_path: /etc/mosdns/config-full.yaml
-  #      audit_log: ""
-  #      proxy: ""
-  #      api_base: https://api.telegram.org
-  #      poll_timeout: 30
-  #
+  - tag: test_bot
+    type: telegram_bot
+    args:
+        token: ""                  # empty disables the plugin
+        chat_ids: [100000001, 100000002, 100000003]
+        admins:
+          - chat_id: 100000001
+            role: superadmin        # built in: every permission
+          - chat_id: 100000002
+            role: admin             # built in: status, ocserv, radius, access
+        # Custom roles are still supported and may reuse a built-in one:
+        #   roles:
+        #     ops:
+        #       allow: [fakeip, ocserv]
+        #     senior:
+        #       inherits: [ops]
+        #       allow: [status, exec_script, config, reload, access]
+        # Chat ids not listed under admins get default_role ("admin": no
+        # config/reload/exec_script, use "superadmin" for full access).
+        default_role: admin
+        fakeip_tags: [fakeip]
+        ocserv_tags: [test_ocserv]
+        radius_tags: [test_radius]
+        config_path: etc/mosdns/config-full.yaml
+        # /provider edits data_providers through these scripts. A custom script
+        # must keep the same argv contract:
+        #   domain_manage.py: add|del [-a] [file_path] domain...
+        #   txt2dat.py: <input_txt> <output_dat> <category> [--overwrite]
+        domain_manage_script: /etc/mosdns/domain_manage.py
+        txt2dat_script: /etc/mosdns/txt2dat.py
+        domain_python: python3
+        domain_timeout: 30
+        audit_log: etc/mosdns/audit_log.log
+        proxy: ""
+        api_base: https://api.telegram.org
+        poll_timeout: 30
+        timezone: Asia/Shanghai
+
   ## ---- ttl ------------------------------------------------------------------
   #  - tag: test_ttl
   #    type: ttl
@@ -529,7 +552,7 @@ servers:
       # CAP_NET_BIND_SERVICE). Add a second listener with protocol: tcp if
       # plain-TCP DNS is needed.
       - protocol: udp
-        addr: 127.0.0.1:53
+        addr: 127.0.0.1:1053
 
 
 # =============================================================================
@@ -1185,9 +1208,12 @@ servers:
 #          and recorded instead of pushed to Telegram. Empty disables it.
 #          Default: "".
 #   event_log - JSONL file receiving every event, so history survives a
-#          restart. Empty keeps events in memory only. Default: "".
+#          restart. /vpn events reads it first. Empty defaults to
+#          ocserv-events.jsonl in the same directory as event_socket.
 #   event_buffer - events kept in memory for /vpn events. Default: 500,
 #          capped at 5000.
+#   timezone - timezone for events that arrive without a time. Default:
+#          Asia/Shanghai.
 #
 # /vpn commands backed by this plugin (permission: ocserv):
 #   pool | alloc <user> [ip] | free <user> | reload | restart |
@@ -1211,8 +1237,9 @@ servers:
 #       systemctl_path: systemctl
 #       disable_restart: false
 #       event_socket: /run/mosdns/ocserv-updown.sock
-#       event_log: /config/ocserv-events.jsonl
+#       event_log: /run/mosdns/ocserv-events.jsonl
 #       event_buffer: 500
+#       timezone: Asia/Shanghai
 
 
 # -----------------------------------------------------------------------------
@@ -1230,6 +1257,10 @@ servers:
 #            value fails startup rather than accepting unauthenticated peers.
 #   db_path - SQLite file for accounts and sessions. Default "radius.db" next
 #             to the process working directory; a relative path follows -d.
+#   ocserv_config - ocserv.conf path. New accounts get a fixed IP from its
+#                   ipv4-network; ocserv's own tun address is excluded.
+#   ip_pool - optional explicit pool overriding ocserv_config: "10.9.0.0/24"
+#             or "10.9.0.2-10.9.0.254". Empty means read ocserv_config.
 # -----------------------------------------------------------------------------
 #   - tag: radius
 #     type: radius
@@ -1238,6 +1269,8 @@ servers:
 #       accounting_listen: 0.0.0.0:1813
 #       secret: "replace-with-a-long-random-string"
 #       db_path: etc/mosdns/radius.db
+#       ocserv_config: /run/ocserv/dyize/ocserv.conf
+#       # ip_pool: "10.9.0.2-10.9.0.254"
 
 # -----------------------------------------------------------------------------
 # type: telegram_bot - long-polling Telegram bot that manages this process.
@@ -1283,6 +1316,8 @@ servers:
 #   proxy - optional HTTP(S) or SOCKS5 proxy for api.telegram.org.
 #   api_base - Telegram API root, for a mirror or tests.
 #   poll_timeout - long-polling timeout in seconds. Default 30.
+#   timezone - render stored unix timestamps in this zone. Empty uses the data
+#          source plugin's timezone, then Asia/Shanghai.
 #
 # Data plane commands, all resolved by tag from fakeip_tags:
 #   /net [tag]      what is installed: plane (tun/nft), device, ipv4_range,
@@ -1329,6 +1364,7 @@ servers:
 #       proxy: ""
 #       api_base: https://api.telegram.org
 #       poll_timeout: 30
+#       timezone: Asia/Shanghai
 
 # -----------------------------------------------------------------------------
 # type: sequence - ordered execution of plugins, the core of every config.
