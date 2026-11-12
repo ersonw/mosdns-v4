@@ -210,6 +210,16 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   把 DNS 一律转到本机解析器 `127.0.0.1:53`（也就是 mosdns 自己），所以客户端把 DNS 指到
   tun 网关地址、或指到公网解析器但被路由进 tun，都能拿到应答（`tun dns: query relayed to the
   host resolver`）；设备地址上非 53 的 UDP 仍按原样回 ICMP port unreachable；
+- 启动队列：Init 只做“数据面必须先有”的事（打开库、建表、装当前形状的对象、起设备），
+  遗留清理（残留 host route 扫描、非 tun 启动时的 tun 出口清理）进 `startup_queue.go` 的队列，
+  Init 返回后由单个协程按顺序执行并逐项打日志（`fakeip nat: slow startup step`，超过 1 秒才 Info）。
+  mosdns 在所有插件 Init 返回前不提供解析，这类清理每个对象一次 exec，攒下来就是几十秒
+  `ping: Unknown host`；`Close` 会先 `startupWG.Wait()` 等队列排空，再删本轮自己的路由；
+- Init 收尾日志带 `init_elapsed`，另有 `proxy-probe` / `legacy-mark-sweep` / `tun-data-path`
+  三个分步耗时，可直接指出是代理探测、迁移清理还是设备启动慢；
+- 自动 tun 设备名（未配置 `tun_dev`）改成两条全量列举：`ip -o link show` 取已占用的
+  `mth<N>`，`ip -o addr show` 找带保留地址的设备复用，再取最低空闲索引；旧实现逐个探测
+  `mth0..mth63`（最多一二百次 exec），在没有 `tun_dev` 的机器上会拖慢启动；
 - 清理前先判存在性：`nft list table` 不存在就只记 Debug，存在但 `delete` 失败则 Warn
   （`fakeip nat: removing the stale nft table failed` / `tun egress: removing the snat table failed`）；
   `nft` 本身不在 PATH 时单独 Warn，避免把"删不掉"伪装成"本来就没有"；

@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
@@ -57,25 +56,6 @@ func (p *FakeIPNatPlugin) tunConfigureCommands(dev string) []tunCommand {
 // pickTunName walks mth0, mth1, ... and takes the first name that is free. A
 // device left behind by a previous run is reused when it still carries the
 // reserved address, so restarts do not leak one device per start.
-func (p *FakeIPNatPlugin) pickTunName(ctx context.Context) (string, error) {
-	addr := p.reservedFakeIP()
-	for i := 0; i < maxAutoTunIdx; i++ {
-		name := fmt.Sprintf("%s%d", defaultTunBase, i)
-		if _, err := p.runner.Run(ctx, "ip", "link", "show", "dev", name); err != nil {
-			p.L().Debug("fakeip nat: free tun name found", zap.String("dev", name), zap.Int("index", i))
-			return name, nil
-		}
-		if out, err := p.runner.Run(ctx, "ip", "addr", "show", "dev", name); err == nil && strings.Contains(out, addr) {
-			p.L().Debug("fakeip nat: reusing leftover tun device with the reserved address",
-				zap.String("dev", name), zap.String("addr", addr))
-			return name, nil
-		}
-		p.L().Debug("fakeip nat: tun name already taken, trying the next one",
-			zap.String("dev", name), zap.String("addr", addr))
-	}
-	return "", fmt.Errorf("no free tun device name in %s0..%s%d", defaultTunBase, defaultTunBase, maxAutoTunIdx-1)
-}
-
 // openTunDevice attaches to an existing device for packet I/O.
 func (p *FakeIPNatPlugin) openTunDevice(dev string) (tunDevice, error) {
 	if len(dev) > maxTunNameLen {

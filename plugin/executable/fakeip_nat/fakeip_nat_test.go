@@ -27,6 +27,9 @@ func newTestPlugin(t *testing.T, ipv4Range string) *FakeIPNatPlugin {
 		t.Fatalf("Init(%s) failed: %v", ipv4Range, err)
 	}
 	fp := p.(*FakeIPNatPlugin)
+	// The startup queue runs behind Init; waiting here keeps every test's exec
+	// calls in its own window instead of racing the cleanup of an earlier run.
+	fp.startupWG.Wait()
 	t.Cleanup(func() { _ = fp.Close() })
 	return fp
 }

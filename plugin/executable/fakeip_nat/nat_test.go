@@ -28,6 +28,8 @@ type fakeRunner struct {
 	routes       string            // output of `ip -4 route show`
 	tableDump    string            // output of `nft list table`
 	ruleShow     string            // output of `ip rule show`
+	linksOut     string            // output of `ip -o link show`
+	addrOut      string            // output of `ip -o addr show`
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
@@ -52,6 +54,10 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 			return "", fmt.Errorf("no map")
 		}
 		return f.mappings, nil
+	case call == "ip -o link show":
+		return f.linksOut, nil
+	case call == "ip -o addr show":
+		return f.addrOut, nil
 	case call == "ip rule show":
 		return f.ruleShow, nil
 	case call == "ip route show default":

@@ -32,6 +32,10 @@ func newRealIPPlugin(t *testing.T, realIP bool) *FakeIPNatPlugin {
 		t.Fatalf("Init(realip=%v) failed: %v", realIP, err)
 	}
 	p := p0.(*FakeIPNatPlugin)
+	// Wait for the startup queue before swapping the runner in: a queued sweep
+	// that read the kernel through the fake runner would delete the ledger rows
+	// the test is about to install.
+	p.startupWG.Wait()
 	p.runner = &fakeRunner{}
 	p.probe = func(context.Context, string) bool { return true }
 	t.Cleanup(func() { _ = p.Close() })

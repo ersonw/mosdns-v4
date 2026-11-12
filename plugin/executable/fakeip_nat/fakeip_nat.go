@@ -185,6 +185,12 @@ type FakeIPNatPlugin struct {
 	// route_mark path), so the next run can undo exactly that after a crash, a
 	// mode switch or a configuration change.
 	stateTable string
+	// startupTasks is the queue of cleanup work that must not hold Init (see
+	// startup_queue.go); startupWG lets Close wait for the drain to finish
+	// before it removes the routes this run owns.
+	startupMu    sync.Mutex
+	startupTasks []startupTask
+	startupWG    sync.WaitGroup
 	// maintMu guards the maintenance loop: it flushes the ledger and re-resolves
 	// the system default route, none of which belongs on the answer path.
 	maintMu   sync.Mutex
@@ -270,6 +276,7 @@ type FakeIPNatPlugin struct {
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
+	initStarted := time.Now()
 	cfg := args.(*Args)
 
 	if cfg.DBPath == "" {
@@ -585,6 +592,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			if _, ok := dialer.(*gostEgress); ok {
 				probeBudget = 10 * time.Second
 			}
+			probeStarted := time.Now()
 			probeCtx, probeCancel := context.WithTimeout(context.Background(), probeBudget)
 			p.L().Debug("fakeip nat: probing proxy egress", zap.String("proxy", redactProxy(cfg.Proxy)))
 			if err := probeEgress(probeCtx, dialer); err != nil {
@@ -606,6 +614,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 				p.L().Info("proxy egress ready", zap.String("proxy", redactProxy(cfg.Proxy)))
 			}
 			probeCancel()
+			p.logStep("proxy-probe", probeStarted)
 		}
 	}
 
@@ -623,9 +632,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// An older build recorded nothing, so its mark rule can only be found from
 	// the mark its nft table still carries. This runs before the stale nft
 	// table is dropped, which is the only place that value survives.
+	legacyStarted := time.Now()
 	legacyCtx, legacyCancel := context.WithTimeout(context.Background(), natTimeout)
 	p.sweepLegacyMarkPath(legacyCtx)
 	legacyCancel()
+	p.logStep("legacy-mark-sweep", legacyStarted)
 
 	// The tun data path is the alternative to per-domain DNAT: it asks the
 	// system for a device and routes the whole ipv4_range into it.
@@ -639,25 +650,32 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		staleCancel()
 
 		p.L().Debug("fakeip nat: starting tun data path", zap.String("range", p.cidr))
+		tunStarted := time.Now()
 		if err := p.startTunDataPath(); err != nil {
 			p.L().Error("use_tun is enabled but the tun data path could not start; the plugin has no outlet", zap.Error(err))
 		} else {
 			// The outlet is pinned only after the device exists: the range
 			// address has to be assigned before it can be bound as a source.
 			p.setupTunEgress()
+			p.logStep("tun-data-path", tunStarted)
 		}
 	} else {
 		// Switching away from tun leaves that run's outlet behind: a SNAT table
-		// in postrouting and a policy rule for the range.
-		nftCtx, nftCancel := context.WithTimeout(context.Background(), natTimeout)
-		p.cleanupStaleTunEgress(nftCtx)
-		nftCancel()
+		// in postrouting and a policy rule for the range. The non-tun data path
+		// does not wait for either, so the removal is queued.
+		p.deferStartup("stale-tun-egress", func() {
+			nftCtx, nftCancel := context.WithTimeout(context.Background(), natTimeout)
+			defer nftCancel()
+			p.cleanupStaleTunEgress(nftCtx)
+		})
 	}
 
 	// A previous process may have stopped without cleaning up: a crash, a SIGKILL
-	// or a configuration change all leave host routes behind. They are removed
-	// before the first route of this run is written, so the two never mix.
-	p.sweepResidualRoutes()
+	// or a configuration change all leave host routes behind. The sweep removes
+	// one route per exec call, so it is queued instead of blocking Init: routes
+	// of this run are in the ledger before they are written, and the sweep only
+	// touches prefixes the ledger does not own.
+	p.deferStartup("residual-routes", p.sweepResidualRoutes)
 
 	// In tun mode the mark path belongs to realip: fakeip already routes the
 	// whole range into the device, so there is nothing for a mark to decide. The
@@ -730,8 +748,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("route_table", p.routeTable),
 		zap.Bool("route_aggregation", p.aggregateRoutes),
 		zap.Bool("proxy_active", p.proxyActive),
-		zap.Uint32("tun_mtu", p.tunMTU))
+		zap.Uint32("tun_mtu", p.tunMTU),
+		zap.Duration("init_elapsed", time.Since(initStarted)))
 
+	// Only cleanup is left in the queue, so it can start now that Init is done.
+	p.startStartupQueue()
 	return p, nil
 }
 
@@ -869,6 +890,7 @@ func (p *FakeIPNatPlugin) Close() error {
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), natTimeout)
 	p.flushLedger(flushCtx)
 	flushCancel()
+	p.startupWG.Wait()
 	p.cleanupDataPath()
 	p.stopRecordRetention()
 	p.stopTunDataPath()
