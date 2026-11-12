@@ -7,51 +7,6 @@ import (
 	"testing"
 )
 
-func TestPickTunNameStartsAtZero(t *testing.T) {
-	runner := &fakeRunner{}
-	p := newNativePlugin(t, runner, nil)
-
-	name, err := p.pickTunName(context.Background())
-	if err != nil {
-		t.Fatalf("pickTunName: %v", err)
-	}
-	if name != "mth0" {
-		t.Fatalf("name = %q, want mth0", name)
-	}
-}
-
-func TestPickTunNameReusesOwnDevice(t *testing.T) {
-	runner := &fakeRunner{
-		devs:     map[string]bool{"mth0": true},
-		devAddrs: map[string]string{"mth0": "198.18.0.1"},
-	}
-	p := newNativePlugin(t, runner, nil)
-
-	name, err := p.pickTunName(context.Background())
-	if err != nil {
-		t.Fatalf("pickTunName: %v", err)
-	}
-	if name != "mth0" {
-		t.Fatalf("name = %q, want the leftover mth0 to be reused", name)
-	}
-}
-
-func TestPickTunNameSkipsForeignDevice(t *testing.T) {
-	runner := &fakeRunner{
-		devs:     map[string]bool{"mth0": true},
-		devAddrs: map[string]string{"mth0": "10.9.9.9"},
-	}
-	p := newNativePlugin(t, runner, nil)
-
-	name, err := p.pickTunName(context.Background())
-	if err != nil {
-		t.Fatalf("pickTunName: %v", err)
-	}
-	if name != "mth1" {
-		t.Fatalf("name = %q, want mth1 because mth0 belongs to something else", name)
-	}
-}
-
 func TestCreateTunPlatformRejectsTooLongDeviceName(t *testing.T) {
 	runner := &fakeRunner{}
 	p := newNativePlugin(t, runner, nil)

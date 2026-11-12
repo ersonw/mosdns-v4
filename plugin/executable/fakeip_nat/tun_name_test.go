@@ -78,3 +78,36 @@ func TestPickTunNameTakesTheLowestFreeIndex(t *testing.T) {
 		t.Fatalf("pickTunName = %q, want mth1", name)
 	}
 }
+
+// TestPickTunNameStartsWithZero: with no leftover device the first name is mth0.
+func TestPickTunNameStartsWithZero(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	name, err := p.pickTunName(context.Background())
+	if err != nil {
+		t.Fatalf("pickTunName: %v", err)
+	}
+	if name != "mth0" {
+		t.Fatalf("pickTunName = %q, want mth0", name)
+	}
+}
+
+// TestPickTunNameSkipsForeignDevice: a device that exists but does not carry
+// the reserved address belongs to someone else and must not be adopted, even
+// when it is the only mth device and sits at the lowest index.
+func TestPickTunNameSkipsForeignDevice(t *testing.T) {
+	runner := &fakeRunner{
+		linksOut: "5: mth0: <POINTOPOINT,UP>\n",
+		addrOut:  "5: mth0    inet 10.9.9.9/32 scope global mth0\n",
+	}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	name, err := p.pickTunName(context.Background())
+	if err != nil {
+		t.Fatalf("pickTunName: %v", err)
+	}
+	if name != "mth1" {
+		t.Fatalf("pickTunName = %q, want mth1 because mth0 belongs to something else", name)
+	}
+}
