@@ -53,10 +53,6 @@ type eventStore struct {
 	closed bool
 }
 
-// defaultEventLog keeps the up/down history across restarts when event_log is
-// not set explicitly.
-const defaultEventLog = "/run/mosdns/ocserv-events.jsonl"
-
 // AdminEvents returns the newest recorded events, newest first. A non-empty
 // user filters case-insensitively. It is the read side exposed as /vpn events:
 // when event_log is set (or defaulted), the JSONL file is the source so history

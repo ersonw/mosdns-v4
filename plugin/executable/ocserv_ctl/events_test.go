@@ -187,12 +187,14 @@ func TestCloseRemovesEventSocket(t *testing.T) {
 }
 
 func TestDefaultEventLogPath(t *testing.T) {
-	a := &Args{EventSocket: filepath.Join(t.TempDir(), "events.sock")}
+	sock := filepath.Join(t.TempDir(), "run", "events.sock")
+	a := &Args{EventSocket: sock}
 	if err := a.initDefault(); err != nil {
 		t.Fatalf("initDefault: %v", err)
 	}
-	if a.EventLog != defaultEventLog {
-		t.Fatalf("event_log = %q, want %q", a.EventLog, defaultEventLog)
+	want := filepath.Join(filepath.Dir(sock), "ocserv-events.jsonl")
+	if a.EventLog != want {
+		t.Fatalf("event_log = %q, want %q", a.EventLog, want)
 	}
 }
 

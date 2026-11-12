@@ -367,8 +367,8 @@ CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中
 
 插件还会建一个 unix socket（`event_socket`）接收 ocserv 上下线钩子推送的事件：钩子每次
 connect/disconnect 发一行 JSON，插件校验后写进内存环形缓冲（`event_buffer`，默认 500 条）
-并追加到 JSONL（`event_log`；配置了 `event_socket` 但没写 `event_log` 时默认
-`/run/mosdns/ocserv-events.jsonl`），不再逐条给管理员发 Telegram。`/vpn events [n] [user]`
+并追加到 JSONL（`event_log`；配置了 `event_socket` 但没写 `event_log` 时，默认使用
+socket 同目录下的 `ocserv-events.jsonl`），不再逐条给管理员发 Telegram。`/vpn events [n] [user]`
 优先从 `event_log` 文件读取，所以进程重启后仍能回看历史；文件不可用时才退回内存缓冲。
 脚本见 `etc/ocserv/ocserv-updown.sh` 与 `etc/ocserv/ocserv_notify.py`。
 ```yaml

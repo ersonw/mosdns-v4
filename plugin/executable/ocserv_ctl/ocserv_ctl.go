@@ -32,6 +32,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,7 +93,8 @@ type Args struct {
 	// EventLog. Empty disables the channel.
 	EventSocket string `yaml:"event_socket"`
 	// EventLog is a JSONL file that outlives a restart. When EventSocket is
-	// set and EventLog is empty, it defaults to /run/mosdns/ocserv-events.jsonl.
+	// set and EventLog is empty, it defaults to ocserv-events.jsonl in the
+	// same directory as the socket.
 	EventLog string `yaml:"event_log"`
 	// EventBuffer is how many events AdminEvents keeps in memory. Default 500.
 	EventBuffer int `yaml:"event_buffer"`
@@ -124,7 +126,7 @@ func (a *Args) initDefault() error {
 	a.EventSocket = strings.TrimSpace(a.EventSocket)
 	a.EventLog = strings.TrimSpace(a.EventLog)
 	if a.EventSocket != "" && a.EventLog == "" {
-		a.EventLog = defaultEventLog
+		a.EventLog = filepath.Join(filepath.Dir(a.EventSocket), "ocserv-events.jsonl")
 	}
 	if a.EventBuffer <= 0 {
 		a.EventBuffer = 500
