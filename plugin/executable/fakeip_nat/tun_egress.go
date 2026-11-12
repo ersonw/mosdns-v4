@@ -21,12 +21,16 @@ import (
 )
 
 func (p *FakeIPNatPlugin) setupTunEgress() {
-	if p.proxyActive {
-		p.L().Debug("tun egress: proxy carries the outlet, host routing left untouched")
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	if p.proxyActive {
+		p.L().Debug("tun egress: proxy carries the outlet, host routing left untouched")
+		// The SNAT table belongs to the no-proxy outlet. A run that used it
+		// before a proxy was configured leaves the table hooked in postrouting,
+		// and this branch would never remove it.
+		p.removeStaleTunSNAT(ctx)
+		return
+	}
 
 	// Unset options mean "follow the host": the plugin reads the system
 	// default route and pins its own table to the same gateway and device, so

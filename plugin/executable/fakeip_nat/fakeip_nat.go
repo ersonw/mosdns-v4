@@ -181,6 +181,10 @@ type FakeIPNatPlugin struct {
 	// answer never waits on SQLite for a route it just installed.
 	ledger   *routeLedger
 	ledgerMu sync.Mutex
+	// stateTable records what the previous run installed on the system (the
+	// route_mark path), so the next run can undo exactly that after a crash, a
+	// mode switch or a configuration change.
+	stateTable string
 	// maintMu guards the maintenance loop: it flushes the ledger and re-resolves
 	// the system default route, none of which belongs on the answer path.
 	maintMu   sync.Mutex
@@ -413,6 +417,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	mapTable := cfg.TablePrefix + "_mapping"
 	ipTable := cfg.TablePrefix + "_real_ips"
 	routesTable := cfg.TablePrefix + "_routes"
+	stateTable := cfg.TablePrefix + "_plugin_state"
 	idxName := "idx_" + cfg.TablePrefix + "_real_ips_domain"
 
 	initSQL := fmt.Sprintf(`
@@ -436,8 +441,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		route_table TEXT DEFAULT '',
 		created_at INTEGER DEFAULT 0
 	);
+	CREATE TABLE IF NOT EXISTS %s (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL DEFAULT ''
+	);
 	CREATE INDEX IF NOT EXISTS %s ON %s(domain);`,
-		mapTable, ipTable, routesTable, idxName, ipTable,
+		mapTable, ipTable, routesTable, stateTable, idxName, ipTable,
 	)
 
 	if _, err := db.Exec(initSQL); err != nil {
@@ -488,6 +497,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		hopSuffix:         cfg.HopNameSuffix,
 		routeTable:        cfg.RouteTable,
 		routeMark:         cfg.RouteMark,
+		stateTable:        stateTable,
 		routeRulePriority: routeRulePriority,
 		tunRouteTable:     cfg.TunRouteTable,
 		aggregateRoutes:   aggregateRoutes,
@@ -649,8 +659,18 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// sweep still has to clean the host routes an earlier shape wrote, and from
 	// here on an address is only added to the nft set. A failure leaves
 	// markActive false, which the data path reads as "keep writing host routes".
-	if p.markRoutingEnabled() {
-		markCtx, markCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	markCtx, markCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// A path this run is not going to use has to be removed by its recorded
+	// identity, not by guessing: a previous run may have installed a different
+	// mark or table, or route_mark may have been dropped from the configuration
+	// altogether, and the objects would otherwise outlive every restart.
+	prevMark, prevTable := p.loadMarkState(markCtx)
+	switch {
+	case p.markRoutingEnabled():
+		if prevMark != 0 && (prevMark != p.routeMark || prevTable != p.routeTable) {
+			p.removeStaleMarkPath(markCtx, prevMark, prevTable)
+			p.clearMarkState(markCtx)
+		}
 		err := p.setupMarkRouting(markCtx)
 		if err != nil {
 			p.L().Error("route_mark is enabled but the mark routing could not be installed; falling back to host routes",
@@ -659,9 +679,15 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			// Installing is not proof: read the four objects back so a silently
 			// incomplete path shows up in the log instead of in the main table.
 			p.reportMarkRouting(markCtx)
+			p.saveMarkState(markCtx, p.routeMark, p.routeTable)
 		}
-		markCancel()
+	case prevMark != 0:
+		// route_mark is gone from the configuration (or the tun+realip
+		// combination that made it meaningful is): undo what the last run left.
+		p.removeStaleMarkPath(markCtx, prevMark, prevTable)
+		p.clearMarkState(markCtx)
 	}
+	markCancel()
 
 	// The NAT data path writes one host route per resolution. A periodic scan
 	// folds them into CIDR blocks; the tun path needs none of that.

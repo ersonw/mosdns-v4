@@ -196,6 +196,12 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   `ipv4_range`、设备自身地址，或本次运行真正路由进设备（打标成功 / 启动时恢复）的真实 IP 集合里，
   其它 IPv4 包直接丢弃（`fakeip nat: packet for an unowned destination dropped`）。被别的路由
   塞进设备的流量不会被插件代拨出去；该集合上限 4096 条，超限按最旧淘汰；
+- 上一轮装过的系统对象由记录驱动清理，不靠猜：`<table_prefix>_plugin_state` 存下实际的
+  `route_mark` / `route_table`，启动时若与当前配置不一致、或 `route_mark` 已被删除，就按记录
+  精确删掉 `ip rule fwmark <旧标记> lookup <旧表>` 与那张表的 default 路由（日志
+  `route mark: removed the policy rule a previous run installed`）；有代理时启动先删掉
+  `<table_prefix>_tun_snat` 这张只属于直连出口的表（日志
+  `tun egress: removed the snat table a proxied run does not use`），避免模式切换后残留；
 - 启动时校验已有 nft 表：`ensureNFTTable` 读回 `nft list table`，若 postrouting 仍是旧版的
   `oifname <dev> masquerade`、或缺少当前的 DNAT/drop/mss 规则，就删表重建（日志
   `fakeip nat: rebuilding the nft table so its rules match the configuration`），
