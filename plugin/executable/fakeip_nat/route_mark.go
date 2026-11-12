@@ -22,6 +22,7 @@ package fakeipnat
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -34,8 +35,13 @@ import (
 // place to look.
 const markSetName = "real_ipv4"
 
-// markRoutingEnabled reports whether the operator asked for mark routing.
-func (p *FakeIPNatPlugin) markRoutingEnabled() bool { return p.routeMark != 0 }
+// markRoutingEnabled reports whether mark routing applies to this run: the
+// operator asked for it and the tun data path is not already responsible for
+// the mapped addresses. In tun mode the whole ipv4_range is routed into the
+// device, so marking would only duplicate what the device route does; the
+// config loader rejects that combination, and this keeps the data path honest
+// if a plugin is built programmatically.
+func (p *FakeIPNatPlugin) markRoutingEnabled() bool { return p.routeMark != 0 && !p.useTun }
 
 // markActiveNow reports whether mark routing is fully installed: table, set,
 // mark rules, default route and the ip rule. Calling it before setup finished
@@ -212,4 +218,166 @@ func (p *FakeIPNatPlugin) cleanupMarkRouting(ctx context.Context) {
 	p.markMu.Unlock()
 	p.L().Info("route mark: destination mark routing removed",
 		zap.Uint32("mark", p.routeMark), zap.String("route_table", p.routeTable))
+}
+
+// The nft object names the self-check looks for. They are spelled here as
+// constants because verifyMarkRouting reads them back from the kernel and must
+// not drift from what ensureMarkTable created.
+const (
+	markPreroutingChain = "mark_prerouting"
+	markOutputChain     = "mark_output"
+)
+
+// markCheck is what the startup self-check sees on the live system.
+type markCheck struct {
+	SetExists    bool
+	SetSize      int
+	Chains       map[string]bool
+	RuleExists   bool
+	DefaultRoute bool
+}
+
+// verifyMarkRouting reads the four installed objects back from the kernel: the
+// nft set and its two chains, the policy rule, and the default route of the
+// dedicated table. Installing them is not the same as them being there — a
+// permission problem, a VyOS-managed table or an outdated binary all leave the
+// plugin running while traffic quietly keeps falling back to host routes — so
+// the shape is read back instead of assumed.
+func (p *FakeIPNatPlugin) verifyMarkRouting(ctx context.Context) markCheck {
+	var c markCheck
+	table := p.nftTableName()
+
+	// One listing covers the set and both chains; nft exits non-zero when the
+	// table itself is gone, which is exactly the case worth reporting.
+	if out, err := p.runner.Run(ctx, "nft", "-j", "list", "table", "ip", table); err == nil {
+		c.SetExists, c.SetSize, c.Chains = parseMarkTable(out)
+	}
+	if out, err := p.runner.Run(ctx, "ip", "rule", "show"); err == nil {
+		c.RuleExists = markRulePresent(out, p.routeMark, p.routeTable)
+	}
+	if out, err := p.runner.Run(ctx, "ip", "route", "show", "table", p.routeTable); err == nil {
+		c.DefaultRoute = defaultRoutePresent(out)
+	}
+	return c
+}
+
+// reportMarkRouting writes the self-check into the log: one Info line when the
+// mark path is complete, one Warn line naming the missing objects otherwise.
+func (p *FakeIPNatPlugin) reportMarkRouting(ctx context.Context) {
+	check := p.verifyMarkRouting(ctx)
+	chains := check.Chains[markPreroutingChain] && check.Chains[markOutputChain]
+	fields := []zap.Field{
+		zap.Uint32("mark", p.routeMark),
+		zap.String("route_table", p.routeTable),
+		zap.Int("rule_priority", p.routeRulePriority),
+		zap.Bool("set", check.SetExists),
+		zap.Int("set_size", check.SetSize),
+		zap.Bool("mark_chains", chains),
+		zap.Bool("ip_rule", check.RuleExists),
+		zap.Bool("default_route", check.DefaultRoute),
+	}
+	if check.SetExists && chains && check.RuleExists && check.DefaultRoute {
+		p.L().Info("route mark: startup check passed", fields...)
+		return
+	}
+	p.L().Warn("route mark: startup check found the mark path incomplete; traffic may fall back to host routes", fields...)
+}
+
+// parseMarkTable reads a `nft -j list table` document and reports whether the
+// mark set exists, how many addresses it holds, and which chains are present.
+// The walk is shape-tolerant on purpose: nft wraps every object in its own key
+// and the exact nesting differs between releases.
+func parseMarkTable(out string) (bool, int, map[string]bool) {
+	chains := map[string]bool{}
+	if strings.TrimSpace(out) == "" {
+		return false, 0, chains
+	}
+	var doc any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		// nft prints a plain error, not JSON, when the table is missing.
+		return false, 0, chains
+	}
+
+	hasSet := false
+	size := 0
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			if set, ok := t["set"].(map[string]any); ok {
+				if name, _ := set["name"].(string); name == markSetName {
+					hasSet = true
+					size = setElementCount(set)
+				}
+			}
+			if chain, ok := t["chain"].(map[string]any); ok {
+				if name, _ := chain["name"].(string); name != "" {
+					chains[name] = true
+				}
+			}
+			for _, val := range t {
+				walk(val)
+			}
+		case []any:
+			for _, item := range t {
+				walk(item)
+			}
+		}
+	}
+	walk(doc)
+	return hasSet, size, chains
+}
+
+// setElementCount counts the members of an nft set. An absent element list and
+// an empty one both mean zero addresses, which is the normal state right after
+// the set is recreated at startup.
+func setElementCount(set map[string]any) int {
+	for _, key := range []string{"elem", "elements"} {
+		if arr, ok := set[key].([]any); ok {
+			return len(arr)
+		}
+	}
+	return 0
+}
+
+// markRulePresent looks for `fwmark <mark> lookup <table>` in `ip rule show`.
+// The kernel prints the mark in hex and the table as a number unless a name is
+// registered, so both spellings are accepted.
+func markRulePresent(out string, mark uint32, table string) bool {
+	hexMark := "0x" + strconv.FormatUint(uint64(mark), 16)
+	decMark := strconv.FormatUint(uint64(mark), 10)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		var fwmark, lookup string
+		for i, field := range fields {
+			switch field {
+			case "fwmark":
+				if i+1 < len(fields) {
+					fwmark = strings.SplitN(fields[i+1], "/", 2)[0]
+				}
+			case "lookup":
+				if i+1 < len(fields) {
+					lookup = fields[i+1]
+				}
+			}
+		}
+		if fwmark != hexMark && fwmark != decMark {
+			continue
+		}
+		if lookup == table {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultRoutePresent reports whether `ip route show table X` holds a default
+// route, which is the only thing the dedicated table is supposed to contain.
+func defaultRoutePresent(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "default ") {
+			return true
+		}
+	}
+	return false
 }

@@ -2,6 +2,7 @@ package fakeipnat
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -208,5 +209,201 @@ func TestMarkModeSkipsRouteAggregation(t *testing.T) {
 	}
 	if _, ok := runner.find("ip -4 route show"); ok {
 		t.Fatalf("aggregation scanned the routing table:\n%s", strings.Join(runner.all(), "\n"))
+	}
+}
+
+// scriptRunner answers the read-only probes of the startup self-check from a
+// table of prefixes; anything it does not know fails the way a missing object
+// does. It exists so the check can be exercised without a kernel.
+type scriptRunner struct {
+	answers map[string]string
+	calls   []string
+}
+
+func (s *scriptRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	call := name + " " + strings.Join(args, " ")
+	s.calls = append(s.calls, call)
+	for prefix, out := range s.answers {
+		if strings.HasPrefix(call, prefix) {
+			return out, nil
+		}
+	}
+	return "", fmt.Errorf("fake failure: %s", call)
+}
+
+const markTableJSON = `{"nftables":[{"metainfo":{"version":"1.0.9"}},` +
+	`{"table":{"family":"ip","name":"fakeip_test"}},` +
+	`{"set":{"family":"ip","name":"real_ipv4","table":"fakeip_test","type":"ipv4_addr",` +
+	`"elem":[{"val":"23.33.184.230"},{"val":"57.145.12.1"}]}},` +
+	`{"chain":{"family":"ip","name":"mark_prerouting"}},` +
+	`{"chain":{"family":"ip","name":"mark_output"}}]}`
+
+// TestVerifyMarkRoutingReadsBackTheWholePath checks that a complete installation
+// is reported as complete, including the set size and both chain names.
+func TestVerifyMarkRoutingReadsBackTheWholePath(t *testing.T) {
+	runner := &scriptRunner{answers: map[string]string{
+		"nft -j list table ip fakeip_test": markTableJSON,
+		"ip rule show":                     "10:\tfrom all fwmark 0xa lookup Oversea_Traffic_Table\n1000:\tfrom all fwmark 0x100 lookup oversea",
+		"ip route show table oversea":      "default via 10.9.8.7 dev eth1",
+	}}
+	p := newNativePlugin(t, runner, nil)
+	p.routeMark = 256
+	p.routeTable = "oversea"
+
+	check := p.verifyMarkRouting(context.Background())
+	if !check.SetExists || check.SetSize != 2 {
+		t.Fatalf("set: exists=%v size=%d, want exists=true size=2", check.SetExists, check.SetSize)
+	}
+	if !check.Chains[markPreroutingChain] || !check.Chains[markOutputChain] {
+		t.Fatalf("chains = %v, want both mark chains", check.Chains)
+	}
+	if !check.RuleExists {
+		t.Fatalf("the fwmark 0x100 lookup oversea rule was not recognised")
+	}
+	if !check.DefaultRoute {
+		t.Fatalf("the default route of the dedicated table was not recognised")
+	}
+}
+
+// TestVerifyMarkRoutingReportsMissingObjects checks the case the self-check
+// exists for: installation silently did not take effect.
+func TestVerifyMarkRoutingReportsMissingObjects(t *testing.T) {
+	runner := &scriptRunner{answers: map[string]string{
+		// A table without the mark set and without the mark chains.
+		"nft -j list table ip fakeip_test": `{"nftables":[{"table":{"family":"ip","name":"fakeip_test"}}]}`,
+		// Only somebody else's rules are present.
+		"ip rule show":                "10:\tfrom all fwmark 0xa lookup Oversea_Traffic_Table",
+		"ip route show table oversea": "",
+	}}
+	p := newNativePlugin(t, runner, nil)
+	p.routeMark = 256
+	p.routeTable = "oversea"
+
+	check := p.verifyMarkRouting(context.Background())
+	if check.SetExists || check.SetSize != 0 {
+		t.Fatalf("set: exists=%v size=%d, want exists=false size=0", check.SetExists, check.SetSize)
+	}
+	if len(check.Chains) != 0 {
+		t.Fatalf("chains = %v, want none", check.Chains)
+	}
+	if check.RuleExists {
+		t.Fatalf("a rule with mark 0xa must not satisfy mark 0x100")
+	}
+	if check.DefaultRoute {
+		t.Fatalf("an empty table must not report a default route")
+	}
+}
+
+// TestVerifyMarkRoutingTreatsNftErrorsAsAbsent checks that a missing table or a
+// non-JSON answer counts as "not installed" instead of panicking.
+func TestVerifyMarkRoutingTreatsNftErrorsAsAbsent(t *testing.T) {
+	p := newNativePlugin(t, &scriptRunner{}, nil) // every command fails
+	p.routeMark = 256
+	p.routeTable = "oversea"
+
+	check := p.verifyMarkRouting(context.Background())
+	if check.SetExists || check.RuleExists || check.DefaultRoute {
+		t.Fatalf("check = %+v, want every object absent", check)
+	}
+}
+
+// TestMarkRulePresentMatchesKernelSpellings covers the shapes `ip rule show`
+// can print: hex, decimal, a masked mark and a named table.
+func TestMarkRulePresentMatchesKernelSpellings(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"hex mark", "1000:\tfrom all fwmark 0x100 lookup 1001", true},
+		{"decimal mark", "1000:\tfrom all fwmark 256 lookup 1001", true},
+		{"masked mark", "1000:\tfrom all fwmark 0x100/0xffffffff lookup 1001", true},
+		{"named table", "1000:\tfrom all fwmark 0x100 lookup oversea", true},
+		{"other mark", "10:\tfrom all fwmark 0xa lookup 1001", false},
+		{"other table", "1000:\tfrom all fwmark 0x100 lookup Oversea_Traffic_Table", false},
+		{"empty", "", false},
+	}
+	for _, c := range cases {
+		table := "1001"
+		if c.name == "named table" {
+			table = "oversea"
+		}
+		if got := markRulePresent(c.out, 256, table); got != c.want {
+			t.Fatalf("%s: markRulePresent = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestDefaultRoutePresent checks that only a default route counts, not the
+// per-address entries the old shape wrote.
+func TestDefaultRoutePresent(t *testing.T) {
+	if !defaultRoutePresent("default via 10.9.8.7 dev eth1") {
+		t.Fatalf("a plain default route was not recognised")
+	}
+	if defaultRoutePresent("23.33.184.230 via 10.9.8.7 dev eth1") {
+		t.Fatalf("a host route must not count as a default route")
+	}
+	if defaultRoutePresent("") {
+		t.Fatalf("an empty table must not report a default route")
+	}
+}
+
+// TestMarkRoutingSkipsTunMode pins the non-tun-only rule: with use_tun the
+// marking path is disabled even when route_mark is set, so neither setup nor
+// cleanup touches the kernel.
+func TestMarkRoutingSkipsTunMode(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newMarkPlugin(t, runner)
+	p.useTun = true
+
+	if p.markRoutingEnabled() {
+		t.Fatalf("mark routing must stay disabled in tun mode")
+	}
+	p.cleanupMarkRouting(context.Background())
+	if calls := runner.all(); len(calls) != 0 {
+		t.Fatalf("cleanup in tun mode issued commands: %v", calls)
+	}
+}
+
+// TestHostRouteTableKeepsTheDedicatedTableFree pins the split of responsibilities:
+// route_table belongs to the mark path, and every per-address route (the
+// fallback after a failed set write, the aggregation scan, the ledger row) goes
+// to main instead. Writing such a route into the dedicated table would strand it,
+// because only packets that already carry the mark ever look there.
+func TestHostRouteTableKeepsTheDedicatedTableFree(t *testing.T) {
+	p := newMarkPlugin(t, &fakeRunner{})
+	if got := p.hostRouteTable(); got != "main" {
+		t.Fatalf("host route table with marking enabled = %q, want main", got)
+	}
+
+	p.routeMark = 0
+	if got := p.hostRouteTable(); got != "oversea" {
+		t.Fatalf("host route table without marking = %q, want the configured oversea", got)
+	}
+}
+
+// TestMarkedFallbackRouteIsRecordedInMain checks the whole fallback: the set
+// write fails, the host route is written with main, and the ledger records main
+// so cleanup deletes it from the table it was actually written into.
+func TestMarkedFallbackRouteIsRecordedInMain(t *testing.T) {
+	runner := &fakeRunner{failContains: "nft add element"}
+	p := newMarkPlugin(t, runner)
+	p.nextHop = "10.9.8.7"
+	p.nextHopDev = "eth1"
+	p.markMu.Lock()
+	p.markActive = true // installed earlier; only the set write fails here
+	p.markMu.Unlock()
+
+	p.applyHostRoute(context.Background(), "203.0.113.10", "10.9.8.7", "eth1")
+
+	routes, err := p.ledgerRoutes(context.Background())
+	if err != nil {
+		t.Fatalf("read ledger failed: %v", err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("ledger rows = %d, want the one fallback route", len(routes))
+	}
+	if routes[0].routeTable != "main" {
+		t.Fatalf("fallback route recorded in table %q, want main", routes[0].routeTable)
 	}
 }

@@ -38,10 +38,10 @@ func (p *FakeIPNatPlugin) rememberManagedRoute(ctx context.Context, prefix, hop,
 		fmt.Sprintf("INSERT INTO %s (prefix, next_hop, dev, route_table, created_at) VALUES (?, ?, ?, ?, ?) "+
 			"ON CONFLICT(prefix) DO UPDATE SET next_hop = excluded.next_hop, dev = excluded.dev, route_table = excluded.route_table",
 			p.routesTable),
-		prefix, hop, dev, p.routeTable, time.Now().Unix())
+		prefix, hop, dev, p.hostRouteTable(), time.Now().Unix())
 	if err != nil {
 		p.L().Warn("fakeip nat: record managed route failed",
-			zap.String("prefix", prefix), zap.String("route_table", p.routeTable), zap.Error(err))
+			zap.String("prefix", prefix), zap.String("route_table", p.hostRouteTable()), zap.Error(err))
 	}
 }
 

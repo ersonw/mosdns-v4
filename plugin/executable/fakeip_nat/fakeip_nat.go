@@ -579,6 +579,16 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// before the first route of this run is written, so the two never mix.
 	p.sweepResidualRoutes()
 
+	// Mark routing belongs to the non-tun data path only: with a tun device the
+	// whole ipv4_range is already routed into it, so marking would steer the
+	// same packets twice. The config loader rejects route_mark + use_tun, and
+	// this second check keeps a programmatically built plugin from installing
+	// objects nobody asked for.
+	if p.routeMark != 0 && p.useTun {
+		p.L().Warn("route_mark is ignored in tun mode: the tun data path owns the mapped addresses",
+			zap.Uint32("route_mark", p.routeMark))
+	}
+
 	// Mark routing is installed after the sweep and before any resolution: the
 	// sweep still has to clean the host routes an earlier shape wrote, and from
 	// here on an address is only added to the nft set. A failure leaves
@@ -586,11 +596,15 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if p.markRoutingEnabled() {
 		markCtx, markCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := p.setupMarkRouting(markCtx)
-		markCancel()
 		if err != nil {
 			p.L().Error("route_mark is enabled but the mark routing could not be installed; falling back to host routes",
 				zap.Uint32("route_mark", p.routeMark), zap.String("route_table", p.routeTable), zap.Error(err))
+		} else {
+			// Installing is not proof: read the four objects back so a silently
+			// incomplete path shows up in the log instead of in the main table.
+			p.reportMarkRouting(markCtx)
 		}
+		markCancel()
 	}
 
 	// The NAT data path writes one host route per resolution. A periodic scan

@@ -163,10 +163,16 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
 
 - 非映射流量不查专用表，`ip rule` 只匹配带标记的包，主表不再被污染；
 - 打标模式下 `route_aggregation` 的扫描直接跳过：地址不在任何路由表里，无可折叠也无可清理；
-- 集合写入失败会回落成写 host route 并打 Warn，数据面不断流；nft 对象或 `ip rule` 装不上时整体回落，
+- 集合写入失败会回落成写 host route 并打 Warn，数据面不断流；此时路由写进 **main**（专用表只留给带标记的包，
+  把回落路由写进去等于白写），账本同样记 `main`，停机时按记录原样删除；nft 对象或 `ip rule` 装不上时整体回落，
   `route_mark` 只打 Error，不影响 DNS 服务；
 - 与 `use_tun` 互斥（tun 自己管整段路由），且仅 Linux 支持，其他平台启动即报错；
-- 清理只做三件事：删 `ip rule`、删专用表的 default、删整张 nft 表，不会残留。
+- 清理只做三件事：删 `ip rule`、删专用表的 default、删整张 nft 表，不会残留；
+- 只对非 tun 数据面生效：`use_tun: true` 时打标整体停用（配置加载阶段会直接拒绝这对组合，
+  运行时再拦一次），tun 自己已经接管整段路由；
+- 装上后立刻自检并写日志：`route mark: startup check passed`（带 `set` / `set_size` /
+  `mark_chains` / `ip_rule` / `default_route` 五个字段）；任一对象缺失则打 Warn
+  `route mark: startup check found the mark path incomplete`，不会等到主表被灌满才发现。
 
 #### TUN 下的 TCP / UDP / ICMP 语义
 

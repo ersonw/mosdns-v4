@@ -47,8 +47,8 @@ func routeDeleteCommands(prefix, table string) [][]string {
 // managed routes.
 func (p *FakeIPNatPlugin) listManagedRoutes(ctx context.Context, hop, dev string) []string {
 	args := []string{"-4", "route", "show"}
-	if p.routeTable != "" && p.routeTable != "main" {
-		args = append(args, "table", p.routeTable)
+	if table := p.hostRouteTable(); table != "" && table != "main" {
+		args = append(args, "table", table)
 	}
 	out, err := p.runner.Run(ctx, "ip", args...)
 	if err != nil {

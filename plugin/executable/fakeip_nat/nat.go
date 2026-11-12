@@ -268,7 +268,10 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 		}
 	}
 
-	commands := routeWriteCommands(ip+"/32", hop, dev, p.routeTable)
+	// Mark routing owns route_table, so a fallback host route goes to the table
+	// unmarked traffic uses; writing it into the dedicated table would strand it.
+	table := p.hostRouteTable()
+	commands := routeWriteCommands(ip+"/32", hop, dev, table)
 	if len(commands) == 0 {
 		p.L().Debug("fakeip nat: host route skipped, platform has no usable route command",
 			zap.String("real_ip", ip), zap.String("next_hop", hop), zap.String("dev", dev))
@@ -277,7 +280,7 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 	for _, cmd := range commands {
 		if _, err := p.runner.Run(ctx, cmd[0], cmd[1:]...); err != nil {
 			p.L().Warn("apply host route failed",
-				zap.String("real_ip", ip), zap.String("route_table", p.routeTable), zap.Strings("cmd", cmd), zap.Error(err))
+				zap.String("real_ip", ip), zap.String("route_table", table), zap.Strings("cmd", cmd), zap.Error(err))
 			return
 		}
 	}
@@ -286,7 +289,7 @@ func (p *FakeIPNatPlugin) applyHostRoute(ctx context.Context, ip, hop, dev strin
 	p.rememberManagedRoute(ctx, ip+"/32", hop, dev)
 	p.L().Debug("fakeip nat: host route applied",
 		zap.String("real_ip", ip), zap.String("next_hop", hop), zap.String("dev", dev),
-		zap.String("route_table", p.routeTable))
+		zap.String("route_table", table))
 }
 
 // aggregateManagedRoutes folds every route that steers traffic to the
@@ -385,9 +388,10 @@ func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []
 		kept[pfx.String()] = struct{}{}
 	}
 
+	table := p.hostRouteTable()
 	withTable := func(args []string) []string {
-		if p.routeTable != "" && p.routeTable != "main" {
-			return append(args, "table", p.routeTable)
+		if table != "" && table != "main" {
+			return append(args, "table", table)
 		}
 		return args
 	}
@@ -435,7 +439,7 @@ func (p *FakeIPNatPlugin) collapseManagedRoutes(ctx context.Context, original []
 func (p *FakeIPNatPlugin) deleteManagedRoutes(ctx context.Context, prefixes []string) int {
 	deleted := 0
 	for _, prefix := range prefixes {
-		commands := routeDeleteCommands(prefix, p.routeTable)
+		commands := routeDeleteCommands(prefix, p.hostRouteTable())
 		if len(commands) == 0 {
 			continue
 		}
@@ -644,7 +648,7 @@ func (p *FakeIPNatPlugin) syncRealRoutes(ctx context.Context, ips []string) {
 
 	p.L().Info("realip routes updated",
 		zap.Strings("real_ips", ips), zap.String("next_hop", hop), zap.String("dev", dev),
-		zap.Int("applied", applied), zap.String("route_table", p.routeTable))
+		zap.Int("applied", applied), zap.String("route_table", p.hostRouteTable()))
 }
 
 // selectReachable probes every candidate in parallel and returns the first
@@ -827,4 +831,17 @@ func mergeSiblings(a, b netip.Prefix) (netip.Prefix, bool) {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], av)
 	return netip.PrefixFrom(netip.AddrFrom4(buf), bits-1), true
+}
+
+// hostRouteTable is the table per-address host routes are written into.
+// Mark routing takes route_table over for its dedicated table, which is only
+// reachable by packets that already carry the mark. A host route written there
+// after a failed set write would therefore route nothing at all, so the fallback
+// goes to main: the table unmarked traffic already consults, which is exactly
+// the shape the mark path replaced.
+func (p *FakeIPNatPlugin) hostRouteTable() string {
+	if p.markRoutingEnabled() {
+		return "main"
+	}
+	return p.routeTable
 }
