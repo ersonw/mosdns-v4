@@ -5,3 +5,6 @@
 /etc/mosdns/fakeip.db-wal
 /build/
 /crossbuild
+/etc/mosdns/radius.db
+/etc/mosdns/radius.db-shm
+/etc/mosdns/radius.db-wal

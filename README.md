@@ -138,13 +138,15 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
       record_ttl: "168h"                 # 记录保留期；留空 = 7 天，"0" = 不清理
       access_log: true                    # 记录每个源 IP 解析了哪些域名，默认 true
       access_ttl: "168h"                  # 访问记录保留期；留空 = 7 天，"0" = 不清理
+      timezone: Asia/Shanghai             # 展示数据库时间用的时区；留空 = Asia/Shanghai
 ```
 
 `access_log` 打开后，每回答一个 fake IP 就在同一份 SQLite 的 `<table_prefix>_access` 表里记一行
 `(client_ip, domain)`，带 `fake_ip`、`first_seen`、`last_seen`、`hits`；真实 IP 不重复存，读取时
 从 real IP 表按域名取最新一条，所以之后学到的地址也能看到。写入在应答路径上但失败只告警，
 不影响查询；`access_ttl` 与映射共用同一个清理循环（间隔取两者较小的 TTL）。这些记录由
-telegram_bot 的 `/access` 导出成 Excel。
+telegram_bot 的 `/access` 导出成 Excel。数据库里存的是 Unix 秒，时区不影响写入；各插件与
+bot 的 `timezone` 只决定管理端如何显示，未填时统一按 `Asia/Shanghai`。
 
 `record_ttl` 控制数据库与内存里映射记录的保留期：启动 5 秒后先扫一次，之后每
 `min(record_ttl, 1h)`（不低于 1 分钟）扫一次，把「内存 touch / 库内 `last_seen` / `created_at`
@@ -363,7 +365,10 @@ CN 分级分流（`etc/mosdns/config.yaml` 的 `main`）分两级：域名命中
 解析 `ipv4-network`/`ipv4-netmask` 与 `config-per-user`，把网段首个可用地址留给 tun 服务端，
 其余按需分配给用户（写 `explicit-ipv4`，改完 `/vpn reload` 生效）；并通过 `systemctl`
 执行 `reload`（保留在线会话）与 `restart`（断开所有会话，可用 `disable_restart: true` 禁用）。
-`config-per-user` 在 `auth = "radius[...,groupconfig=true]"` 时不生效，两种方式不要混用。
+ocserv 1.1.6 里 `config-per-user` / `config-per-group` 要求补充配置来源是 file；如果 `auth` 写了
+`groupconfig=true`，补充配置会切到 radius，启动直接报
+`specified config-per-user or config-per-group but supplemental config is 'radius'`。要用组/用户
+配置文件就删掉 `groupconfig=true`；要让 RADIUS 下发补充配置就删掉 `config-per-*`，二选一。
 
 插件还会建一个 unix socket（`event_socket`）接收 ocserv 上下线钩子推送的事件：钩子每次
 connect/disconnect 发一行 JSON，插件校验后写进内存环形缓冲（`event_buffer`，默认 500 条）
@@ -386,17 +391,24 @@ socket 同目录下的 `ocserv-events.jsonl`），不再逐条给管理员发 Te
       event_socket: /run/mosdns/ocserv-updown.sock
       event_log: /run/mosdns/ocserv-events.jsonl
       event_buffer: 500
+      timezone: Asia/Shanghai            # 无时间字段的事件按此时区落盘
 ```
 ### radius
 给 ocserv 当 RADIUS 服务端：账号由插件自己存在本地 SQLite，不再从 ocserv 的 `ocpasswd` 读。
 ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用户名、密码与启用状态，
 通过时把账号的 group 作为 `Class` 属性回给 ocserv；账号配置了固定 IP 时再回
 `Framed-IP-Address(8)`，ocserv 每次登录都给该用户同一个隧道地址。打开记账后同时收 `Accounting-Request`，
-在 `radius_sessions` 里记录每个会话的起止时间、客户端地址与收发字节。
+在 `radius_sessions` 里记录每个会话的起止时间、客户端地址与收发字节。每个账号还累计上下行
+流量（`used_in` / `used_out`），可以设置总流量上限（`max_total`，0 表示无限制）和重置周期
+（`reset_period`，0 表示不自动重置）。每次 interim/stop 只把该会话新产生的字节加进账号，
+重复记录不会重复计费；累计达到上限时账号自动禁用，周期到点后清零并只恢复因配额被禁用的账号。
+`Acct-Input/Output-Gigawords` 会与低 32 位合成为 64 位总量，长会话不会在 4 GiB 处回绕。
 只实现 PAP：若客户端协商成 EAP-MSCHAPv2，ocserv 发来的是 `CHAP-Password`，插件明确回 Reject
 并提示改用 PAP，不会静默丢包。密码按 PBKDF2-HMAC-SHA256（12000 轮加盐）存，明文不落盘；
 账号的增删改由 `telegram_bot` 的 `/user` 完成，固定 IP 用 `/user ip <name> <ipv4|->`
-设置或清除（`-` 表示清除固定 IP）。配置 `ocserv_config` 后，新增账号会自动从 ocserv 的
+设置或清除（`-` 表示清除固定 IP）。流量上限用 `/user limit <name> <max|0|-> [period|0|-]`
+设置（`0` / `-` 表示无限制或永不重置，`period` 支持 `30d` / `168h`；省略 `period` 保留当前重置周期），`/user usage <name>`
+看上下行和剩余额度，`/user reset <name>` 立即清零并重新开始周期。配置 `ocserv_config` 后，新增账号会自动从 ocserv 的
 `ipv4-network` 分配一个固定地址：从池高端向下找空闲地址，ocserv 自己的 tun 地址（默认首个
 可用地址，或 `ipv4-network = 10.9.0.1/24` / `server-ip` 显式写出的地址）不参与分配。
 ```yaml
@@ -411,6 +423,7 @@ ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用
       ocserv_config: /run/ocserv/dyize/ocserv.conf
       # 可选：手动指定池，优先于 ocserv_config；CIDR 或 起始-结束
       # ip_pool: "10.9.0.2-10.9.0.254"
+      timezone: Asia/Shanghai           # 展示账号与会话时间用的时区
 ```
 老库（`radius_users` 还没有 `ip` 列）在插件启动时自动补列，不需要手工迁移；固定 IP 由
 `ip <> ''` 的部分唯一索引约束，同一个地址不能同时绑两个账号。
@@ -428,12 +441,13 @@ accounting[0].secret = 换成一串随机字符
 `getUpdates`，`token` 缺失或 `chat_ids` 为空时插件保持禁用（不建连、不占线程）。每个 chat 绑定
 一个角色，角色决定它能发哪些命令；只列在 `chat_ids` 里的 chat 用 `default_role`（默认 `admin`）。
 两个角色是内置的，不必在 `roles` 里声明：`admin` 只能查看状态、管理 RADIUS 用户、查看和操作
-ocserv、导出指定用户的访问记录（`status`/`ocserv`/`radius`/`access`）；`superadmin` 拥有全部权限。
+ocserv、导出指定用户的访问记录、管理 `data_providers` 域名列表（`status`/`ocserv`/`radius`/`access`/`provider`）；
+`superadmin` 继承 `admin`，并附加其余全部权限。
 常用命令：`/status`、`/net`（数据面观测：tun 设备、代理是否生效、打标与表号、本插件在
 `ip rule show` 里的规则、出口表的 default、nft 标记集合大小）、`/ledger`（账本里记了哪些待清理对象）、
 `/sweep`（按账本删掉当前配置不拥有的残留，`kill -9` 之后可以手动收尾）、`/diag <domain>`（一次诊断：
 假 IP、已学到的真实 IP、出口是代理还是 `next_hop`）、`/fip`（查看或切换 fakeip_nat 的映射，`/fip <tag> <sub>` 指定插件）、
-`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务、回看上下线事件）、`/user`（增删改 RADIUS 账号、用 `/user ip` 绑定固定 IP、查记账会话）、`/config`（读写 mosdns 配置字段）、`/exec`（跑白名单脚本）、
+`/vpn`（查 ocserv 在线用户、按网段分配固定 IP、reload/restart 服务、回看上下线事件）、`/user`（增删改 RADIUS 账号、用 `/user ip` 绑定固定 IP、用 `/user limit <name> <10GB|0|-> [30d|0|-]` 设置流量上限与重置周期、用 `/user usage <name>` 查看上下行用量、用 `/user reset <name>` 手动清零、查记账会话）、`/config`（读写 mosdns 配置字段）、`/provider`（按 `data_providers` 节点增/改/删/清空域名，`.txt` 还可分页列出）、`/exec`（跑白名单脚本）、
 `/proxy`（读或写 fakeip 的出口代理，`/proxy on <url>` / `/proxy off`，写完要 `/reload confirm`）、
 `/help`（只列出当前 chat 有权限执行的命令，并按组隐藏整组；`/help` 本身不受权限限制）、
 `/audit`（最近的管理动作：谁在什么时候改了配置或跑了脚本，写 `telegram_bot_audit.log`，只记键路径不记值）、
@@ -452,7 +466,7 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       chat_ids: [123456789]              # 允许交互的 chat，空则不启用
       admins:
         - chat_id: 123456789
-          role: superadmin                # 内置：全部权限
+          role: superadmin                # 内置：继承 admin + 其余全部权限
         - chat_id: 987654321
           role: admin                     # 内置：状态 + 用户 + ocserv + 访问记录导出
       roles:                              # 自定义角色，可 inherits: [admin] 复用内置角色
@@ -463,10 +477,15 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       ocserv_tags: ["ocserv_user"]        # /vpn 可查询的 ocserv_ctl 插件 tag
       radius_tags: ["radius"]             # /user 可管理的 radius 插件 tag
       config_path: etc/mosdns/config.yaml # /config 改写的文件，留空取 -c 参数
+      domain_manage_script: /etc/mosdns/domain_manage.py # 文本域名列表脚本
+      txt2dat_script: /etc/mosdns/txt2dat.py             # 文本 -> v2dat 脚本
+      domain_python: python3              # *.py 使用这个解释器
+      domain_timeout: 30                  # 单次脚本超时（秒）
       audit_log: ""                       # 审计日志，留空取配置目录下 telegram_bot_audit.log
       proxy: ""                           # 例如 socks5://127.0.0.1:1080
       api_base: https://api.telegram.org
       poll_timeout: 30
+      timezone: Asia/Shanghai            # 留空则跟随数据源插件，最终兜底上海时区
 ```
 
 ## 构建与发布

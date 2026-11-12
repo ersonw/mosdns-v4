@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/pkg/timeutil"
+
 	"go.uber.org/zap"
 )
 
@@ -326,7 +328,11 @@ func (p *ocservCtl) validateEvent(ev *updownEvent) error {
 		return fmt.Errorf("byte counters must not be negative")
 	}
 	if strings.TrimSpace(ev.Time) == "" {
-		ev.Time = time.Now().Format("2006-01-02 15:04:05")
+		loc := p.loc
+		if loc == nil {
+			loc = timeutil.MustDefault()
+		}
+		ev.Time = time.Now().In(loc).Format("2006-01-02 15:04:05")
 	}
 	return nil
 }

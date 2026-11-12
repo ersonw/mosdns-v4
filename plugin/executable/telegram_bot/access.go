@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"github.com/ersonw/mosdns-v4/plugin/executable/radius"
 	tgbot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -29,6 +30,11 @@ const accessHelp = `usage:
 /access <user> [days]   export that RADIUS user's visit records (default 7 days, max 365)
 /access <ip> [days]     export the records of one client address directly
 The result is sent to this chat as an .xlsx file.`
+
+const accessHelpZH = `用法：
+/access <user> [days]   导出该 RADIUS 用户的访问记录（默认 7 天，最多 365 天）
+/access <ip> [days]     直接导出某个客户端地址的记录
+结果会以 .xlsx 文件发送到本会话。`
 
 // accessRecordRow is one exported line, already resolved to text so the sheet
 // writer only deals with values.
@@ -42,10 +48,11 @@ type accessRecordRow struct {
 	last     int64
 }
 
-func (p *telegramBot) handleAccess(ctx context.Context, chatID int64, args []string) (string, error) {
+func (p *telegramBot) handleAccess(ctx context.Context, chatID int64, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, rest := pickTag(p.args.RadiusTags, args)
 	if len(rest) == 0 || rest[0] == "help" {
-		return accessHelp, nil
+		return l.t(accessHelp, accessHelpZH), nil
 	}
 	target := rest[0]
 	days := 7
@@ -60,26 +67,32 @@ func (p *telegramBot) handleAccess(ctx context.Context, chatID int64, args []str
 
 	// A bare address is accepted so an administrator can look up a machine that
 	// never authenticated through RADIUS (a router, a phone, a test host).
+	loc := p.loc
+	if loc == nil {
+		loc = timeutil.MustDefault()
+	}
 	var addresses []string
 	if addr, err := netip.ParseAddr(target); err == nil {
 		addresses = []string{addr.Unmap().String()}
 	} else {
-		rad, err := p.resolveRadiusFor(tag)
+		rad, err := p.resolveRadiusFor(tag, l)
 		if err != nil {
 			return "", err
 		}
+		loc = p.locationFor(rad)
 		users, err := rad.Users()
 		if err != nil {
-			return "", fmt.Errorf("read radius users: %w", err)
+			return "", fmt.Errorf(l.t("read radius users: %w", "读取 radius 用户失败：%w"), err)
 		}
 		fixed := fixedIPOfUser(users, target)
 		sessions, err := rad.Sessions(false, 5000)
 		if err != nil {
-			return "", fmt.Errorf("read radius sessions: %w", err)
+			return "", fmt.Errorf(l.t("read radius sessions: %w", "读取 radius 会话失败：%w"), err)
 		}
 		addresses = addressesOfUser(sessions, fixed, target)
 		if len(addresses) == 0 {
-			return fmt.Sprintf("no fixed IP or accounting session with an address for user %q; use /access <ip> if the address is known", target), nil
+			return l.t(fmt.Sprintf("no fixed IP or accounting session with an address for user %q; use /access <ip> if the address is known", target),
+				fmt.Sprintf("用户 %q 没有固定 IP，也没有带地址的记账会话；如果知道地址，请用 /access <ip>", target)), nil
 		}
 	}
 
@@ -89,37 +102,43 @@ func (p *telegramBot) handleAccess(ctx context.Context, chatID int64, args []str
 		return "", err
 	}
 	if len(rows) == 0 {
-		return fmt.Sprintf("no visit records for %s in the last %d days", strings.Join(addresses, ", "), days), nil
+		return l.t(fmt.Sprintf("no visit records for %s in the last %d days", strings.Join(addresses, ", "), days),
+			fmt.Sprintf("%s 在最近 %d 天内没有访问记录", strings.Join(addresses, ", "), days)), nil
 	}
 
 	cells := [][]interface{}{
-		{"client_ip", "domain", "real_ip", "fake_ip", "hits", "first_seen", "last_seen"},
+		{l.t("client_ip", "客户端 IP"), l.t("domain", "域名"), l.t("real_ip", "真实 IP"),
+			l.t("fake_ip", "fake IP"), l.t("hits", "次数"), l.t("first_seen", "首次出现"),
+			l.t("last_seen", "最后出现")},
 	}
 	for _, r := range rows {
 		cells = append(cells, []interface{}{
 			r.clientIP, r.domain, r.realIP, r.fakeIP, r.hits,
-			formatUnix(r.first), formatUnix(r.last),
+			formatUnix(r.first, loc), formatUnix(r.last, loc),
 		})
 	}
 
 	data, err := writeXLSX("access", cells)
 	if err != nil {
-		return "", fmt.Errorf("build xlsx: %w", err)
+		return "", fmt.Errorf(l.t("build xlsx: %w", "生成 xlsx 失败：%w"), err)
 	}
 
-	filename := fmt.Sprintf("access-%s-%s.xlsx", safeFilePart(target), time.Now().Format("20060102"))
-	caption := fmt.Sprintf("access records: %s\naddresses: %s\nrows: %d\ntags: %s\nwindow: last %d days",
-		target, strings.Join(addresses, ", "), len(rows), strings.Join(tags, ", "), days)
+	filename := fmt.Sprintf("access-%s-%s.xlsx", safeFilePart(target), time.Now().In(loc).Format("20060102"))
+	caption := l.t(
+		fmt.Sprintf("access records: %s\naddresses: %s\nrows: %d\ntags: %s\nwindow: last %d days",
+			target, strings.Join(addresses, ", "), len(rows), strings.Join(tags, ", "), days),
+		fmt.Sprintf("访问记录：%s\n地址：%s\n行数：%d\n标签：%s\n窗口：最近 %d 天",
+			target, strings.Join(addresses, ", "), len(rows), strings.Join(tags, ", "), days))
 
 	if p.tb == nil {
-		return "", fmt.Errorf("telegram client is not running")
+		return "", fmt.Errorf("%s", l.t("telegram client is not running", "Telegram 客户端未运行"))
 	}
 	if _, err := p.tb.SendDocument(ctx, &tgbot.SendDocumentParams{
 		ChatID:   chatID,
 		Document: &models.InputFileUpload{Filename: filename, Data: bytes.NewReader(data)},
 		Caption:  caption,
 	}); err != nil {
-		return "", fmt.Errorf("send document: %w", err)
+		return "", fmt.Errorf(l.t("send document: %w", "发送文件失败：%w"), err)
 	}
 	p.L().Info("telegram access export sent",
 		zap.Int64("chat_id", chatID), zap.String("target", target),
@@ -201,11 +220,8 @@ func (p *telegramBot) collectAccessRows(ctx context.Context, addresses []string,
 	return rows, tags, nil
 }
 
-func formatUnix(ts int64) string {
-	if ts <= 0 {
-		return ""
-	}
-	return time.Unix(ts, 0).Format("2006-01-02 15:04:05")
+func formatUnix(ts int64, loc *time.Location) string {
+	return timeutil.FormatUnix(ts, "2006-01-02 15:04:05", loc)
 }
 
 // safeFilePart keeps a user name or address from breaking the file name.

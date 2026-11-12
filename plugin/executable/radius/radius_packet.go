@@ -22,25 +22,27 @@ const (
 
 // Attribute types this server reads or writes.
 const (
-	attrUserName            = 1
-	attrUserPassword        = 2
-	attrCHAPPassword        = 3
-	attrNASIPAddress        = 4
-	attrNASPort             = 5
-	attrServiceType         = 6
-	attrFramedIPAddress     = 8
-	attrReplyMessage        = 18
-	attrState               = 24
-	attrVendorSpecific      = 26
-	attrNASIdentifier       = 32
-	attrProxyState          = 33
+	attrUserName        = 1
+	attrUserPassword    = 2
+	attrCHAPPassword    = 3
+	attrNASIPAddress    = 4
+	attrNASPort         = 5
+	attrServiceType     = 6
+	attrFramedIPAddress = 8
+	attrReplyMessage    = 18
+	attrState           = 24
+	attrVendorSpecific  = 26
+	attrNASIdentifier   = 32
+	attrProxyState      = 33
 	// RFC 2866 numbering. Note the split: 42/43 are the byte counters, while
 	// 46/47 are the packet counters, which this server does not read.
-	attrAcctStatusType      = 40
-	attrAcctInputOctets     = 42
-	attrAcctOutputOctets    = 43
-	attrAcctSessionID       = 44
-	attrAcctSessionTime     = 45
+	attrAcctStatusType       = 40
+	attrAcctInputOctets      = 42
+	attrAcctOutputOctets     = 43
+	attrAcctSessionID        = 44
+	attrAcctSessionTime      = 45
+	attrAcctInputGigawords   = 84
+	attrAcctOutputGigawords  = 85
 	attrMessageAuthenticator = 80
 )
 

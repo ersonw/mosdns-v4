@@ -38,6 +38,7 @@ const (
 	PermOcserv     = "ocserv"      // /vpn
 	PermRadius     = "radius"      // /user
 	PermConfig     = "config"      // /config read and write
+	PermProvider   = "provider"    // /provider data source management
 	PermReload     = "reload"      // /reload confirm
 	PermExecScript = "exec_script" // /exec <tag> <ip> <domain>
 	PermAccess     = "access"      // /access <user> [days]: export visit records
@@ -49,32 +50,55 @@ const (
 // Built-in roles. They are not declared under roles:, they always exist,
 // and a config role may inherit them.
 const (
-	// RoleAdmin observes: status, user management, ocserv, and the access
-	// record export. It cannot touch the config file, run scripts, reload the
-	// process or rewrite fakeip mappings.
+	// RoleAdmin observes: status, user management, ocserv, the access record
+	// export and data_providers domain lists. It cannot touch the config file,
+	// run scripts, reload the process or rewrite fakeip mappings.
 	RoleAdmin = "admin"
-	// RoleSuperAdmin holds every permission, including the write paths above.
+	// RoleSuperAdmin inherits RoleAdmin and adds every remaining permission.
 	RoleSuperAdmin = "superadmin"
 )
 
+// allPermissions is the canonical list used to validate role allow entries.
 var allPermissions = []string{
 	PermStatus,
 	PermFakeIP,
 	PermOcserv,
 	PermRadius,
 	PermConfig,
+	PermProvider,
 	PermReload,
 	PermExecScript,
 	PermAccess,
 }
 
 // adminPermissions is the built-in plain administrator: see everything, manage
-// people and the VPN session set, but never change how the process runs.
+// people, the VPN session set and the data_providers domain lists, but never
+// change how the process runs or rewrite the config file.
 var adminPermissions = []string{
 	PermStatus,
 	PermOcserv,
 	PermRadius,
 	PermAccess,
+	PermProvider,
+}
+
+// superAdminPermissions is explicit inheritance: everything admin may do, plus
+// the remaining write/control permissions. Adding a permission to
+// adminPermissions therefore also grants it to superadmin.
+var superAdminPermissions = unionPermissions(adminPermissions, allPermissions)
+
+func unionPermissions(lists ...[]string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, list := range lists {
+		for _, p := range list {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }
 
 // AdminUser binds one Telegram chat to a role.
@@ -119,8 +143,9 @@ func validPermission(p string) bool {
 // startup, so a command check never walks the inheritance graph.
 //
 // Two roles are built in and need no declaration: "superadmin" holds every
-// permission, "admin" only observes and manages people (status, ocserv, radius,
-// access). Every chat in chat_ids gets default_role, which defaults to "admin".
+// permission, "admin" only observes and manages people plus data_providers
+// domain lists (status, ocserv, radius, access, provider). Every chat in
+// chat_ids gets default_role, which defaults to "admin".
 func buildAccess(args *Args) (*accessTable, error) {
 	t := &accessTable{
 		perms: make(map[int64]map[string]bool),
@@ -141,7 +166,7 @@ func buildAccess(args *Args) (*accessTable, error) {
 
 		switch name {
 		case "", RoleSuperAdmin, PermAll:
-			set := permissionSet(allPermissions...)
+			set := permissionSet(superAdminPermissions...)
 			resolved[name] = set
 			return set, nil
 		case RoleAdmin:
@@ -264,6 +289,8 @@ func requiredPermission(cmd string) string {
 		return PermAccess
 	case "/config", "/proxy", "/sweep":
 		return PermConfig
+	case "/provider":
+		return PermProvider
 	case "/diag":
 		return PermFakeIP
 	case "/reload":
@@ -274,24 +301,29 @@ func requiredPermission(cmd string) string {
 	return PermStatus
 }
 
-func (p *telegramBot) require(chatID int64, perm string) error {
+func (p *telegramBot) require(chatID int64, perm string, langs ...lang) error {
+	l := replyLang(langs)
 	if p.access == nil {
 		return nil
 	}
 	if _, ok := p.access.perms[chatID]; !ok {
-		return fmt.Errorf("permission denied: chat %d is not an administrator", chatID)
+		return fmt.Errorf(l.t("permission denied: chat %d is not an administrator",
+			"权限不足：聊天 %d 不是管理员"), chatID)
 	}
 	if perm == "" || p.access.allowed(chatID, perm) {
 		return nil
 	}
-	return fmt.Errorf("permission denied: role %q lacks %q (allowed: %s)",
+	return fmt.Errorf(l.t("permission denied: role %q lacks %q (allowed: %s)",
+		"权限不足：角色 %q 缺少 %q（允许：%s）"),
 		p.access.roles[chatID], perm, p.access.permissionNames(chatID))
 }
 
-func (p *telegramBot) handlePerm(chatID int64) string {
+func (p *telegramBot) handlePerm(chatID int64, langs ...lang) string {
+	l := replyLang(langs)
 	if p.access == nil {
-		return "permissions are not configured"
+		return l.t("permissions are not configured", "未配置权限")
 	}
-	return fmt.Sprintf("chat_id: %d\nrole: %s\npermissions: %s",
+	return fmt.Sprintf(l.t("chat_id: %d\nrole: %s\npermissions: %s",
+		"chat_id：%d\n角色：%s\n权限：%s"),
 		chatID, p.access.roles[chatID], p.access.permissionNames(chatID))
 }

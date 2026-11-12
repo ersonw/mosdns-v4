@@ -135,6 +135,11 @@ func TestSuperAdminHoldsEveryPermission(t *testing.T) {
 			t.Fatalf("superadmin lacks %q: %s", perm, access.permissionNames(2002))
 		}
 	}
+	for _, perm := range adminPermissions {
+		if !access.allowed(2002, perm) {
+			t.Fatalf("superadmin did not inherit admin permission %q: %s", perm, access.permissionNames(2002))
+		}
+	}
 }
 
 func TestAccessCommandNeedsAccessPermission(t *testing.T) {

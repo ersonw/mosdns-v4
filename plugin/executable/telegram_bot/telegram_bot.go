@@ -39,6 +39,7 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	fakeipadmin "github.com/ersonw/mosdns-v4/pkg/fakeip_admin"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"github.com/ersonw/mosdns-v4/plugin/executable/radius"
 	"go.uber.org/zap"
 )
@@ -83,6 +84,20 @@ type Args struct {
 	// ConfigPath is the mosdns config file /config edits. Empty means:
 	// take -c from the process arguments, else "etc/mosdns/config.yaml".
 	ConfigPath string `yaml:"config_path"`
+	// DomainManageScript edits a plain-text domain provider. It must accept
+	// "add|del [file_path] domain..." (and "clear" is not used here).
+	// Default: /etc/mosdns/domain_manage.py.
+	DomainManageScript string `yaml:"domain_manage_script"`
+	// Txt2DatScript regenerates a v2dat geosite file. It must accept
+	// "<input_txt> <output_dat> <category> [--overwrite]".
+	// Default: /etc/mosdns/txt2dat.py.
+	Txt2DatScript string `yaml:"txt2dat_script"`
+	// DomainPython runs *.py domain scripts. Default "python3". A non-.py
+	// script is executed directly, so a custom helper can use its own shebang.
+	DomainPython string `yaml:"domain_python"`
+	// DomainTimeout is the maximum run time of one domain script, in seconds.
+	// Default 30.
+	DomainTimeout int `yaml:"domain_timeout"`
 	// AuditLog is where administration actions are appended, one JSON object per
 	// line. Empty means "<config dir>/telegram_bot_audit.log".
 	AuditLog string `yaml:"audit_log"`
@@ -94,10 +109,17 @@ type Args struct {
 	APIBase string `yaml:"api_base"`
 	// PollTimeout is the long-polling timeout in seconds. Default 30.
 	PollTimeout int `yaml:"poll_timeout"`
+	// Timezone overrides how stored Unix timestamps are rendered. Empty uses
+	// the data source plugin's timezone, then Asia/Shanghai.
+	Timezone string `yaml:"timezone"`
+
+	timezoneSet bool
+	loc         *time.Location
 }
 
-func (a *Args) initDefault() {
+func (a *Args) initDefault() error {
 	a.Token = strings.TrimSpace(a.Token)
+	a.timezoneSet = strings.TrimSpace(a.Timezone) != ""
 	a.FakeIPTags = tagList(a.FakeIPTags, "fakeip")
 	a.OcservTags = tagList(a.OcservTags, "ocserv")
 	a.RadiusTags = tagList(a.RadiusTags, "radius")
@@ -111,6 +133,21 @@ func (a *Args) initDefault() {
 		a.Admins[i].Role = strings.TrimSpace(a.Admins[i].Role)
 	}
 	a.ConfigPath = strings.TrimSpace(a.ConfigPath)
+	a.DomainManageScript = strings.TrimSpace(a.DomainManageScript)
+	if a.DomainManageScript == "" {
+		a.DomainManageScript = "/etc/mosdns/domain_manage.py"
+	}
+	a.Txt2DatScript = strings.TrimSpace(a.Txt2DatScript)
+	if a.Txt2DatScript == "" {
+		a.Txt2DatScript = "/etc/mosdns/txt2dat.py"
+	}
+	a.DomainPython = strings.TrimSpace(a.DomainPython)
+	if a.DomainPython == "" {
+		a.DomainPython = "python3"
+	}
+	if a.DomainTimeout <= 0 {
+		a.DomainTimeout = 30
+	}
 	a.APIBase = strings.TrimSpace(a.APIBase)
 	if a.APIBase == "" {
 		a.APIBase = "https://api.telegram.org"
@@ -118,6 +155,12 @@ func (a *Args) initDefault() {
 	if a.PollTimeout <= 0 {
 		a.PollTimeout = 30
 	}
+	loc, err := timeutil.Load(a.Timezone)
+	if err != nil {
+		return err
+	}
+	a.loc = loc
+	return nil
 }
 
 func (a *Args) enabled() bool {
@@ -227,7 +270,11 @@ type telegramBot struct {
 	radius      radius.Admin
 	radiusCache map[string]radius.Admin
 
+	domainMu     sync.Mutex
+	domainRunner func(ctx context.Context, script string, args ...string) (string, error)
+
 	access *accessTable
+	loc    *time.Location
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -235,7 +282,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 }
 
 func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
-	args.initDefault()
+	if err := args.initDefault(); err != nil {
+		return nil, err
+	}
 	p := &telegramBot{
 		BP:          bp,
 		args:        args,
@@ -243,6 +292,7 @@ func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		adminCache:  make(map[string]mappingAdmin),
 		ocservCache: make(map[string]ocservAdmin),
 		radiusCache: make(map[string]radius.Admin),
+		loc:         args.loc,
 	}
 	if !args.enabled() {
 		bp.L().Info("telegram bot disabled, token or chat_ids is empty")
@@ -284,7 +334,8 @@ func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		zap.Int("roles", len(args.Roles)),
 		zap.Strings("fakeip_tags", args.FakeIPTags),
 		zap.Strings("ocserv_tags", args.OcservTags),
-		zap.Int("poll_timeout", args.PollTimeout))
+		zap.Int("poll_timeout", args.PollTimeout),
+		zap.String("timezone", args.loc.String()))
 
 	p.wg.Add(1)
 	go func() {
@@ -333,16 +384,22 @@ func (p *telegramBot) onUpdate(ctx context.Context, b *tgbot.Bot, update *models
 	}
 	p.L().Debug("telegram command received", zap.Int64("chat_id", chatID), zap.String("text", text))
 
-	reply, err := p.handleText(ctx, chatID, text)
+	code := ""
+	if update.Message.From != nil {
+		code = update.Message.From.LanguageCode
+	}
+	l := detectLang(code, text)
+
+	reply, err := p.handleText(ctx, chatID, text, l)
 	if err != nil {
-		reply = "error: " + err.Error()
+		reply = l.t("error: ", "错误：") + err.Error()
 	}
 	if reply == "" {
 		return
 	}
 	// Telegram caps a message at 4096 characters.
 	if len(reply) > 4000 {
-		reply = reply[:4000] + "\n...(truncated)"
+		reply = reply[:4000] + l.t("\n...(truncated)", "\n...(已截断)")
 	}
 	if _, err := b.SendMessage(ctx, &tgbot.SendMessageParams{ChatID: chatID, Text: reply}); err != nil {
 		p.L().Warn("telegram sendMessage failed", zap.Error(err))
@@ -350,7 +407,8 @@ func (p *telegramBot) onUpdate(ctx context.Context, b *tgbot.Bot, update *models
 }
 
 // handleText parses one command and returns the reply text.
-func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string) (reply string, err error) {
+func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string, langs ...lang) (reply string, err error) {
+	l := replyLang(langs)
 	fields := strings.Fields(strings.TrimSpace(text))
 	if len(fields) == 0 {
 		return "", nil
@@ -360,7 +418,7 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 		cmd = cmd[:i] // "/cmd@botname" in groups
 	}
 
-	if err := p.require(chatID, requiredPermission(cmd)); err != nil {
+	if err := p.require(chatID, requiredPermission(cmd), l); err != nil {
 		return err.Error(), nil
 	}
 
@@ -379,100 +437,106 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string)
 
 	switch cmd {
 	case "/start", "/help":
-		return p.helpFor(chatID), nil
+		return p.helpFor(chatID, l), nil
 	case "/fip":
-		return p.handleFip(ctx, fields[1:])
+		return p.handleFip(ctx, fields[1:], l)
 	case "/vpn":
-		return p.handleVPN(ctx, fields[1:])
+		return p.handleVPN(ctx, fields[1:], l)
 	case "/user":
-		return p.handleUser(fields[1:]), nil
+		return p.handleUser(fields[1:], l), nil
 	case "/access":
-		return p.handleAccess(ctx, chatID, fields[1:])
+		return p.handleAccess(ctx, chatID, fields[1:], l)
 	case "/status":
-		return p.handleStatus(ctx)
+		return p.handleStatus(ctx, l)
 	case "/plugins":
-		return p.handlePlugins(), nil
+		return p.handlePlugins(l), nil
 	case "/plugin":
 		if len(fields) < 2 {
-			return "usage: /plugin <tag>", nil
+			return l.t("usage: /plugin <tag>", "用法：/plugin <tag>"), nil
 		}
-		return p.handlePlugin(fields[1])
+		return p.handlePlugin(fields[1], l)
 	case "/config":
-		return p.handleConfig(fields[1:])
+		return p.handleConfig(fields[1:], l)
+	case "/provider":
+		return p.handleProvider(ctx, fields[1:], l)
 	case "/reload":
-		return p.handleReload(fields[1:])
+		return p.handleReload(fields[1:], l)
 	case "/exec":
-		return p.handleExec(ctx, fields[1:])
+		return p.handleExec(ctx, fields[1:], l)
 	case "/net":
-		return p.handleNet(ctx, fields[1:])
+		return p.handleNet(ctx, fields[1:], l)
 	case "/ledger":
-		return p.handleLedger(ctx, fields[1:])
+		return p.handleLedger(ctx, fields[1:], l)
 	case "/sweep":
-		return p.handleSweep(ctx, fields[1:])
+		return p.handleSweep(ctx, fields[1:], l)
 	case "/diag":
-		return p.handleDiag(ctx, fields[1:])
+		return p.handleDiag(ctx, fields[1:], l)
 	case "/proxy":
-		return p.handleProxy(ctx, fields[1:])
+		return p.handleProxy(ctx, fields[1:], l)
 	case "/audit":
-		return p.handleAudit(fields[1:])
+		return p.handleAudit(fields[1:], l)
 	case "/perm", "/whoami":
-		return p.handlePerm(chatID), nil
+		return p.handlePerm(chatID, l), nil
 	// Short forms kept for muscle memory; they are aliases of /fip <sub>.
 	case "/list", "/stats", "/lookup", "/rev", "/del", "/clear":
 		sub := strings.TrimPrefix(cmd, "/")
 		if sub == "lookup" || sub == "rev" {
 			sub = "get"
 		}
-		return p.handleFip(ctx, append([]string{sub}, fields[1:]...))
+		return p.handleFip(ctx, append([]string{sub}, fields[1:]...), l)
 	}
 
-	return "unknown command, send /help", nil
+	return l.t("unknown command, send /help", "未知命令，请发送 /help"), nil
 }
 
 // handleExec runs the script already bound to one exec_script plugin. The bot
 // never passes an arbitrary shell command, only ip and domain arguments.
-func (p *telegramBot) handleExec(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleExec(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	if len(args) < 3 {
-		return "usage: /exec <tag> <ip> <domain>", nil
+		return l.t("usage: /exec <tag> <ip> <domain>", "用法：/exec <tag> <ip> <domain>"), nil
 	}
 	tag := args[0]
 	e, ok := p.M().GetExecutables()[tag]
 	if !ok {
-		return fmt.Sprintf("%s: not loaded", tag), nil
+		return l.t(fmt.Sprintf("%s: not loaded", tag), fmt.Sprintf("%s：未加载", tag)), nil
 	}
 	runner, ok := e.(execScriptAdmin)
 	if !ok {
-		return fmt.Sprintf("%s: not an exec_script plugin", tag), nil
+		return l.t(fmt.Sprintf("%s: not an exec_script plugin", tag), fmt.Sprintf("%s：不是 exec_script 插件", tag)), nil
 	}
 
 	out, err := runner.AdminRun(ctx, args[1], args[2])
 	if err != nil {
 		return "", fmt.Errorf("%s %s %s: %w", tag, args[1], args[2], err)
 	}
-	reply := fmt.Sprintf("exec %s %s %s", tag, args[1], args[2])
+	reply := l.t(fmt.Sprintf("exec %s %s %s", tag, args[1], args[2]),
+		fmt.Sprintf("执行 %s %s %s", tag, args[1], args[2]))
 	if strings.TrimSpace(out) != "" {
 		reply += "\n" + strings.TrimSpace(out)
 	}
 	return reply, nil
 }
 
-func (p *telegramBot) handleFip(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleFip(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, args := pickTag(p.args.FakeIPTags, args)
 	if len(args) == 0 {
-		return fipHelp, nil
+		return fipHelpText(l), nil
 	}
 
 	switch strings.ToLower(args[0]) {
 	case "tags":
-		return p.tagSummary("fakeip", p.args.FakeIPTags), nil
+		return p.tagSummary("fakeip", p.args.FakeIPTags, l), nil
 	case "help":
-		return fipHelp, nil
+		return fipHelpText(l), nil
 	}
 
-	admin, err := p.resolveAdminFor(tag)
+	admin, err := p.resolveAdminFor(tag, l)
 	if err != nil {
 		return "", err
 	}
+	loc := p.locationFor(admin)
 
 	switch strings.ToLower(args[0]) {
 	case "stats":
@@ -480,7 +544,8 @@ func (p *telegramBot) handleFip(ctx context.Context, args []string) (string, err
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("mappings: %d\npending: %d\nreal_ips: %d\nruntime: %d",
+		return fmt.Sprintf(l.t("mappings: %d\npending: %d\nreal_ips: %d\nruntime: %d",
+			"映射：%d\n待处理：%d\n真实 IP：%d\n运行时：%d"),
 			s.Mappings, s.Pending, s.RealIPs, s.Runtime), nil
 
 	case "list":
@@ -495,18 +560,18 @@ func (p *telegramBot) handleFip(ctx context.Context, args []string) (string, err
 			return "", err
 		}
 		if len(entries) == 0 {
-			return "no mappings yet", nil
+			return l.t("no mappings yet", "暂无映射"), nil
 		}
 		var b strings.Builder
-		fmt.Fprintf(&b, "recent %d mapping(s):", len(entries))
+		fmt.Fprintf(&b, l.t("recent %d mapping(s):", "最近 %d 条映射："), len(entries))
 		for _, e := range entries {
-			fmt.Fprintf(&b, "\n%s -> %s (%s)", e.Domain, e.FakeIP, formatTime(e.CreatedAt))
+			fmt.Fprintf(&b, "\n%s -> %s (%s)", e.Domain, e.FakeIP, formatTime(e.CreatedAt, loc))
 		}
 		return b.String(), nil
 
 	case "get":
 		if len(args) < 2 {
-			return "usage: /fip get <domain|fake_ip>", nil
+			return l.t("usage: /fip get <domain|fake_ip>", "用法：/fip get <domain|fake_ip>"), nil
 		}
 		key := args[1]
 		e, ok, err := admin.AdminLookupDomain(ctx, key)
@@ -520,48 +585,53 @@ func (p *telegramBot) handleFip(ctx context.Context, args []string) (string, err
 			}
 		}
 		if !ok {
-			return fmt.Sprintf("%s: no mapping", key), nil
+			return l.t(fmt.Sprintf("%s: no mapping", key), fmt.Sprintf("%s：无映射", key)), nil
 		}
-		return fmt.Sprintf("%s -> %s (%s)", e.Domain, e.FakeIP, formatTime(e.CreatedAt)), nil
+		return fmt.Sprintf("%s -> %s (%s)", e.Domain, e.FakeIP, formatTime(e.CreatedAt, loc)), nil
 
 	case "add", "set":
 		if len(args) < 3 {
-			return "usage: /fip add <domain> <fake_ip>", nil
+			return l.t("usage: /fip add <domain> <fake_ip>", "用法：/fip add <domain> <fake_ip>"), nil
 		}
 		if err := admin.AdminPutMapping(ctx, args[1], args[2]); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s -> %s saved", args[1], args[2]), nil
+		return l.t(fmt.Sprintf("%s -> %s saved", args[1], args[2]),
+			fmt.Sprintf("%s -> %s 已保存", args[1], args[2])), nil
 
 	case "del":
 		if len(args) < 2 {
-			return "usage: /fip del <domain>", nil
+			return l.t("usage: /fip del <domain>", "用法：/fip del <domain>"), nil
 		}
 		ok, err := admin.AdminDeleteDomain(ctx, args[1])
 		if err != nil {
 			return "", err
 		}
 		if !ok {
-			return fmt.Sprintf("%s: no mapping", args[1]), nil
+			return l.t(fmt.Sprintf("%s: no mapping", args[1]), fmt.Sprintf("%s：无映射", args[1])), nil
 		}
-		return fmt.Sprintf("deleted %s, the next query allocates a new fake ip", args[1]), nil
+		return l.t(fmt.Sprintf("deleted %s, the next query allocates a new fake ip", args[1]),
+			fmt.Sprintf("已删除 %s，下次查询会分配新的 fake IP", args[1])), nil
 
 	case "clear":
 		if len(args) < 2 || strings.ToLower(args[1]) != "confirm" {
-			return "send /fip clear confirm to drop every mapping", nil
+			return l.t("send /fip clear confirm to drop every mapping",
+				"发送 /fip clear confirm 以删除全部映射"), nil
 		}
 		n, err := admin.AdminClearMappings(ctx)
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("deleted %d mapping(s)", n), nil
+		return l.t(fmt.Sprintf("deleted %d mapping(s)", n),
+			fmt.Sprintf("已删除 %d 条映射", n)), nil
 	}
 
-	return "unknown subcommand, send /fip help", nil
+	return l.t("unknown subcommand, send /fip help", "未知子命令，请发送 /fip help"), nil
 }
 
 // handleStatus summarises the process and the managed plugins.
-func (p *telegramBot) handleStatus(ctx context.Context) (string, error) {
+func (p *telegramBot) handleStatus(ctx context.Context, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	ex := p.M().GetExecutables()
 	var fakeipCount, ocservCount int
 	for _, e := range ex {
@@ -574,18 +644,19 @@ func (p *telegramBot) handleStatus(ctx context.Context) (string, error) {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "uptime: %s", time.Since(p.startedAt).Round(time.Second))
-	fmt.Fprintf(&b, "\nloaded plugins: %d", len(ex))
-	fmt.Fprintf(&b, "\nfakeip-capable: %d", fakeipCount)
-	fmt.Fprintf(&b, "\nocserv-capable: %d", ocservCount)
-	fmt.Fprintf(&b, "\nfakeip_tags: %s", strings.Join(p.args.FakeIPTags, ", "))
-	fmt.Fprintf(&b, "\nocserv_tags: %s", strings.Join(p.args.OcservTags, ", "))
+	fmt.Fprintf(&b, l.t("uptime: %s", "运行时长：%s"), time.Since(p.startedAt).Round(time.Second))
+	fmt.Fprintf(&b, l.t("\nloaded plugins: %d", "\n已加载插件：%d"), len(ex))
+	fmt.Fprintf(&b, l.t("\nfakeip-capable: %d", "\n支持 fakeip：%d"), fakeipCount)
+	fmt.Fprintf(&b, l.t("\nocserv-capable: %d", "\n支持 ocserv：%d"), ocservCount)
+	fmt.Fprintf(&b, l.t("\nfakeip_tags: %s", "\nfakeip 标签：%s"), strings.Join(p.args.FakeIPTags, ", "))
+	fmt.Fprintf(&b, l.t("\nocserv_tags: %s", "\nocserv 标签：%s"), strings.Join(p.args.OcservTags, ", "))
 	return b.String(), nil
 }
 
 // handlePlugins lists every loaded plugin and the capabilities the bot sees
 // on it, which is how a tag is chosen for the commands above.
-func (p *telegramBot) handlePlugins() string {
+func (p *telegramBot) handlePlugins(langs ...lang) string {
+	l := replyLang(langs)
 	ex := p.M().GetExecutables()
 	tags := make([]string, 0, len(ex))
 	for tag := range ex {
@@ -594,7 +665,7 @@ func (p *telegramBot) handlePlugins() string {
 	sort.Strings(tags)
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "loaded plugins: %d", len(tags))
+	fmt.Fprintf(&b, l.t("loaded plugins: %d", "已加载插件：%d"), len(tags))
 	for _, tag := range tags {
 		var caps string
 		if _, ok := ex[tag].(mappingAdmin); ok {
@@ -608,19 +679,20 @@ func (p *telegramBot) handlePlugins() string {
 	return b.String()
 }
 
-func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleVPN(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, args := pickTag(p.args.OcservTags, args)
 	if len(args) == 0 {
-		return vpnHelp, nil
+		return vpnHelpText(l), nil
 	}
 	switch strings.ToLower(args[0]) {
 	case "tags":
-		return p.tagSummary("ocserv", p.args.OcservTags), nil
+		return p.tagSummary("ocserv", p.args.OcservTags, l), nil
 	case "help":
-		return vpnHelp, nil
+		return vpnHelpText(l), nil
 	}
 
-	admin, err := p.resolveOcservFor(tag)
+	admin, err := p.resolveOcservFor(tag, l)
 	if err != nil {
 		return "", err
 	}
@@ -629,28 +701,32 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 	case "reload":
 		svc, ok := admin.(ocservServiceAdmin)
 		if !ok {
-			return "", fmt.Errorf("ocserv_ctl tag %q does not expose systemd control", tag)
+			return "", fmt.Errorf("%s", l.t(fmt.Sprintf("ocserv_ctl tag %q does not expose systemd control", tag),
+				fmt.Sprintf("ocserv_ctl 标签 %q 未提供 systemd 控制", tag)))
 		}
 		return svc.AdminReload(ctx)
 	case "restart":
 		svc, ok := admin.(ocservServiceAdmin)
 		if !ok {
-			return "", fmt.Errorf("ocserv_ctl tag %q does not expose systemd control", tag)
+			return "", fmt.Errorf("%s", l.t(fmt.Sprintf("ocserv_ctl tag %q does not expose systemd control", tag),
+				fmt.Sprintf("ocserv_ctl 标签 %q 未提供 systemd 控制", tag)))
 		}
 		return svc.AdminRestart(ctx)
 	case "pool":
 		pool, ok := admin.(ocservPoolAdmin)
 		if !ok {
-			return "", fmt.Errorf("ocserv_ctl tag %q does not expose address allocation", tag)
+			return "", fmt.Errorf("%s", l.t(fmt.Sprintf("ocserv_ctl tag %q does not expose address allocation", tag),
+				fmt.Sprintf("ocserv_ctl 标签 %q 未提供地址分配", tag)))
 		}
 		return pool.AdminPool(ctx)
 	case "alloc":
 		if len(args) < 2 {
-			return "usage: /vpn alloc <user> [ip]", nil
+			return l.t("usage: /vpn alloc <user> [ip]", "用法：/vpn alloc <user> [ip]"), nil
 		}
 		pool, ok := admin.(ocservPoolAdmin)
 		if !ok {
-			return "", fmt.Errorf("ocserv_ctl tag %q does not expose address allocation", tag)
+			return "", fmt.Errorf("%s", l.t(fmt.Sprintf("ocserv_ctl tag %q does not expose address allocation", tag),
+				fmt.Sprintf("ocserv_ctl 标签 %q 未提供地址分配", tag)))
 		}
 		ip := ""
 		if len(args) > 2 {
@@ -660,7 +736,8 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 	case "events":
 		ev, ok := admin.(ocservEventAdmin)
 		if !ok {
-			return "", fmt.Errorf("ocserv_ctl tag %q does not expose updown events", tag)
+			return "", fmt.Errorf("%s", l.t(fmt.Sprintf("ocserv_ctl tag %q does not expose updown events", tag),
+				fmt.Sprintf("ocserv_ctl 标签 %q 未提供上下线事件", tag)))
 		}
 		limit, user := 0, ""
 		if len(args) > 1 {
@@ -676,11 +753,12 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 		return ev.AdminEvents(limit, user)
 	case "free":
 		if len(args) < 2 {
-			return "usage: /vpn free <user>", nil
+			return l.t("usage: /vpn free <user>", "用法：/vpn free <user>"), nil
 		}
 		pool, ok := admin.(ocservPoolAdmin)
 		if !ok {
-			return "", fmt.Errorf("ocserv_ctl tag %q does not expose address allocation", tag)
+			return "", fmt.Errorf("%s", l.t(fmt.Sprintf("ocserv_ctl tag %q does not expose address allocation", tag),
+				fmt.Sprintf("ocserv_ctl 标签 %q 未提供地址分配", tag)))
 		}
 		return pool.AdminReleaseIP(ctx, args[1])
 	}
@@ -689,7 +767,7 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 	switch strings.ToLower(args[0]) {
 	case "user":
 		if len(args) < 2 {
-			return "usage: /vpn user <name>", nil
+			return l.t("usage: /vpn user <name>", "用法：/vpn user <name>"), nil
 		}
 		argv = []string{"show", "user", args[1]}
 	case "users":
@@ -700,41 +778,42 @@ func (p *telegramBot) handleVPN(ctx context.Context, args []string) (string, err
 		argv = []string{"show", "sessions", "valid"}
 	case "kick":
 		if len(args) < 2 {
-			return "usage: /vpn kick <user>", nil
+			return l.t("usage: /vpn kick <user>", "用法：/vpn kick <user>"), nil
 		}
 		argv = []string{"disconnect", "user", args[1]}
 	case "term":
 		if len(args) < 2 {
-			return "usage: /vpn term <user>", nil
+			return l.t("usage: /vpn term <user>", "用法：/vpn term <user>"), nil
 		}
 		argv = []string{"terminate", "user", args[1]}
 	case "run":
 		// Full escape hatch for the remaining occtl commands.
 		if len(args) < 2 {
-			return "usage: /vpn run <occtl args...>", nil
+			return l.t("usage: /vpn run <occtl args...>", "用法：/vpn run <occtl args...>"), nil
 		}
 		argv = args[1:]
 	default:
-		return "unknown subcommand, send /vpn help", nil
+		return l.t("unknown subcommand, send /vpn help", "未知子命令，请发送 /vpn help"), nil
 	}
 
 	out, err := admin.AdminExec(ctx, argv)
 	out = strings.TrimSpace(out)
 	if err != nil {
 		if out != "" {
-			return "occtl failed: " + err.Error() + "\n" + out, nil
+			return l.t("occtl failed: ", "occtl 失败：") + err.Error() + "\n" + out, nil
 		}
 		return "", err
 	}
 	if out == "" {
-		out = "ok, no output"
+		out = l.t("ok, no output", "成功，无输出")
 	}
 	return out, nil
 }
 
 // resolveAdminFor finds a fakeip plugin by tag. Lookup is lazy because plugins
 // are initialised in configuration order, and cached per tag.
-func (p *telegramBot) resolveAdminFor(tag string) (mappingAdmin, error) {
+func (p *telegramBot) resolveAdminFor(tag string, langs ...lang) (mappingAdmin, error) {
+	l := replyLang(langs)
 	p.adminMu.Lock()
 	defer p.adminMu.Unlock()
 	if p.admin != nil {
@@ -746,18 +825,20 @@ func (p *telegramBot) resolveAdminFor(tag string) (mappingAdmin, error) {
 
 	e, ok := p.M().GetExecutables()[tag]
 	if !ok {
-		return nil, fmt.Errorf("plugin %q is not loaded", tag)
+		return nil, fmt.Errorf(l.t("plugin %q is not loaded", "插件 %q 未加载"), tag)
 	}
 	a, ok := e.(mappingAdmin)
 	if !ok {
-		return nil, fmt.Errorf("plugin %q does not implement the fakeip admin interface", tag)
+		return nil, fmt.Errorf(l.t("plugin %q does not implement the fakeip admin interface",
+			"插件 %q 未实现 fakeip 管理接口"), tag)
 	}
 	p.adminCache[tag] = a
 	return a, nil
 }
 
 // resolveOcservFor finds the ocserv_ctl plugin that owns the occtl call.
-func (p *telegramBot) resolveOcservFor(tag string) (ocservAdmin, error) {
+func (p *telegramBot) resolveOcservFor(tag string, langs ...lang) (ocservAdmin, error) {
+	l := replyLang(langs)
 	p.ocservMu.Lock()
 	defer p.ocservMu.Unlock()
 	if p.ocserv != nil {
@@ -769,36 +850,57 @@ func (p *telegramBot) resolveOcservFor(tag string) (ocservAdmin, error) {
 
 	e, ok := p.M().GetExecutables()[tag]
 	if !ok {
-		return nil, fmt.Errorf("plugin %q is not loaded", tag)
+		return nil, fmt.Errorf(l.t("plugin %q is not loaded", "插件 %q 未加载"), tag)
 	}
 	a, ok := e.(ocservAdmin)
 	if !ok {
-		return nil, fmt.Errorf("plugin %q does not implement the ocserv admin interface", tag)
+		return nil, fmt.Errorf(l.t("plugin %q does not implement the ocserv admin interface",
+			"插件 %q 未实现 ocserv 管理接口"), tag)
 	}
 	p.ocservCache[tag] = a
 	return a, nil
 }
 
 // tagSummary says which configured tags are actually loaded.
-func (p *telegramBot) tagSummary(kind string, tags []string) string {
+func (p *telegramBot) tagSummary(kind string, tags []string, langs ...lang) string {
+	l := replyLang(langs)
 	ex := p.M().GetExecutables()
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s targets:", kind)
+	fmt.Fprintf(&b, l.t("%s targets:", "%s 目标："), kind)
 	for _, t := range tags {
-		state := "loaded"
+		state := l.t("loaded", "已加载")
 		if _, ok := ex[t]; !ok {
-			state = "missing"
+			state = l.t("missing", "未加载")
 		}
 		fmt.Fprintf(&b, "\n%s (%s)", t, state)
 	}
 	return b.String()
 }
 
-func formatTime(unix int64) string {
+// locationFor picks the timezone used to render a data source's timestamps:
+// an explicit bot timezone wins, then the plugin's own setting, then the
+// default Asia/Shanghai.
+func (p *telegramBot) locationFor(src interface{}) *time.Location {
+	if p.args.timezoneSet && p.loc != nil {
+		return p.loc
+	}
+	if lp, ok := src.(interface{ Location() *time.Location }); ok {
+		if loc := lp.Location(); loc != nil {
+			return loc
+		}
+	}
+	if p.loc != nil {
+		return p.loc
+	}
+	return timeutil.MustDefault()
+}
+
+// formatTime renders stored Unix seconds in loc.
+func formatTime(unix int64, loc *time.Location) string {
 	if unix <= 0 {
 		return "-"
 	}
-	return time.Unix(unix, 0).Format("2006-01-02 15:04")
+	return timeutil.FormatUnix(unix, "2006-01-02 15:04", loc)
 }
 
 // helpGroup / helpItem describe /help in a form that can be filtered per
@@ -816,6 +918,7 @@ type helpGroup struct {
 
 var helpGroups = []helpGroup{
 	{title: "fakeip mappings", items: []helpItem{
+		{"/fip tags                    configured targets", PermFakeIP},
 		{"/fip [tag] list [n]          recent mappings (default 20)", PermFakeIP},
 		{"/fip get <domain|fake_ip>    look up one mapping", PermFakeIP},
 		{"/fip add <domain> <fake_ip>  create or replace a mapping", PermFakeIP},
@@ -824,6 +927,7 @@ var helpGroups = []helpGroup{
 		{"/fip clear confirm           drop every mapping", PermFakeIP},
 	}},
 	{title: "ocserv", items: []helpItem{
+		{"/vpn tags                    configured targets", PermOcserv},
 		{"/vpn users                   connected ocserv users", PermOcserv},
 		{"/vpn user <name>             state of one ocserv user", PermOcserv},
 		{"/vpn events [n] [user]       connect/disconnect history", PermOcserv},
@@ -834,11 +938,15 @@ var helpGroups = []helpGroup{
 		{"/vpn run <occtl args...>     any other occtl command", PermOcserv},
 	}},
 	{title: "radius accounts", items: []helpItem{
+		{"/user tags                   configured targets", PermRadius},
 		{"/user list                   radius accounts with group and state", PermRadius},
 		{"/user add <name> <pass> [g]  create a radius account", PermRadius},
 		{"/user del <name>             delete a radius account", PermRadius},
 		{"/user pass <name> <pass>     replace a password", PermRadius},
 		{"/user enable|disable <name>  toggle authentication", PermRadius},
+		{"/user limit <name> <max> [p] set traffic quota / reset period", PermRadius},
+		{"/user usage <name>           used up/down, limit and next reset", PermRadius},
+		{"/user reset <name>           clear usage, start a new period", PermRadius},
 		{"/user sessions [active] [n]  accounting sessions", PermRadius},
 	}},
 	{title: "access records", items: []helpItem{
@@ -856,6 +964,15 @@ var helpGroups = []helpGroup{
 		{"/plugins                     loaded plugins and their capabilities", PermStatus},
 		{"/plugin <tag>                one plugin: type, capabilities, config args", PermStatus},
 		{"/audit [n]                   last administration actions", PermStatus},
+	}},
+	{title: "data providers", items: []helpItem{
+		{"/provider                    configured data providers and examples", PermProvider},
+		{"/provider <tag>              one provider and its add/mod/del/clear examples", PermProvider},
+		{"/provider <tag> add <d>      add a domain to a text provider", PermProvider},
+		{"/provider <tag> list [p] [n]  list a .txt provider, page and size together", PermProvider},
+		{"/provider <tag> mod <old> <new>  replace a domain", PermProvider},
+		{"/provider <tag> del <d>      delete a domain", PermProvider},
+		{"/provider <tag> clear        empty a text provider or one v2dat category", PermProvider},
 	}},
 	{title: "config", items: []helpItem{
 		{"/config                      config file summary", PermConfig},
@@ -875,16 +992,21 @@ var helpGroups = []helpGroup{
 
 // helpFor builds the reply for one chat: only the commands that chat may run,
 // with an empty group omitted entirely.
-func (p *telegramBot) helpFor(chatID int64) string {
+func (p *telegramBot) helpFor(chatID int64, langs ...lang) string {
+	l := replyLang(langs)
+	groups := helpGroups
+	if l == langZH {
+		groups = helpGroupsZH
+	}
 	var b strings.Builder
-	b.WriteString("mosdns admin bot")
+	b.WriteString(l.t("mosdns admin bot", "mosdns 管理机器人"))
 	if p.access != nil {
 		if role, ok := p.access.roles[chatID]; ok {
-			b.WriteString(" (role: " + role + ")")
+			b.WriteString(l.t(" (role: "+role+")", "（角色："+role+"）"))
 		}
 	}
 	b.WriteString("\n")
-	for _, group := range helpGroups {
+	for _, group := range groups {
 		var visible []string
 		for _, item := range group.items {
 			if p.mayRun(chatID, item.perm) {
@@ -899,7 +1021,8 @@ func (p *telegramBot) helpFor(chatID int64) string {
 			b.WriteString(line + "\n")
 		}
 	}
-	b.WriteString("\n/perm                        your role and permissions\n/help                        this message")
+	b.WriteString(l.t("\n/perm                        your role and permissions\n/help                        this message",
+		"\n/perm                        查看你的角色和权限\n/help                        显示本帮助"))
 	return b.String()
 }
 
@@ -937,4 +1060,125 @@ const vpnHelp = `ocserv commands (occtl; optional tag first, e.g. /vpn ocserv2 u
 /vpn free <user>             drop that fixed IP
 /vpn reload                  systemctl reload ocserv (keeps sessions)
 /vpn restart                 systemctl restart ocserv (drops sessions)
-/vpn events [n] [user]       recent connect/disconnect events from the updown hook`
+/vpn events [n] [user]       recent connect/disconnect events from the updown hook
+
+traffic quota belongs to the radius account table, not occtl:
+/user limit <name> <max|0|-> [period|0|-]   set total quota and reset period
+/user usage <name>                            used up/down, limit and next reset
+/user reset <name>                            clear usage, start a new period`
+
+const fipHelpZH = `fakeip 命令（可选 tag 放在最前，例如 /fip fakeip2 list）
+/fip tags                    已配置的目标
+/fip list [n]                最近的映射
+/fip get <domain|fake_ip>    查询一条映射
+/fip add <domain> <fake_ip>  新增或替换映射
+/fip del <domain>            删除一条映射
+/fip stats                   映射计数
+/fip clear confirm           删除全部映射`
+
+const vpnHelpZH = `ocserv 命令（occtl；可选 tag 放在最前，例如 /vpn ocserv2 users）
+/vpn tags                    已配置的目标
+/vpn users                   当前在线用户
+/vpn user <name>             单个用户状态（在线、IP、流量）
+/vpn status                  服务端状态
+/vpn sessions                有效会话
+/vpn kick <user>             断开一个用户
+/vpn term <user>             终止一个用户
+/vpn run <occtl args...>     其他任意 occtl 命令，例如
+                             /vpn run show iroutes
+                             /vpn run unban ip 10.0.0.5
+/vpn pool                    从 ocserv.conf 解析的地址池
+/vpn alloc <user> [ip]       在 config-per-user 中固定 IP
+/vpn free <user>             释放该固定 IP
+/vpn reload                  重载 ocserv（保留会话）
+/vpn restart                 重启 ocserv（丢弃会话）
+/vpn events [n] [user]       最近的上下线事件
+
+流量配额属于 radius 账号表，不属于 occtl：
+/user limit <name> <max|0|-> [period|0|-]   设置总配额和重置周期
+/user usage <name>                           查看上下行、上限和下次重置
+/user reset <name>                           清空用量并开始新周期`
+
+// helpGroupsZH mirrors helpGroups in the same order. Command tokens stay in
+// English deliberately; only the descriptions are translated.
+var helpGroupsZH = []helpGroup{
+	{title: "fakeip 映射", items: []helpItem{
+		{"/fip tags                    已配置的目标", PermFakeIP},
+		{"/fip [tag] list [n]          最近映射（默认 20 条）", PermFakeIP},
+		{"/fip get <domain|fake_ip>    查询一条映射", PermFakeIP},
+		{"/fip add <domain> <fake_ip>  新增或替换映射", PermFakeIP},
+		{"/fip del <domain>             删除一条映射", PermFakeIP},
+		{"/fip stats                    映射计数", PermFakeIP},
+		{"/fip clear confirm            删除全部映射", PermFakeIP},
+	}},
+	{title: "ocserv", items: []helpItem{
+		{"/vpn tags                    已配置的目标", PermOcserv},
+		{"/vpn users                   当前在线用户", PermOcserv},
+		{"/vpn user <name>             单个用户状态", PermOcserv},
+		{"/vpn events [n] [user]       上下线历史", PermOcserv},
+		{"/vpn status                  服务端状态", PermOcserv},
+		{"/vpn sessions                有效会话", PermOcserv},
+		{"/vpn kick <user>             断开一个用户", PermOcserv},
+		{"/vpn term <user>             终止一个用户", PermOcserv},
+		{"/vpn run <occtl args...>     其他 occtl 命令", PermOcserv},
+	}},
+	{title: "radius 账号", items: []helpItem{
+		{"/user tags                   已配置的目标", PermRadius},
+		{"/user list                   radius 账号、组和状态", PermRadius},
+		{"/user add <name> <pass> [g]  创建 radius 账号", PermRadius},
+		{"/user del <name>             删除 radius 账号", PermRadius},
+		{"/user pass <name> <pass>     替换密码", PermRadius},
+		{"/user enable|disable <name>  启用或禁用认证", PermRadius},
+		{"/user limit <name> <max> [p] 设置流量配额和重置周期", PermRadius},
+		{"/user usage <name>           查看上下行、上限和下次重置", PermRadius},
+		{"/user reset <name>           清空用量并开始新周期", PermRadius},
+		{"/user sessions [active] [n]  记账会话", PermRadius},
+	}},
+	{title: "访问记录", items: []helpItem{
+		{"/access <user> [days]        导出该用户的访问记录为 xlsx（默认 7 天）", PermAccess},
+		{"/access <ip> [days]          直接导出某个客户端地址的记录", PermAccess},
+	}},
+	{title: "数据面", items: []helpItem{
+		{"/net [tag]                   数据面：设备、代理、标记、规则、路由", PermStatus},
+		{"/ledger [tag]                后续运行会清理的已记录对象", PermStatus},
+		{"/diag <domain> [tag]         单个域名的映射、真实 IP 和出口", PermFakeIP},
+		{"/sweep [tag] confirm         清理当前配置不拥有的已记录对象", PermConfig},
+	}},
+	{title: "进程", items: []helpItem{
+		{"/status                      进程和插件摘要", PermStatus},
+		{"/plugins                     已加载插件及其能力", PermStatus},
+		{"/plugin <tag>                单个插件的类型、能力和配置参数", PermStatus},
+		{"/audit [n]                   最近的管理操作", PermStatus},
+	}},
+	{title: "数据源", items: []helpItem{
+		{"/provider                    查看数据源和示例", PermProvider},
+		{"/provider <tag>              单个数据源及其 add/mod/del/clear 示例", PermProvider},
+		{"/provider <tag> add <d>      向文本数据源增加域名", PermProvider},
+		{"/provider <tag> list [p] [n] 列出 .txt 数据源，页码和分页大小须同时提供", PermProvider},
+		{"/provider <tag> mod <old> <new>  替换域名", PermProvider},
+		{"/provider <tag> del <d>      删除域名", PermProvider},
+		{"/provider <tag> clear        清空文本数据源或一个 v2dat 分类", PermProvider},
+	}},
+	{title: "配置", items: []helpItem{
+		{"/config                      配置文件摘要", PermConfig},
+		{"/config show <section>       查看 log/data_providers/plugins/servers", PermConfig},
+		{"/config get <key.path>       读取一个值，例如 plugins[1].tag", PermConfig},
+		{"/config set <key.path> <v>   写入一个值（会先备份）", PermConfig},
+		{"/config add <section> <yaml> 追加一个块；flow yaml，例如", PermConfig},
+		{"                             /config add plugins {tag: x, type: sequence}", PermConfig},
+		{"/config del <section> <k>    按 tag、索引或日志键删除", PermConfig},
+		{"/config validate             重载前检查必填字段", PermConfig},
+		{"/proxy [tag]                 fakeip 插件的代理状态", PermConfig},
+		{"/proxy on <url>|off          写入代理，然后 /reload confirm", PermConfig},
+		{"/exec <tag> <ip> <domain>    运行一个已配置的 exec_script 插件", PermExecScript},
+		{"/reload confirm              校验配置并停止，由 supervisor 拉起", PermReload},
+	}},
+}
+
+func fipHelpText(l lang) string {
+	return l.t(fipHelp, fipHelpZH)
+}
+
+func vpnHelpText(l lang) string {
+	return l.t(vpnHelp, vpnHelpZH)
+}

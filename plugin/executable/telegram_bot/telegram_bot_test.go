@@ -661,12 +661,19 @@ func TestRolePermissions(t *testing.T) {
 	}
 
 	// chat 123 is only in chat_ids, so it gets the built-in admin role: it can
-	// observe and manage people, but not rewrite config or reload the process.
-	if !access.allowed(123, PermStatus) || !access.allowed(123, PermRadius) || !access.allowed(123, PermAccess) {
+	// observe, manage people and edit data_providers lists, but not rewrite
+	// config or reload the process.
+	if !access.allowed(123, PermStatus) || !access.allowed(123, PermRadius) || !access.allowed(123, PermAccess) || !access.allowed(123, PermProvider) {
 		t.Fatalf("chat_ids entry lost admin rights: %s", access.permissionNames(123))
 	}
 	if access.allowed(123, PermConfig) || access.allowed(123, PermReload) || access.allowed(123, PermExecScript) {
 		t.Fatalf("admin role must not hold write permissions: %s", access.permissionNames(123))
+	}
+	if err := p.require(123, PermProvider); err != nil {
+		t.Fatalf("admin role should manage data providers: %v", err)
+	}
+	if err := p.require(123, PermConfig); err == nil {
+		t.Fatalf("admin role must not edit the config")
 	}
 	if err := p.require(999, PermStatus); err == nil {
 		t.Fatalf("an unlisted chat must be rejected")
@@ -704,5 +711,16 @@ func TestRoleUnknownPermission(t *testing.T) {
 	args.initDefault()
 	if _, err := buildAccess(args); err == nil {
 		t.Fatalf("an unknown permission must be rejected")
+	}
+}
+
+func TestTimezoneFormatting(t *testing.T) {
+	a := &Args{Timezone: "Asia/Tokyo"}
+	if err := a.initDefault(); err != nil {
+		t.Fatalf("initDefault: %v", err)
+	}
+	ts := time.Date(2026, 11, 13, 0, 0, 0, 0, time.UTC).Unix()
+	if got := formatTime(ts, a.loc); got != "2026-11-13 09:00" {
+		t.Fatalf("formatTime = %q, want Tokyo 09:00", got)
 	}
 }

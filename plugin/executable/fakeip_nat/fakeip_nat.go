@@ -14,6 +14,7 @@ import (
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	_ "modernc.org/sqlite"
@@ -44,8 +45,11 @@ func init() {
 type Args struct {
 	DBPath      string `yaml:"db_path"`      // SQLite 路径，默认: "/config/mosdns/fakeip.db"
 	TablePrefix string `yaml:"table_prefix"` // 数据库表名前缀，默认: "default"
-	IPv4Range   string `yaml:"ipv4_range"`   // 虚拟 IP 段，默认: "198.18.0.0/15"
-	TTL         uint32 `yaml:"ttl"`          // 返回的 DNS TTL，默认: 60
+	// Timezone controls how stored Unix timestamps are rendered by the admin
+	// surface. Default "Asia/Shanghai"; SQLite keeps seconds since the epoch.
+	Timezone  string `yaml:"timezone"`
+	IPv4Range string `yaml:"ipv4_range"` // 虚拟 IP 段，默认: "198.18.0.0/15"
+	TTL       uint32 `yaml:"ttl"`        // 返回的 DNS TTL，默认: 60
 	// RecordTTL 是域名映射的保留时长，默认 "168h"（7 天）。超过该时长没有被查询过的
 	// 记录会被后台任务从 SQLite 和内存中删除，释放的虚拟地址重新进入可分配池。
 	// 填 "0" 关闭清理（记录一直保留）。支持 Go 时长语法：168h、24h、30m。
@@ -153,8 +157,9 @@ type FakeIPNatPlugin struct {
 	nextHopDev    string
 	// realIP mirrors Args.RealIP: when set the plugin answers real IPs and only
 	// maintains the host routes that steer them out of the chosen gateway.
-	realIP bool
-	mu     sync.Mutex // serializes fake ip allocation
+	realIP  bool
+	timeLoc *time.Location
+	mu      sync.Mutex // serializes fake ip allocation
 
 	taskSem      chan struct{}       // bounds concurrently running NAT tasks
 	taskMu       sync.Mutex          // guards taskInFlight
@@ -291,10 +296,22 @@ type FakeIPNatPlugin struct {
 	tunStarted bool
 }
 
+// Location is the timezone used to render this plugin's stored timestamps.
+func (p *FakeIPNatPlugin) Location() *time.Location {
+	if p.timeLoc == nil {
+		return timeutil.MustDefault()
+	}
+	return p.timeLoc
+}
+
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	initStarted := time.Now()
 	cfg := args.(*Args)
 
+	tzLoc, tzErr := timeutil.Load(cfg.Timezone)
+	if tzErr != nil {
+		return nil, tzErr
+	}
 	if cfg.DBPath == "" {
 		cfg.DBPath = "/etc/mosdns/fakeip.db"
 	}
@@ -512,6 +529,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		nextHop:             strings.TrimSpace(cfg.NextHop),
 		nextHopDev:          strings.TrimSpace(cfg.NextHopDev),
 		realIP:              cfg.RealIP,
+		timeLoc:             tzLoc,
 		policyRuleSupported: supportsNamedRouteTable(),
 		realRoutes:          make(map[string]struct{}),
 		taskSem:             make(chan struct{}, defaultTaskConcurrency),

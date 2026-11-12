@@ -20,29 +20,31 @@ import (
 // planeAdmin is the data-plane contract of a fakeip plugin, resolved by tag.
 type planeAdmin = fakeipadmin.PlaneAdmin
 
-func (p *telegramBot) resolvePlaneAdmin(tag string) (planeAdmin, error) {
+func (p *telegramBot) resolvePlaneAdmin(tag string, langs ...lang) (planeAdmin, error) {
+	l := replyLang(langs)
 	if p.plane != nil {
 		return p.plane, nil // test seam: one stub for every tag
 	}
 	e, ok := p.M().GetExecutables()[tag]
 	if !ok {
-		return nil, fmt.Errorf("%s: not loaded", tag)
+		return nil, fmt.Errorf(l.t("%s: not loaded", "%s：未加载"), tag)
 	}
 	admin, ok := e.(planeAdmin)
 	if !ok {
-		return nil, fmt.Errorf("%s: not a fakeip data plane", tag)
+		return nil, fmt.Errorf(l.t("%s: not a fakeip data plane", "%s：不是 fakeip 数据面插件"), tag)
 	}
 	return admin, nil
 }
 
 // handleNet renders what the data plane has installed: the fields a shell
 // session would otherwise need three commands to read.
-func (p *telegramBot) handleNet(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleNet(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, args := pickTag(p.args.FakeIPTags, args)
 	if len(args) > 0 && strings.ToLower(args[0]) == "tags" {
-		return p.tagSummary("fakeip", p.args.FakeIPTags), nil
+		return p.tagSummary("fakeip", p.args.FakeIPTags, l), nil
 	}
-	admin, err := p.resolvePlaneAdmin(tag)
+	admin, err := p.resolvePlaneAdmin(tag, l)
 	if err != nil {
 		return "", err
 	}
@@ -52,30 +54,30 @@ func (p *telegramBot) handleNet(ctx context.Context, args []string) (string, err
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s plane: %s", tag, plane.DataPlane)
+	fmt.Fprintf(&b, l.t("%s plane: %s", "%s 数据面：%s"), tag, plane.DataPlane)
 	if plane.Device != "" {
 		fmt.Fprintf(&b, " (%s)", plane.Device)
 	}
-	fmt.Fprintf(&b, "\nrange: %s", plane.Range)
-	fmt.Fprintf(&b, "\nproxy: %s", yesNo(plane.ProxyActive))
-	fmt.Fprintf(&b, "\nmark: %s", yesNo(plane.MarkEnabled))
+	fmt.Fprintf(&b, l.t("\nrange: %s", "\n地址范围：%s"), plane.Range)
+	fmt.Fprintf(&b, l.t("\nproxy: %s", "\n代理：%s"), l.yesNo(plane.ProxyActive))
+	fmt.Fprintf(&b, l.t("\nmark: %s", "\n标记：%s"), l.yesNo(plane.MarkEnabled))
 	if plane.RouteMark != 0 {
-		fmt.Fprintf(&b, " (0x%x -> table %s)", plane.RouteMark, plane.RouteTable)
+		fmt.Fprintf(&b, l.t(" (0x%x -> table %s)", " (0x%x -> 路由表 %s)"), plane.RouteMark, plane.RouteTable)
 	}
 	if plane.OutletTable != "" {
-		fmt.Fprintf(&b, "\noutlet table: %s", plane.OutletTable)
+		fmt.Fprintf(&b, l.t("\noutlet table: %s", "\n出口路由表：%s"), plane.OutletTable)
 	}
-	fmt.Fprintf(&b, "\nmark set: %d address(es)", plane.RealIPs)
+	fmt.Fprintf(&b, l.t("\nmark set: %d address(es)", "\n标记地址：%d 个"), plane.RealIPs)
 	if len(plane.Rules) > 0 {
-		fmt.Fprintf(&b, "\nrules:")
+		fmt.Fprintf(&b, l.t("\nrules:", "\n规则："))
 		for _, line := range plane.Rules {
 			fmt.Fprintf(&b, "\n  %s", line)
 		}
 	} else {
-		fmt.Fprintf(&b, "\nrules: none of ours")
+		fmt.Fprintf(&b, l.t("\nrules: none of ours", "\n规则：没有本插件的规则"))
 	}
 	if len(plane.Routes) > 0 {
-		fmt.Fprintf(&b, "\nroutes:")
+		fmt.Fprintf(&b, l.t("\nroutes:", "\n路由："))
 		for _, line := range plane.Routes {
 			fmt.Fprintf(&b, "\n  %s", line)
 		}
@@ -85,12 +87,13 @@ func (p *telegramBot) handleNet(ctx context.Context, args []string) (string, err
 
 // handleLedger shows the state a later run would clean with, next to what is
 // installed now: a recorded object with no live counterpart is a leftover.
-func (p *telegramBot) handleLedger(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleLedger(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, args := pickTag(p.args.FakeIPTags, args)
 	if len(args) > 0 && strings.ToLower(args[0]) == "tags" {
-		return p.tagSummary("fakeip", p.args.FakeIPTags), nil
+		return p.tagSummary("fakeip", p.args.FakeIPTags, l), nil
 	}
-	admin, err := p.resolvePlaneAdmin(tag)
+	admin, err := p.resolvePlaneAdmin(tag, l)
 	if err != nil {
 		return "", err
 	}
@@ -100,9 +103,9 @@ func (p *telegramBot) handleLedger(ctx context.Context, args []string) (string, 
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s recorded objects:", tag)
+	fmt.Fprintf(&b, l.t("%s recorded objects:", "%s 已记录对象："), tag)
 	if len(plane.Recorded) == 0 {
-		fmt.Fprintf(&b, "\n  none")
+		fmt.Fprintf(&b, l.t("\n  none", "\n  无"))
 		return b.String(), nil
 	}
 	keys := make([]string, 0, len(plane.Recorded))
@@ -113,22 +116,25 @@ func (p *telegramBot) handleLedger(ctx context.Context, args []string) (string, 
 	for _, k := range keys {
 		fmt.Fprintf(&b, "\n  %s = %s", k, plane.Recorded[k])
 	}
-	fmt.Fprintf(&b, "\nlive: rules=%d routes=%d mark set=%d",
+	fmt.Fprintf(&b, l.t("\nlive: rules=%d routes=%d mark set=%d",
+		"\n当前：规则=%d 路由=%d 标记地址=%d"),
 		len(plane.Rules), len(plane.Routes), plane.RealIPs)
 	return b.String(), nil
 }
 
 // handleSweep runs the record-driven cleanup by hand. It removes only what the
 // running configuration does not own, so it is safe while the plugin is up.
-func (p *telegramBot) handleSweep(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleSweep(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, args := pickTag(p.args.FakeIPTags, args)
 	if len(args) == 0 {
-		return "sweep removes recorded objects the current configuration does not own.\nrun /sweep confirm", nil
+		return l.t("sweep removes recorded objects the current configuration does not own.\nrun /sweep confirm",
+			"清理会删除当前配置不拥有的已记录对象。\n请运行 /sweep confirm"), nil
 	}
 	if strings.ToLower(args[0]) != "confirm" {
-		return "usage: /sweep [tag] confirm", nil
+		return l.t("usage: /sweep [tag] confirm", "用法：/sweep [tag] confirm"), nil
 	}
-	admin, err := p.resolvePlaneAdmin(tag)
+	admin, err := p.resolvePlaneAdmin(tag, l)
 	if err != nil {
 		return "", err
 	}
@@ -137,20 +143,22 @@ func (p *telegramBot) handleSweep(ctx context.Context, args []string) (string, e
 		return "", err
 	}
 	if len(removed) == 0 {
-		return "nothing to sweep: no recorded object differs from the running configuration", nil
+		return l.t("nothing to sweep: no recorded object differs from the running configuration",
+			"没有需要清理的对象：已记录对象与当前运行配置一致"), nil
 	}
-	return "removed:\n  " + strings.Join(removed, "\n  "), nil
+	return l.t("removed:\n  ", "已删除：\n  ") + strings.Join(removed, "\n  "), nil
 }
 
 // handleDiag answers what happens to one domain: the mapping handed out, the
 // real addresses learned for it, and the way the stack would dial them.
-func (p *telegramBot) handleDiag(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleDiag(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	if len(args) == 0 {
-		return "usage: /diag <domain> [tag]", nil
+		return l.t("usage: /diag <domain> [tag]", "用法：/diag <domain> [tag]"), nil
 	}
 	domain := strings.ToLower(strings.TrimSpace(args[0]))
 	tag, _ := pickTag(p.args.FakeIPTags, args[1:])
-	admin, err := p.resolvePlaneAdmin(tag)
+	admin, err := p.resolvePlaneAdmin(tag, l)
 	if err != nil {
 		return "", err
 	}
@@ -162,30 +170,33 @@ func (p *telegramBot) handleDiag(ctx context.Context, args []string) (string, er
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s", d.Domain)
 	if d.FakeIP == "" {
-		fmt.Fprintf(&b, "\nno mapping: this domain has never been answered")
+		fmt.Fprintf(&b, l.t("\nno mapping: this domain has never been answered",
+			"\n无映射：该域名从未被应答过"))
 	} else {
-		fmt.Fprintf(&b, "\nfake ip: %s", d.FakeIP)
+		fmt.Fprintf(&b, l.t("\nfake ip: %s", "\nfake IP：%s"), d.FakeIP)
 		if d.CreatedAt > 0 {
-			fmt.Fprintf(&b, " (%s)", formatTime(d.CreatedAt))
+			fmt.Fprintf(&b, " (%s)", formatTime(d.CreatedAt, p.locationFor(nil)))
 		}
 	}
 	if d.RealIPKnown {
-		fmt.Fprintf(&b, "\nreal ips: %s", strings.Join(d.RealIPs, ", "))
+		fmt.Fprintf(&b, l.t("\nreal ips: %s", "\n真实 IP：%s"), strings.Join(d.RealIPs, ", "))
 	} else {
-		fmt.Fprintf(&b, "\nreal ips: none recorded yet")
+		fmt.Fprintf(&b, l.t("\nreal ips: none recorded yet", "\n真实 IP：尚未记录"))
 	}
-	fmt.Fprintf(&b, "\noutlet: %s", d.Outlet)
-	fmt.Fprintf(&b, "\nproxy: %s  mark: %s", yesNo(d.ProxyActive), yesNo(d.Marked))
+	fmt.Fprintf(&b, l.t("\noutlet: %s", "\n出口：%s"), d.Outlet)
+	fmt.Fprintf(&b, l.t("\nproxy: %s  mark: %s", "\n代理：%s  标记：%s"),
+		l.yesNo(d.ProxyActive), l.yesNo(d.Marked))
 	return b.String(), nil
 }
 
 // handleProxy reads or writes the proxy of the fakeip plugin. Writing the URL
 // is the "on" switch, an empty value is "off"; the change is written to the
 // config file with a backup, and a reload is needed to take effect.
-func (p *telegramBot) handleProxy(ctx context.Context, args []string) (string, error) {
+func (p *telegramBot) handleProxy(ctx context.Context, args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	tag, args := pickTag(p.args.FakeIPTags, args)
 	if len(args) == 0 {
-		return p.proxySummary(tag)
+		return p.proxySummary(tag, l)
 	}
 	switch strings.ToLower(args[0]) {
 	case "off":
@@ -193,28 +204,34 @@ func (p *telegramBot) handleProxy(ctx context.Context, args []string) (string, e
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s proxy cleared (backup %s)\nrun /reload confirm to apply", tag, backup), nil
+		return l.t(fmt.Sprintf("%s proxy cleared (backup %s)\nrun /reload confirm to apply", tag, backup),
+			fmt.Sprintf("%s 代理已清除（备份 %s）\n运行 /reload confirm 以生效", tag, backup)), nil
 	case "on":
 		if len(args) < 2 {
-			return "usage: /proxy on <socks5://user:pass@host:port>", nil
+			return l.t("usage: /proxy on <socks5://user:pass@host:port>",
+				"用法：/proxy on <socks5://user:pass@host:port>"), nil
 		}
 		backup, err := p.setPluginValue(tag, "proxy", args[1])
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s proxy set (backup %s)\nrun /reload confirm to apply", tag, backup), nil
+		return l.t(fmt.Sprintf("%s proxy set (backup %s)\nrun /reload confirm to apply", tag, backup),
+			fmt.Sprintf("%s 代理已设置（备份 %s）\n运行 /reload confirm 以生效", tag, backup)), nil
 	}
-	return "usage: /proxy [tag]\n/proxy on <url>\n/proxy off", nil
+	return l.t("usage: /proxy [tag]\n/proxy on <url>\n/proxy off",
+		"用法：/proxy [tag]\n/proxy on <url>\n/proxy off"), nil
 }
 
-func (p *telegramBot) proxySummary(tag string) (string, error) {
+func (p *telegramBot) proxySummary(tag string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	doc, err := loadConfigDocument(p.configPath())
 	if err != nil {
 		return "", err
 	}
 	block := pluginBlock(doc, tag)
 	if block == nil {
-		return "", fmt.Errorf("%s: not in the config file", tag)
+		return "", fmt.Errorf("%s", l.t(fmt.Sprintf("%s: not in the config file", tag),
+			fmt.Sprintf("%s：不在配置文件中", tag)))
 	}
 	args := mappingGet(block, "args")
 	proxy := ""
@@ -224,9 +241,11 @@ func (p *telegramBot) proxySummary(tag string) (string, error) {
 		}
 	}
 	if proxy == "" {
-		return fmt.Sprintf("%s proxy: off (answers go out over the direct outlet)", tag), nil
+		return l.t(fmt.Sprintf("%s proxy: off (answers go out over the direct outlet)", tag),
+			fmt.Sprintf("%s 代理：关（应答走直连出口）", tag)), nil
 	}
-	return fmt.Sprintf("%s proxy: on %s", tag, maskURL(proxy)), nil
+	return l.t(fmt.Sprintf("%s proxy: on %s", tag, maskURL(proxy)),
+		fmt.Sprintf("%s 代理：开 %s", tag, maskURL(proxy))), nil
 }
 
 // setPluginValue writes one key of a plugin's args and returns the backup path.
@@ -352,7 +371,8 @@ func (p *telegramBot) readAudit(limit int) ([]auditEntry, error) {
 	return entries, nil
 }
 
-func (p *telegramBot) handleAudit(args []string) (string, error) {
+func (p *telegramBot) handleAudit(args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	limit := 20
 	if len(args) > 0 {
 		if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
@@ -364,12 +384,12 @@ func (p *telegramBot) handleAudit(args []string) (string, error) {
 		return "", err
 	}
 	if len(entries) == 0 {
-		return "no administration action recorded yet\nlog: " + p.auditPath(), nil
+		return l.t("no administration action recorded yet\nlog: ", "暂无管理操作记录\n日志：") + p.auditPath(), nil
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "last %d action(s), log %s", len(entries), p.auditPath())
+	fmt.Fprintf(&b, l.t("last %d action(s), log %s", "最近 %d 条操作，日志 %s"), len(entries), p.auditPath())
 	for _, e := range entries {
-		fmt.Fprintf(&b, "\n%s chat %d %s", e.At, e.ChatID, e.Action)
+		fmt.Fprintf(&b, l.t("\n%s chat %d %s", "\n%s 会话 %d %s"), e.At, e.ChatID, e.Action)
 		if e.Detail != "" {
 			fmt.Fprintf(&b, " %s", e.Detail)
 		}
@@ -395,7 +415,7 @@ func yesNo(v bool) string {
 // system objects, or runs a script. Read-only commands are not recorded.
 func isAuditedCommand(cmd string) bool {
 	switch cmd {
-	case "/config", "/proxy", "/sweep", "/reload", "/exec", "/fip":
+	case "/config", "/proxy", "/sweep", "/provider", "/reload", "/exec", "/fip":
 		return true
 	}
 	return false

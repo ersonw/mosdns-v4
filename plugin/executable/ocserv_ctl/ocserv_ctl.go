@@ -41,6 +41,7 @@ import (
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"go.uber.org/zap"
 )
 
@@ -98,6 +99,10 @@ type Args struct {
 	EventLog string `yaml:"event_log"`
 	// EventBuffer is how many events AdminEvents keeps in memory. Default 500.
 	EventBuffer int `yaml:"event_buffer"`
+	// Timezone stamps events that arrive without a time. Default Asia/Shanghai.
+	Timezone string `yaml:"timezone"`
+
+	loc *time.Location
 }
 
 func (a *Args) initDefault() error {
@@ -134,6 +139,11 @@ func (a *Args) initDefault() error {
 	if a.EventBuffer > 5000 {
 		a.EventBuffer = 5000
 	}
+	loc, err := timeutil.Load(a.Timezone)
+	if err != nil {
+		return err
+	}
+	a.loc = loc
 	return nil
 }
 
@@ -177,6 +187,7 @@ type ocservUser struct {
 type ocservCtl struct {
 	*coremain.BP
 	args *Args
+	loc  *time.Location
 
 	mu        sync.Mutex
 	users     []ocservUser
@@ -201,7 +212,7 @@ func newOcservCtl(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 	if err := args.initDefault(); err != nil {
 		return nil, err
 	}
-	p := &ocservCtl{BP: bp, args: args}
+	p := &ocservCtl{BP: bp, args: args, loc: args.loc}
 	if err := p.startEvents(); err != nil {
 		return nil, err
 	}

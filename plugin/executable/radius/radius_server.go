@@ -3,6 +3,7 @@ package radius
 import (
 	"net"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -150,10 +151,29 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 		return s.reply(p, withMA, codeAccessReject, "malformed user-password", nil)
 	}
 
+	now := time.Now().Unix()
+	if _, err := s.store.maybeResetQuota(name, now); err != nil {
+		s.lg.Error("radius: quota reset failed", zap.String("user", name), zap.Error(err))
+	}
 	u, found, err := s.store.getUser(name)
 	if err != nil {
 		s.lg.Error("radius: user lookup failed", zap.String("user", name), zap.Error(err))
 		return s.reply(p, withMA, codeAccessReject, "internal error", nil)
+	}
+	if found {
+		// A hand-edited row or a limit lowered below current usage must not
+		// authenticate forever: enforce the limit before checking enabled.
+		disabled, err := s.store.enforceQuota(name, now)
+		if err != nil {
+			s.lg.Error("radius: quota check failed", zap.String("user", name), zap.Error(err))
+			return s.reply(p, withMA, codeAccessReject, "internal error", nil)
+		}
+		if disabled {
+			u, found, err = s.store.getUser(name)
+			if err != nil {
+				return s.reply(p, withMA, codeAccessReject, "internal error", nil)
+			}
+		}
 	}
 	if !found || !u.Enabled || !verifyPassword(u.Password, plain) {
 		s.lg.Debug("radius: authentication rejected",
@@ -204,13 +224,24 @@ func (s *server) handleAccounting(src *net.UDPAddr, raw []byte) []byte {
 	session := p.getString(attrAcctSessionID)
 	in, _ := p.getUint32(attrAcctInputOctets)
 	out, _ := p.getUint32(attrAcctOutputOctets)
+	inGiga, _ := p.getUint32(attrAcctInputGigawords)
+	outGiga, _ := p.getUint32(attrAcctOutputGigawords)
+	// RFC 2869: the low 32 bits wrap every 4 GiB, the gigawords carry the
+	// high 32 bits. Without them a long session resets its counter and the
+	// quota undercounts.
+	inTotal := int64(in) + int64(inGiga)<<32
+	outTotal := int64(out) + int64(outGiga)<<32
 
-	if err := s.store.applyAccounting(session, name, src.String(), status, int64(in), int64(out)); err != nil {
+	disabled, err := s.store.applyAccounting(session, name, src.String(), status, inTotal, outTotal)
+	if err != nil {
 		s.lg.Error("radius: accounting update failed", zap.String("user", name), zap.Error(err))
+	}
+	if disabled {
+		s.lg.Info("radius: user disabled by traffic quota", zap.String("user", name))
 	}
 	s.lg.Debug("radius: accounting recorded",
 		zap.String("user", name), zap.String("session", session),
-		zap.Uint32("status", status), zap.Uint32("in", in), zap.Uint32("out", out))
+		zap.Uint32("status", status), zap.Int64("in", inTotal), zap.Int64("out", outTotal))
 	return buildAccountingResponse(p, s.secret)
 }
 

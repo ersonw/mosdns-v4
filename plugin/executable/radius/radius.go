@@ -19,10 +19,13 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"go.uber.org/zap"
 )
 
@@ -55,8 +58,13 @@ type Args struct {
 	// IPPool overrides OcservConfig with an explicit range:
 	// "10.8.0.0/24" or "10.8.0.2-10.8.0.254". Empty means "read ocserv.conf".
 	IPPool string `yaml:"ip_pool"`
+	// Timezone is how stored Unix timestamps are rendered by the admin
+	// surface. Default "Asia/Shanghai"; the database itself always stores
+	// seconds since the epoch.
+	Timezone string `yaml:"timezone"`
 
 	pool *ipPool
+	loc  *time.Location
 }
 
 func (a *Args) initDefault() error {
@@ -92,6 +100,10 @@ func (a *Args) initDefault() error {
 		return err
 	}
 	a.pool = pool
+	a.loc, err = timeutil.Load(a.Timezone)
+	if err != nil {
+		return err
+	}
 	if _, err := net.ResolveUDPAddr("udp", a.Listen); err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", a.Listen, err)
 	}
@@ -111,6 +123,14 @@ type User struct {
 	Enabled   bool
 	CreatedAt int64
 	UpdatedAt int64
+	// Quota values are bytes. MaxTotal 0 means unlimited; ResetPeriod 0 means
+	// no automatic reset.
+	UsedIn        int64
+	UsedOut       int64
+	MaxTotal      int64
+	ResetPeriod   int64
+	PeriodStart   int64
+	QuotaDisabled bool
 }
 
 // Session is one accounting session as exposed to the admin surface.
@@ -136,6 +156,8 @@ type Admin interface {
 	SetEnabled(name string, enabled bool) (bool, error)
 	SetIP(name, ip string) (bool, error)
 	Sessions(activeOnly bool, limit int) ([]Session, error)
+	SetQuota(name string, maxTotal, resetPeriod int64) (bool, error)
+	ResetQuota(name string) (bool, error)
 }
 
 type Plugin struct {
@@ -144,6 +166,11 @@ type Plugin struct {
 	store *store
 	srv   *server
 	pool  *ipPool
+	loc   *time.Location
+
+	quotaStop chan struct{}
+	quotaOnce sync.Once
+	quotaWG   sync.WaitGroup
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -165,8 +192,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		return nil, fmt.Errorf("radius: %w", err)
 	}
 
-	p := &Plugin{BP: bp, args: a, store: st, srv: srv, pool: a.pool}
+	p := &Plugin{BP: bp, args: a, store: st, srv: srv, pool: a.pool, loc: a.loc, quotaStop: make(chan struct{})}
 	srv.start()
+	p.startQuotaLoop()
 
 	users, _ := st.listUsers()
 	poolInfo := ""
@@ -178,9 +206,45 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("listen", a.Listen),
 		zap.String("accounting_listen", a.AccountingListen),
 		zap.String("ip_pool", poolInfo),
+		zap.String("timezone", a.loc.String()),
 		zap.Int("users", len(users)),
 	)
 	return p, nil
+}
+
+// startQuotaLoop resets expired traffic periods even when the account is
+// offline. The check is cheap: one query per minute, and only accounts with a
+// non-zero reset_period are examined.
+func (p *Plugin) startQuotaLoop() {
+	p.quotaWG.Add(1)
+	go func() {
+		defer p.quotaWG.Done()
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-p.quotaStop:
+				return
+			case now := <-t.C:
+				n, err := p.store.resetDueQuotas(now.Unix())
+				if err != nil {
+					p.L().Warn("radius: quota reset sweep failed", zap.Error(err))
+					continue
+				}
+				if n > 0 {
+					p.L().Info("radius: quota periods reset", zap.Int("users", n))
+				}
+			}
+		}
+	}()
+}
+
+// Location is the timezone used to render this plugin's stored timestamps.
+func (p *Plugin) Location() *time.Location {
+	if p.loc == nil {
+		return timeutil.MustDefault()
+	}
+	return p.loc
 }
 
 // Exec is a pass-through: this plugin is a service, not a query-chain step.
@@ -189,6 +253,10 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context, next exe
 }
 
 func (p *Plugin) Close() error {
+	if p.quotaStop != nil {
+		p.quotaOnce.Do(func() { close(p.quotaStop) })
+		p.quotaWG.Wait()
+	}
 	if p.srv != nil {
 		p.srv.close()
 	}
@@ -212,6 +280,9 @@ func (p *Plugin) Users() ([]User, error) {
 		out = append(out, User{
 			Name: r.Name, Group: r.Group, IP: r.IP, Enabled: r.Enabled,
 			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
+			UsedIn: r.UsedIn, UsedOut: r.UsedOut,
+			MaxTotal: r.MaxTotal, ResetPeriod: r.ResetPeriod,
+			PeriodStart: r.PeriodStart, QuotaDisabled: r.QuotaDisabled,
 		})
 	}
 	return out, nil
@@ -325,6 +396,32 @@ func (p *Plugin) SetGroup(name, group string) (bool, error) {
 	}
 	if ok {
 		p.L().Info("radius: group changed", zap.String("user", name), zap.String("group", group))
+	}
+	return ok, nil
+}
+
+// SetQuota changes the total byte limit and reset period. maxTotal 0 is
+// unlimited, resetPeriod 0 never resets.
+func (p *Plugin) SetQuota(name string, maxTotal, resetPeriod int64) (bool, error) {
+	ok, err := p.store.setQuota(name, maxTotal, resetPeriod)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		p.L().Info("radius: user quota changed", zap.String("user", name),
+			zap.Int64("max_total", maxTotal), zap.Int64("reset_period", resetPeriod))
+	}
+	return ok, nil
+}
+
+// ResetQuota clears the traffic counters and starts a new period.
+func (p *Plugin) ResetQuota(name string) (bool, error) {
+	ok, err := p.store.resetQuota(name)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		p.L().Info("radius: user quota reset", zap.String("user", name))
 	}
 	return ok, nil
 }

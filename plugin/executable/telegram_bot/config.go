@@ -354,98 +354,108 @@ func maskWalk(m *yaml.Node) {
 	}
 }
 
-func (p *telegramBot) handleConfig(args []string) (string, error) {
+func (p *telegramBot) handleConfig(args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	path := p.configPath()
 	doc, err := loadConfigDocument(path)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf(l.t("read config %s: %w", "读取配置 %s 失败：%w"), path, err)
 	}
 
 	if len(args) == 0 {
-		return p.configSummary(path, doc), nil
+		return p.configSummary(path, doc, l), nil
 	}
 
 	switch strings.ToLower(args[0]) {
 	case "show":
 		if len(args) < 2 {
-			return "usage: /config show <log|data_providers|plugins|servers>", nil
+			return l.t("usage: /config show <log|data_providers|plugins|servers>",
+				"用法：/config show <log|data_providers|plugins|servers>"), nil
 		}
 		n := nodePath(doc, strings.Split(args[1], "."))
 		if n == nil {
-			return fmt.Sprintf("%s: not found", args[1]), nil
+			return l.t(fmt.Sprintf("%s: not found", args[1]), fmt.Sprintf("%s：未找到", args[1])), nil
 		}
 		text := maskSecrets(n)
 		if len(text) > 3500 {
-			text = text[:3500] + "\n...(truncated)"
+			text = text[:3500] + l.t("\n...(truncated)", "\n...(已截断)")
 		}
 		return text, nil
 
 	case "get":
 		if len(args) < 2 {
-			return "usage: /config get <key.path>", nil
+			return l.t("usage: /config get <key.path>", "用法：/config get <key.path>"), nil
 		}
 		n := nodePath(doc, strings.Split(args[1], "."))
 		if n == nil {
-			return fmt.Sprintf("%s: not found", args[1]), nil
+			return l.t(fmt.Sprintf("%s: not found", args[1]), fmt.Sprintf("%s：未找到", args[1])), nil
 		}
 		return fmt.Sprintf("%s: %s", args[1], maskSecrets(n)), nil
 
 	case "set":
 		if len(args) < 3 {
-			return "usage: /config set <key.path> <value>", nil
+			return l.t("usage: /config set <key.path> <value>", "用法：/config set <key.path> <value>"), nil
 		}
 		if err := setConfigValue(doc, strings.Split(args[1], "."), strings.Join(args[2:], " ")); err != nil {
-			return "", err
+			return "", fmt.Errorf(l.t("set refused: %w", "写入被拒绝：%w"), err)
 		}
 		backup, err := writeConfigDocument(path, doc)
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf(l.t("config write failed: %w", "配置写入失败：%w"), err)
 		}
 		p.L().Info("config updated by bot", zap.String("key", args[1]), zap.String("backup", backup))
-		return fmt.Sprintf("%s updated\nbackup: %s\nsend /reload confirm to apply", args[1], backup), nil
+		return l.t(fmt.Sprintf("%s updated\nbackup: %s\nsend /reload confirm to apply", args[1], backup),
+			fmt.Sprintf("%s 已更新\n备份：%s\n发送 /reload confirm 以生效", args[1], backup)), nil
 
 	case "add":
 		if len(args) < 3 {
-			return "usage: /config add <log|data_providers|plugins|servers> <yaml>", nil
+			return l.t("usage: /config add <log|data_providers|plugins|servers> <yaml>",
+				"用法：/config add <log|data_providers|plugins|servers> <yaml>"), nil
 		}
 		backup, err := p.configAdd(doc, args[1], strings.Join(args[2:], " "))
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf(l.t("add refused: %w", "追加被拒绝：%w"), err)
 		}
-		return fmt.Sprintf("%s appended\nbackup: %s\nsend /reload confirm to apply", args[1], backup), nil
+		return l.t(fmt.Sprintf("%s appended\nbackup: %s\nsend /reload confirm to apply", args[1], backup),
+			fmt.Sprintf("%s 已追加\n备份：%s\n发送 /reload confirm 以生效", args[1], backup)), nil
 
 	case "del":
 		if len(args) < 3 {
-			return "usage: /config del <log|data_providers|plugins|servers> <key|tag|index>", nil
+			return l.t("usage: /config del <log|data_providers|plugins|servers> <key|tag|index>",
+				"用法：/config del <log|data_providers|plugins|servers> <key|tag|index>"), nil
 		}
 		backup, err := p.configDel(doc, args[1], args[2])
 		if err != nil {
-			return "", err
+			return "", fmt.Errorf(l.t("delete refused: %w", "删除被拒绝：%w"), err)
 		}
-		return fmt.Sprintf("%s removed\nbackup: %s\nsend /reload confirm to apply", args[2], backup), nil
+		return l.t(fmt.Sprintf("%s removed\nbackup: %s\nsend /reload confirm to apply", args[2], backup),
+			fmt.Sprintf("%s 已删除\n备份：%s\n发送 /reload confirm 以生效", args[2], backup)), nil
 
 	case "validate":
-		problems := validateConfig(doc)
+		problems := validateConfig(doc, l)
 		if len(problems) == 0 {
-			return "config looks valid: syntax plus required fields of plugins, data_providers and servers", nil
+			return l.t("config looks valid: syntax plus required fields of plugins, data_providers and servers",
+				"配置看起来有效：语法以及 plugins、data_providers、servers 的必填字段均正常"), nil
 		}
-		return "problems:\n- " + strings.Join(problems, "\n- "), nil
+		return l.t("problems:\n- ", "问题：\n- ") + strings.Join(problems, "\n- "), nil
 	}
 
-	return "usage: /config [show|get|set|add|del|validate] ...", nil
+	return l.t("usage: /config [show|get|set|add|del|validate] ...",
+		"用法：/config [show|get|set|add|del|validate] ..."), nil
 }
 
-func (p *telegramBot) configSummary(path string, doc *yaml.Node) string {
+func (p *telegramBot) configSummary(path string, doc *yaml.Node, langs ...lang) string {
+	l := replyLang(langs)
 	var b strings.Builder
-	fmt.Fprintf(&b, "config: %s", path)
+	fmt.Fprintf(&b, l.t("config: %s", "配置文件：%s"), path)
 	for _, key := range []string{"log.level", "log.file", "api.http", "include"} {
 		if n := nodePath(doc, strings.Split(key, ".")); n != nil {
 			fmt.Fprintf(&b, "\n%s: %s", key, strings.Trim(n.Value, "\n"))
 		}
 	}
-	fmt.Fprintf(&b, "\nplugins: %d", sequenceLen(doc, "plugins"))
-	fmt.Fprintf(&b, "\ndata_providers: %d", sequenceLen(doc, "data_providers"))
-	fmt.Fprintf(&b, "\nservers: %d", sequenceLen(doc, "servers"))
+	fmt.Fprintf(&b, l.t("\nplugins: %d", "\n插件：%d"), sequenceLen(doc, "plugins"))
+	fmt.Fprintf(&b, l.t("\ndata_providers: %d", "\n数据源：%d"), sequenceLen(doc, "data_providers"))
+	fmt.Fprintf(&b, l.t("\nservers: %d", "\n服务端：%d"), sequenceLen(doc, "servers"))
 	return b.String()
 }
 
@@ -572,7 +582,8 @@ func findElementByTag(seq *yaml.Node, tag string) *yaml.Node {
 
 // validateConfig checks the fields mosdns itself requires, so a write can be
 // refused before it turns into a startup failure.
-func validateConfig(doc *yaml.Node) []string {
+func validateConfig(doc *yaml.Node, langs ...lang) []string {
+	l := replyLang(langs)
 	var problems []string
 
 	plugins := nodePath(doc, []string{"plugins"})
@@ -582,14 +593,14 @@ func validateConfig(doc *yaml.Node) []string {
 			tag := mappingGet(item, "tag")
 			typ := mappingGet(item, "type")
 			if tag == nil || tag.Value == "" {
-				problems = append(problems, fmt.Sprintf("plugins[%d] has no tag", i))
+				problems = append(problems, fmt.Sprintf(l.t("plugins[%d] has no tag", "plugins[%d] 缺少 tag"), i))
 				continue
 			}
 			if typ == nil || typ.Value == "" {
-				problems = append(problems, fmt.Sprintf("plugins[%d] (%s) has no type", i, tag.Value))
+				problems = append(problems, fmt.Sprintf(l.t("plugins[%d] (%s) has no type", "plugins[%d]（%s）缺少 type"), i, tag.Value))
 			}
 			if _, dup := seen[tag.Value]; dup {
-				problems = append(problems, fmt.Sprintf("duplicate plugin tag %q", tag.Value))
+				problems = append(problems, fmt.Sprintf(l.t("duplicate plugin tag %q", "插件 tag %q 重复"), tag.Value))
 			}
 			seen[tag.Value] = struct{}{}
 		}
@@ -599,7 +610,7 @@ func validateConfig(doc *yaml.Node) []string {
 	if providers != nil {
 		for i, item := range providers.Content {
 			if tag := mappingGet(item, "tag"); tag == nil || tag.Value == "" {
-				problems = append(problems, fmt.Sprintf("data_providers[%d] has no tag", i))
+				problems = append(problems, fmt.Sprintf(l.t("data_providers[%d] has no tag", "data_providers[%d] 缺少 tag"), i))
 			}
 		}
 	}
@@ -607,16 +618,16 @@ func validateConfig(doc *yaml.Node) []string {
 	servers := nodePath(doc, []string{"servers"})
 	if servers != nil {
 		if len(servers.Content) == 0 {
-			problems = append(problems, "servers is empty, mosdns refuses to start")
+			problems = append(problems, l.t("servers is empty, mosdns refuses to start", "servers 为空，mosdns 会拒绝启动"))
 		}
 		for i, item := range servers.Content {
 			exec := mappingGet(item, "exec")
 			if exec == nil || exec.Value == "" {
-				problems = append(problems, fmt.Sprintf("servers[%d] has no exec", i))
+				problems = append(problems, fmt.Sprintf(l.t("servers[%d] has no exec", "servers[%d] 缺少 exec"), i))
 			}
 			listeners := mappingGet(item, "listeners")
 			if listeners == nil || listeners.Kind != yaml.SequenceNode || len(listeners.Content) == 0 {
-				problems = append(problems, fmt.Sprintf("servers[%d] has no listeners", i))
+				problems = append(problems, fmt.Sprintf(l.t("servers[%d] has no listeners", "servers[%d] 缺少 listeners"), i))
 			}
 		}
 	}
@@ -626,11 +637,12 @@ func validateConfig(doc *yaml.Node) []string {
 
 // handlePlugin describes one loaded plugin, including its configuration block
 // with credentials masked.
-func (p *telegramBot) handlePlugin(tag string) (string, error) {
+func (p *telegramBot) handlePlugin(tag string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	ex := p.M().GetExecutables()
 	e, ok := ex[tag]
 	if !ok {
-		return fmt.Sprintf("%s: not loaded", tag), nil
+		return l.t(fmt.Sprintf("%s: not loaded", tag), fmt.Sprintf("%s：未加载", tag)), nil
 	}
 
 	var caps []string
@@ -642,22 +654,23 @@ func (p *telegramBot) handlePlugin(tag string) (string, error) {
 	}
 	out := fmt.Sprintf("%s\n%T", tag, e)
 	if len(caps) > 0 {
-		out += "\ncapabilities: " + strings.Join(caps, ", ")
+		out += l.t("\ncapabilities: ", "\n能力：") + strings.Join(caps, ", ")
 	}
 
 	doc, err := loadConfigDocument(p.configPath())
 	if err != nil {
-		return out + "\nconfig: " + err.Error(), nil
+		return out + l.t("\nconfig: ", "\n配置：") + err.Error(), nil
 	}
 	block := pluginBlock(doc, tag)
 	if block == nil {
-		return out + "\nconfig: no plugin block with this tag", nil
+		return out + l.t("\nconfig: no plugin block with this tag",
+			"\n配置：没有使用该 tag 的插件块"), nil
 	}
 	if t := mappingGet(block, "type"); t != nil {
-		out += "\ntype: " + t.Value
+		out += l.t("\ntype: ", "\n类型：") + t.Value
 	}
 	if argsNode := mappingGet(block, "args"); argsNode != nil {
-		out += "\nargs:\n" + maskSecrets(argsNode)
+		out += l.t("\nargs:\n", "\n参数：\n") + maskSecrets(argsNode)
 	}
 	return out, nil
 }
@@ -666,13 +679,16 @@ func (p *telegramBot) handlePlugin(tag string) (string, error) {
 // supervisor restarts it with the new configuration. mosdns builds plugins and
 // listeners once at startup and has no in-process reload, so a restart is the
 // only correct apply step.
-func (p *telegramBot) handleReload(args []string) (string, error) {
+func (p *telegramBot) handleReload(args []string, langs ...lang) (string, error) {
+	l := replyLang(langs)
 	path := p.configPath()
 	if _, err := loadConfigDocument(path); err != nil {
-		return "", fmt.Errorf("config is not loadable, refusing to reload: %w", err)
+		return "", fmt.Errorf(l.t("config is not loadable, refusing to reload: %w",
+			"配置无法加载，拒绝重载：%w"), err)
 	}
 	if len(args) == 0 || strings.ToLower(args[0]) != "confirm" {
-		return "reload stops mosdns and expects a supervisor (launchd/systemd/GoLand) to start it again.\nsend /reload confirm to proceed", nil
+		return l.t("reload stops mosdns and expects a supervisor (launchd/systemd/GoLand) to start it again.\nsend /reload confirm to proceed",
+			"重载会停止 mosdns，并依赖 supervisor（launchd/systemd/GoLand）重新拉起。\n发送 /reload confirm 继续"), nil
 	}
 
 	p.L().Info("reload requested by telegram admin", zap.String("config", path))
@@ -682,5 +698,6 @@ func (p *telegramBot) handleReload(args []string) (string, error) {
 		// restarts on failure brings mosdns back; the reason stays in its log.
 		p.M().GetSafeClose().SendCloseSignal(errors.New("reload requested by telegram bot"))
 	}()
-	return "config is loadable, stopping mosdns so the supervisor can restart it", nil
+	return l.t("config is loadable, stopping mosdns so the supervisor can restart it",
+		"配置可加载，正在停止 mosdns，等待 supervisor 重新拉起"), nil
 }

@@ -30,7 +30,7 @@ func TestHelpListsOnlyPermittedCommands(t *testing.T) {
 	p.access = access
 
 	adminHelp := p.helpFor(111)
-	for _, want := range []string{"role: admin", "/user list", "/access <user>", "/vpn users", "/status"} {
+	for _, want := range []string{"role: admin", "/user list", "/access <user>", "/vpn users", "/status", "/provider"} {
 		if !strings.Contains(adminHelp, want) {
 			t.Errorf("admin help lacks %q:\n%s", want, adminHelp)
 		}
