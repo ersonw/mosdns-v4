@@ -11,6 +11,7 @@ place.
 
 Examples:
   cat messy.txt | python3 domain_manage.py            # clean to stdout
+  cat messy.txt | python3 domain_manage.py -o clean.txt  # clean to a new file
   python3 domain_manage.py 'https://foo.com/x'        # one domain to stdout
   python3 domain_manage.py /etc/mosdns/rule/oversea_domains.txt google.com
   python3 domain_manage.py del /etc/mosdns/rule/oversea_domains.txt foo.com
@@ -152,7 +153,7 @@ def save_domains(path, domains):
         try:
             os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
         except FileNotFoundError:
-            pass
+            os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -163,13 +164,15 @@ def save_domains(path, domains):
 
 
 USAGE = """Usage:
-  python3 domain_manage.py [file_path] domain1 [domain2 ...]
+  python3 domain_manage.py [-o out_file] [file_path] domain1 [domain2 ...]
   python3 domain_manage.py add|del [file_path] domain1 [domain2 ...]
   python3 domain_manage.py clean [file_path]
-  cat domain_list.txt | python3 domain_manage.py [add|del] [file_path]
+  cat domain_list.txt | python3 domain_manage.py [-o out_file] [add|del]
 
 Action defaults to add. Without file_path the sorted domains are printed to
-stdout and only the summary goes to stderr; nothing is written.
+stdout, or to -o out_file when given; -o never reads the output file, so it
+is for "extract and save", not for merging. With file_path the list is edited
+in place. Only the summary goes to stderr in stream mode.
 URLs, wildcards, ports and trailing notes are reduced to bare domains."""
 
 
@@ -183,6 +186,28 @@ def parse_args(argv):
     if args and args[0] in ("-h", "--help"):
         print(USAGE)
         raise SystemExit(0)
+
+    # Pull -o/--output out before the positional interpretation: its value
+    # may look like a path or a domain.
+    output = None
+    rest = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("-o", "--output"):
+            if i + 1 >= len(args):
+                print("Error: -o needs a file name", file=sys.stderr)
+                raise SystemExit(1)
+            output = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--output="):
+            output = arg.split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(arg)
+        i += 1
+    args = rest
 
     action = "add"
     if args and args[0].lower() in ("add", "del", "clean"):
@@ -198,14 +223,23 @@ def parse_args(argv):
         ):
             path = args.pop(0)
 
-    return action, path, args
+    if output == "-":
+        output = None
+    if output is not None and path is not None:
+        print("Error: -o and an in-place file path are mutually exclusive",
+              file=sys.stderr)
+        raise SystemExit(1)
+
+    return action, path, args, output
 
 
 def main(argv=None):
-    action, path, inputs = parse_args(sys.argv[1:] if argv is None else argv)
+    action, path, inputs, output = parse_args(
+        sys.argv[1:] if argv is None else argv
+    )
 
     # Pipe mode only when nothing was passed as positional domains. A file
-    # clean never reads stdin; the stdout mode always does.
+    # clean never reads stdin; stream mode always does.
     read_stdin = not inputs and not sys.stdin.isatty()
     if read_stdin and (path is None or action != "clean"):
         raw_text = sys.stdin.read()
@@ -223,7 +257,7 @@ def main(argv=None):
     unique_input = set(valid)
     duplicate_input = len(valid) - len(unique_input)
 
-    # No file: print the normalized set, keep stdout pipe-clean.
+    # No file: write the normalized set to -o, or print it to stdout.
     if path is None:
         if action == "del":
             print("Error: del needs a file path", file=sys.stderr)
@@ -231,8 +265,11 @@ def main(argv=None):
         if not unique_input:
             print("Error: no valid domain found in input", file=sys.stderr)
             return 1
-        for domain in sorted(unique_input):
-            print(domain)
+        if output is not None:
+            save_domains(output, unique_input)
+        else:
+            for domain in sorted(unique_input):
+                print(domain)
         print(
             f"Input: {len(inputs)} lines, {len(unique_input)} valid, "
             f"{duplicate_input} duplicate, {skipped} skipped",
