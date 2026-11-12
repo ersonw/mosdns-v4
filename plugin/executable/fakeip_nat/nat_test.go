@@ -26,6 +26,7 @@ type fakeRunner struct {
 	devAddrs     map[string]string // output of `ip addr show dev X`
 	ifaces       map[string]bool   // `ifconfig X` answers; nil means every probe succeeds
 	routes       string            // output of `ip -4 route show`
+	tableDump    string            // output of `nft list table`
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
@@ -42,7 +43,7 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string
 	switch {
 	case call == "nft list table ip fakeip_test":
 		if f.tableExists {
-			return "", nil
+			return f.tableDump, nil
 		}
 		return "", fmt.Errorf("no such file or directory")
 	case strings.HasPrefix(call, "nft list map"):
@@ -483,5 +484,77 @@ func TestCleanupStaleNFTTableToleratesAbsence(t *testing.T) {
 	p.cleanupStaleNFTTable(context.Background())
 	if _, ok := runner.find("nft delete table ip fakeip_test"); !ok {
 		t.Fatalf("the absence probe was not attempted: %v", runner.all())
+	}
+}
+
+// TestNFTTableMatchesConfig pins the upgrade path: a table an older build left
+// behind carries the wide "oifname <dev> masquerade" rule and must not be
+// reused, while the current shape is accepted as-is.
+func TestNFTTableMatchesConfig(t *testing.T) {
+	stale := `table ip fakeip_default {
+	chain prerouting {
+		ip daddr 198.18.0.0/16 dnat to ip daddr map @dnat_map
+	}
+	chain forward {
+		ip daddr 198.18.0.0/16 drop
+	}
+	chain postrouting {
+		oifname "wg0" masquerade
+	}
+}`
+	if nftTableMatchesConfig(stale, "198.18.0.0/16", "wg0", 0) {
+		t.Fatalf("the wide masquerade rule must be treated as out of date")
+	}
+
+	current := `table ip fakeip_default {
+	chain prerouting {
+		ip daddr 198.18.0.0/16 dnat to ip daddr map @dnat_map
+	}
+	chain forward {
+		ip daddr 198.18.0.0/16 drop
+	}
+	chain postrouting {
+		ct status dnat masquerade
+	}
+	chain mss_clamp {
+		ip daddr 198.18.0.0/16 tcp flags syn tcp option maxseg size set 1360
+	}
+}`
+	if !nftTableMatchesConfig(current, "198.18.0.0/16", "wg0", 1360) {
+		t.Fatalf("the current shape must be reused")
+	}
+	// The current rule no longer names the egress device at all, so changing
+	// next_hop_dev is not a reason to rebuild the table.
+	if !nftTableMatchesConfig(current, "198.18.0.0/16", "eth0", 1360) {
+		t.Fatalf("a device change alone must not trigger a rebuild")
+	}
+	if nftTableMatchesConfig(current, "198.18.0.0/16", "wg0", 1400) {
+		t.Fatalf("a changed mss clamp must trigger a rebuild")
+	}
+	if nftTableMatchesConfig(current, "198.18.0.0/16", "", 1360) {
+		t.Fatalf("a table with a masquerade rule must not be reused without an egress device")
+	}
+	if !nftTableMatchesConfig("", "198.18.0.0/16", "wg0", 0) {
+		t.Fatalf("an empty dump proves nothing and must count as a match")
+	}
+}
+
+// TestEnsureNFTTableRebuildsStaleTable covers the upgrade itself: the plugin
+// deletes the mismatched table and builds the current one.
+func TestEnsureNFTTableRebuildsStaleTable(t *testing.T) {
+	runner := &fakeRunner{tableExists: true, tableDump: `table ip fakeip_test {
+	chain postrouting {
+		oifname "eth0" masquerade
+	}
+}`}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+	if err := p.ensureNFTTable(context.Background(), "fakeip_test", "eth0"); err != nil {
+		t.Fatalf("ensureNFTTable failed: %v", err)
+	}
+	if _, ok := runner.find("nft delete table ip fakeip_test"); !ok {
+		t.Fatalf("stale table was not deleted:\n%s", strings.Join(runner.all(), "\n"))
+	}
+	if _, ok := runner.find("nft add rule ip fakeip_test postrouting ct status dnat masquerade"); !ok {
+		t.Fatalf("the current rule was not installed:\n%s", strings.Join(runner.all(), "\n"))
 	}
 }

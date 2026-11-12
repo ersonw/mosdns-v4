@@ -179,9 +179,20 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 // ensureNFTTable creates the table, the dnat map and the three chains the
 // python version used. An existing table is left untouched.
 func (p *FakeIPNatPlugin) ensureNFTTable(ctx context.Context, table, dev string) error {
-	if _, err := p.runner.Run(ctx, "nft", "list", "table", "ip", table); err == nil {
-		p.L().Debug("fakeip nat: nft table already present", zap.String("nft_table", table))
-		return nil
+	if dump, err := p.runner.Run(ctx, "nft", "list", "table", "ip", table); err == nil {
+		if nftTableMatchesConfig(dump, p.cidr, dev, p.mssClamp) {
+			p.L().Debug("fakeip nat: nft table already present", zap.String("nft_table", table))
+			return nil
+		}
+		// The table is the one an earlier build left behind: its rules may
+		// reach further than this configuration does (an unconditional
+		// "oifname X masquerade" being the typical one). Reusing it would keep
+		// that behaviour alive, so it is rebuilt from scratch.
+		p.L().Info("fakeip nat: rebuilding the nft table so its rules match the configuration",
+			zap.String("nft_table", table))
+		if _, derr := p.runner.Run(ctx, "nft", "delete", "table", "ip", table); derr != nil {
+			return fmt.Errorf("delete the mismatched nft table: %w", derr)
+		}
 	}
 
 	setup := [][]string{
@@ -227,6 +238,45 @@ func (p *FakeIPNatPlugin) ensureNFTTable(ctx context.Context, table, dev string)
 	}
 	p.L().Info("nft table created", zap.String("nft_table", table), zap.String("egress_dev", dev))
 	return nil
+}
+
+// nftTableMatchesConfig reports whether an existing nft table already carries
+// the rules this configuration needs. A table from an older build can be
+// narrower or wider than the current shape - the postrouting rewrite is the one
+// that changed from "oifname <dev> masquerade" to "ct status dnat masquerade" -
+// and reusing it would silently keep the old scope. An empty dump proves
+// nothing, so it counts as a match.
+func nftTableMatchesConfig(dump, cidr, dev string, mssClamp int) bool {
+	if strings.TrimSpace(dump) == "" {
+		return true
+	}
+	if !strings.Contains(dump, "dnat to ip daddr map @") {
+		return false
+	}
+	if !strings.Contains(dump, "ip daddr "+cidr+" drop") {
+		return false
+	}
+	masquerades := 0
+	for _, line := range strings.Split(dump, "\n") {
+		if !strings.Contains(line, "masquerade") {
+			continue
+		}
+		masquerades++
+		if !strings.Contains(line, "ct status dnat") {
+			return false
+		}
+	}
+	wantMasquerades := 0
+	if dev != "" {
+		wantMasquerades = 1
+	}
+	if masquerades != wantMasquerades {
+		return false
+	}
+	if mssClamp > 0 && !strings.Contains(dump, fmt.Sprintf("maxseg size set %d", mssClamp)) {
+		return false
+	}
+	return true
 }
 
 // nftMappings reads the whole dnat map: fake ip -> real ip.

@@ -196,6 +196,10 @@ TUN 下的假 IP 分配从段内第 2 个地址开始（段首 `.1` 归网卡所
   `ipv4_range`、设备自身地址，或本次运行真正路由进设备（打标成功 / 启动时恢复）的真实 IP 集合里，
   其它 IPv4 包直接丢弃（`fakeip nat: packet for an unowned destination dropped`）。被别的路由
   塞进设备的流量不会被插件代拨出去；该集合上限 4096 条，超限按最旧淘汰；
+- 启动时校验已有 nft 表：`ensureNFTTable` 读回 `nft list table`，若 postrouting 仍是旧版的
+  `oifname <dev> masquerade`、或缺少当前的 DNAT/drop/mss 规则，就删表重建（日志
+  `fakeip nat: rebuilding the nft table so its rules match the configuration`），
+  避免升级二进制后继续沿用旧表的宽匹配；
 - 清理扫描只删自己的路由：`cleanupDataPath` / `sweepResidualRoutes` / `pruneManagedRoutes`
   扫到前缀后先过 `foreignRoute`——账本里没有逐条记录、也不是账本行折叠出的聚合块时跳过，
   运维自己写的同网关路由不会被误删（账本为空的旧场景仍按扫描兜底）。
