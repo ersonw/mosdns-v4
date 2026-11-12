@@ -53,18 +53,40 @@ type eventStore struct {
 	closed bool
 }
 
+// defaultEventLog keeps the up/down history across restarts when event_log is
+// not set explicitly.
+const defaultEventLog = "/run/mosdns/ocserv-events.jsonl"
+
 // AdminEvents returns the newest recorded events, newest first. A non-empty
-// user filters case-insensitively. It is the read side exposed as
-// /vpn events and only reads the in-memory ring; event_log keeps the history
-// that outlives a restart.
+// user filters case-insensitively. It is the read side exposed as /vpn events:
+// when event_log is set (or defaulted), the JSONL file is the source so history
+// survives a restart; the in-memory ring is only a fallback.
 func (p *ocservCtl) AdminEvents(limit int, user string) (string, error) {
 	if limit <= 0 {
 		limit = 50
 	}
+	if limit > 5000 {
+		limit = 5000
+	}
+	user = strings.TrimSpace(user)
+
+	if p.args.EventLog != "" {
+		items, err := readEventLog(p.args.EventLog, limit, user)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return "", fmt.Errorf("read event_log %s: %w", p.args.EventLog, err)
+			}
+		} else if len(items) > 0 {
+			return formatEvents(items), nil
+		}
+	}
+
+	if p.args.EventSocket == "" {
+		return "", fmt.Errorf("event_socket is not configured")
+	}
 	if limit > p.args.EventBuffer {
 		limit = p.args.EventBuffer
 	}
-	user = strings.TrimSpace(user)
 
 	p.events.mu.Lock()
 	items := make([]updownEvent, 0, len(p.events.ring))
@@ -80,20 +102,59 @@ func (p *ocservCtl) AdminEvents(limit int, user string) (string, error) {
 	p.events.mu.Unlock()
 
 	if len(items) == 0 {
-		if p.args.EventSocket == "" {
-			return "", fmt.Errorf("event_socket is not configured")
-		}
 		if user == "" {
 			return "no events recorded yet", nil
 		}
 		return fmt.Sprintf("no events recorded for %s", user), nil
 	}
+	return formatEvents(items), nil
+}
+
+// readEventLog returns up to limit matching events, newest first. A malformed
+// or partially written line is skipped instead of breaking the whole history.
+func readEventLog(path string, limit int, user string) ([]updownEvent, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	items := make([]updownEvent, 0, limit)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 256*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var ev updownEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			continue
+		}
+		if user != "" && !strings.EqualFold(ev.User, user) {
+			continue
+		}
+		items = append(items, ev)
+		if len(items) > limit {
+			items = items[len(items)-limit:]
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(items)-1; i < j; i, j = i+1, j-1 {
+		items[i], items[j] = items[j], items[i]
+	}
+	return items, nil
+}
+
+func formatEvents(items []updownEvent) string {
 	var b strings.Builder
 	for _, e := range items {
 		b.WriteString(formatEvent(e))
 		b.WriteByte('\n')
 	}
-	return strings.TrimRight(b.String(), "\n"), nil
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func formatEvent(e updownEvent) string {

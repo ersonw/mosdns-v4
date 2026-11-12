@@ -40,6 +40,9 @@ func fakeOcctl(t *testing.T, body string) (path, argvLog, socketPath string) {
 
 func newTestPlugin(t *testing.T, args *Args) *ocservCtl {
 	t.Helper()
+	if args.EventSocket != "" && args.EventLog == "" {
+		args.EventLog = filepath.Join(t.TempDir(), "events.jsonl")
+	}
 	bp := coremain.NewBP("test_ocserv", PluginType, zap.NewNop(), nil)
 	p, err := newOcservCtl(bp, args)
 	if err != nil {

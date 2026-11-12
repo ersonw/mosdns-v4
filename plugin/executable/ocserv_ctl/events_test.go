@@ -149,8 +149,8 @@ func TestEventSocketFilterAndLimit(t *testing.T) {
 		t.Fatalf("filter leaked bob:\n%s", out)
 	}
 
-	// The ring keeps only the newest three entries: adding carol drops the
-	// oldest alice event.
+	// The JSONL file keeps the full history even when the in-memory ring is
+	// smaller, so adding carol must not drop older alice entries.
 	if r := sendEvent(t, conn, `{"event":"connect","user":"carol","real_ip":"203.0.113.9"}`); !r.OK {
 		t.Fatalf("carol rejected: %+v", r)
 	}
@@ -158,8 +158,11 @@ func TestEventSocketFilterAndLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AdminEvents: %v", err)
 	}
-	if strings.Contains(all, "user=alice") && strings.Count(all, "user=alice") > 1 {
-		t.Fatalf("ring did not drop the oldest event:\n%s", all)
+	if strings.Count(all, "user=alice") != 2 {
+		t.Fatalf("event_log should keep both alice events:\n%s", all)
+	}
+	if !strings.Contains(all, "user=carol") {
+		t.Fatalf("event_log lost carol:\n%s", all)
 	}
 }
 
@@ -180,5 +183,46 @@ func TestCloseRemovesEventSocket(t *testing.T) {
 	}
 	if _, err := os.Stat(sock); !os.IsNotExist(err) {
 		t.Fatalf("socket file still present: %v", err)
+	}
+}
+
+func TestDefaultEventLogPath(t *testing.T) {
+	a := &Args{EventSocket: filepath.Join(t.TempDir(), "events.sock")}
+	if err := a.initDefault(); err != nil {
+		t.Fatalf("initDefault: %v", err)
+	}
+	if a.EventLog != defaultEventLog {
+		t.Fatalf("event_log = %q, want %q", a.EventLog, defaultEventLog)
+	}
+}
+
+func TestAdminEventsReadsEventLogAfterRestart(t *testing.T) {
+	dir := shortSocketDir(t)
+	sock := filepath.Join(dir, "events.sock")
+	eventLog := filepath.Join(dir, "events.jsonl")
+
+	p := newTestPlugin(t, &Args{EventSocket: sock, EventLog: eventLog, EventBuffer: 10})
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatalf("dial event socket: %v", err)
+	}
+	if r := sendEvent(t, conn, `{"event":"connect","user":"alice","real_ip":"203.0.113.9","time":"2026-11-12 23:00:00"}`); !r.OK {
+		t.Fatalf("connect rejected: %+v", r)
+	}
+	_ = conn.Close()
+	if err := p.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A fresh process has an empty ring but the same event_log; /vpn events
+	// must still show the history written before the restart.
+	p2 := newTestPlugin(t, &Args{EventSocket: sock, EventLog: eventLog, EventBuffer: 10})
+	t.Cleanup(func() { _ = p2.Close() })
+	out, err := p2.AdminEvents(10, "")
+	if err != nil {
+		t.Fatalf("AdminEvents after restart: %v", err)
+	}
+	if !strings.Contains(out, "user=alice") {
+		t.Fatalf("history was not read from event_log:\n%s", out)
 	}
 }
