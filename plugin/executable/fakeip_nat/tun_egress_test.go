@@ -19,7 +19,7 @@ func ipCmd(args []string) string {
 }
 
 func TestTunRoutePlan(t *testing.T) {
-	plan := tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100", "")
+	plan := tunRoutePlan("198.18.0.1/32", "192.168.1.1", "en0", "100", "")
 	if plan == nil {
 		t.Fatalf("plan is nil although a gateway and a device are known")
 	}
@@ -27,10 +27,10 @@ func TestTunRoutePlan(t *testing.T) {
 	if got := ipCmd(plan.route); got != want {
 		t.Fatalf("route step = %q, want %q", got, want)
 	}
-	if got := ipCmd(plan.delRule); got != "ip rule del from 198.18.0.0/15 lookup 100" {
+	if got := ipCmd(plan.delRule); got != "ip rule del from 198.18.0.1/32 lookup 100" {
 		t.Fatalf("stale rule delete step = %q", got)
 	}
-	if got := ipCmd(plan.addRule); got != "ip rule add from 198.18.0.0/15 lookup 100" {
+	if got := ipCmd(plan.addRule); got != "ip rule add from 198.18.0.1/32 lookup 100" {
 		t.Fatalf("rule add step = %q", got)
 	}
 	// "ip rule add from X to !X" is rejected by iproute2 ("any valid prefix is
@@ -43,13 +43,13 @@ func TestTunRoutePlan(t *testing.T) {
 	}
 
 	// Without a device the gateway alone still describes the table.
-	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "", "100", "")
+	plan = tunRoutePlan("198.18.0.1/32", "192.168.1.1", "", "100", "")
 	if got := ipCmd(plan.route); got != "ip route replace default via 192.168.1.1 table 100" {
 		t.Fatalf("gateway-only route = %q", got)
 	}
 
 	// Without a gateway the device alone carries the default route.
-	plan = tunRoutePlan("198.18.0.0/15", "", "en0", "100", "")
+	plan = tunRoutePlan("198.18.0.1/32", "", "en0", "100", "")
 	if got := ipCmd(plan.route); got != "ip route replace default dev en0 table 100" {
 		t.Fatalf("device-only route = %q", got)
 	}
@@ -57,17 +57,49 @@ func TestTunRoutePlan(t *testing.T) {
 	// With mark routing the outlet rule carries an explicit priority so it is
 	// consulted before the mark rule instead of landing behind it. The delete
 	// stays wider than the add, so a stale rule with another priority goes too.
-	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100", "999")
-	if got := ipCmd(plan.addRule); got != "ip rule add from 198.18.0.0/15 lookup 100 prio 999" {
+	plan = tunRoutePlan("198.18.0.1/32", "192.168.1.1", "en0", "100", "999")
+	if got := ipCmd(plan.addRule); got != "ip rule add from 198.18.0.1/32 lookup 100 prio 999" {
 		t.Fatalf("prioritized rule add step = %q", got)
 	}
-	if got := ipCmd(plan.delRule); got != "ip rule del from 198.18.0.0/15 lookup 100" {
+	if got := ipCmd(plan.delRule); got != "ip rule del from 198.18.0.1/32 lookup 100" {
 		t.Fatalf("delete must not pin a priority, got %q", got)
 	}
 
 	// Neither one: nothing can be installed.
-	if plan := tunRoutePlan("198.18.0.0/15", "", "", "100", ""); plan != nil {
+	if plan := tunRoutePlan("198.18.0.1/32", "", "", "100", ""); plan != nil {
 		t.Fatalf("plan without gateway or device = %v, want nil", plan)
+	}
+}
+
+// TestTunEgressSourceIsOneHost guards the rule's width. A rule matching the
+// whole range also matches everything the stack sends back to a client (its
+// source is the fake address the client dialled), and those SYN-ACKs and echo
+// replies then leave through the outlet table instead of reaching the client -
+// the state that made every connection time out on ph-vpn.
+func TestTunEgressSourceIsOneHost(t *testing.T) {
+	p := newNativePlugin(t, &fakeRunner{}, func(context.Context, string) bool { return true })
+
+	source := p.tunEgressSource()
+	if source != "198.18.0.1/32" {
+		t.Fatalf("outlet source = %q, want the range head as a /32", source)
+	}
+	plan := tunRoutePlan(source, "192.168.1.1", "eth0", "101", "")
+	if plan == nil {
+		t.Fatalf("plan is nil")
+	}
+	for _, step := range [][]string{plan.delRule, plan.addRule} {
+		if joined := strings.Join(step, " "); strings.Contains(joined, p.cidr) {
+			t.Fatalf("outlet rule still matches the whole range: %q", joined)
+		}
+	}
+
+	// The same address has to be derivable from the configured range alone, so
+	// the cleanup of a previous run can name it without the plugin instance.
+	if got := tunEgressSourceOf("198.18.0.0/16"); got != "198.18.0.1/32" {
+		t.Fatalf("source of 198.18.0.0/16 = %q", got)
+	}
+	if got := tunEgressSourceOf("198.19.0.0/16"); got != "198.19.0.1/32" {
+		t.Fatalf("source of 198.19.0.0/16 = %q", got)
 	}
 }
 
@@ -78,17 +110,18 @@ func TestTunEgressPlanRunsTheAdd(t *testing.T) {
 	runner := &fakeRunner{}
 	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
 
-	plan := tunRoutePlan(p.cidr, "192.168.1.1", "eth0", "101", "999")
+	plan := tunRoutePlan(p.tunEgressSource(), "192.168.1.1", "eth0", "101", "999")
 	if plan == nil {
 		t.Fatalf("plan is nil")
 	}
+	plan.staleRule = egressRuleArgs("del", p.cidr, "101", "")
 	if _, err := p.applyTunEgressPlan(context.Background(), plan); err != nil {
 		t.Fatalf("apply plan: %v", err)
 	}
 
 	calls := runner.all()
 	joined := strings.Join(calls, "\n")
-	want := "ip rule add from " + p.cidr + " lookup 101 prio 999"
+	want := "ip rule add from " + p.tunEgressSource() + " lookup 101 prio 999"
 	if !strings.Contains(joined, want) {
 		t.Fatalf("the add never ran, want %q in:\n%s", want, joined)
 	}

@@ -912,8 +912,13 @@ func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Add
 		return
 	}
 	if !p.icmpRelayActive() {
-		p.L().Debug("tun icmp: echo request dropped, icmp relay is disabled",
+		// Without the raw socket the real path cannot be probed, but a host that
+		// owns the address would still answer. Answering as the destination is
+		// the same stand-in the proxied outlet uses, and it keeps ping from
+		// failing silently just because the process lost CAP_NET_RAW.
+		p.L().Debug("tun icmp: echo request answered locally, icmp relay is disabled",
 			zap.String("fake_ip", fakeIP.String()))
+		p.answerEchoLocally(st, client, fakeIP, clientID, seq, payload)
 		return
 	}
 	r := p.icmp

@@ -219,7 +219,7 @@ func (p *FakeIPNatPlugin) stopTunEgress() {
 	p.clearTunState(ctx)
 }
 
-// tunEgressPlan is the command set that pins the fake range to a dedicated
+// tunEgressPlan is the command set that pins the outlet socket to a dedicated
 // routing table. It is pure data so it can be checked on any host, and
 // installTunEgressRoute only has to run it.
 //
@@ -231,38 +231,74 @@ type tunEgressPlan struct {
 	route   []string
 	delRule []string
 	addRule []string
+	// staleRule is a shape an earlier version installed for this table. It is
+	// deleted best effort: a rule that matched the whole range keeps sending
+	// every reply from the stack out of the physical interface, so an upgrade
+	// has to take it out even though its own rule is narrower now.
+	staleRule []string
 }
 
 // egressRuleArgs is the single shape of the outlet rule, used for add and
 // delete so the two can never drift apart.
 //
-// The rule matches on the source only. It deliberately carries no destination
-// negation: iproute2 has no "!" prefix token ("any valid prefix is expected
-// rather than \"!\""), and the exclusion it was meant to express is already
-// installed — installFakeRangeRule pins every packet aimed inside the range to
-// the main table at priority 5, ahead of this rule. Packets aimed at a fake
-// address therefore never reach the outlet table. The only traffic this rule
-// has to catch is what the stack dials, which leaves with the reserved address
-// of the range as its source and a real address as its destination.
-func egressRuleArgs(action, cidr, table, prio string) []string {
-	args := []string{"rule", action, "from", cidr, "lookup", table}
+// source is the address the outlet socket binds, never the whole fake range:
+// the rule decides where packets *leave* the host, and the only packets that
+// have to leave through the configured gateway are the ones the stack dials
+// itself. Everything the stack sends back to a client carries a fake address as
+// its source (the address the client dialled), and must keep following the host
+// table: a rule matching the range sends those SYN-ACKs and echo replies into
+// the outlet table, out of the physical interface, and they never come back to
+// the client.
+//
+// The rule also carries no destination negation: iproute2 has no "!" prefix
+// token ("any valid prefix is expected rather than \"!\""), and the exclusion
+// it was meant to express is already installed — installFakeRangeRule pins
+// every packet aimed inside the range to the main table at priority 5, ahead of
+// this rule.
+func egressRuleArgs(action, source, table, prio string) []string {
+	args := []string{"rule", action, "from", source, "lookup", table}
 	if prio != "" {
 		args = append(args, "prio", prio)
 	}
 	return args
 }
 
-// tunRoutePlan is the command line that pins the fake range to a dedicated
+// tunEgressSource is the address the direct outlet binds as its source: the
+// first host of the range, the same address the tun device owns. The outlet
+// rule matches exactly this address, so it cannot touch traffic sourced from
+// other addresses of the range.
+func (p *FakeIPNatPlugin) tunEgressSource() string {
+	return p.reservedAddr().String() + "/32"
+}
+
+// tunEgressSourceOf is the same address computed from a configured range, used
+// when only the recorded range is at hand (a previous run's state).
+func tunEgressSourceOf(cidr string) string {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return ""
+	}
+	addr := prefix.Masked().Addr()
+	if !addr.Is4() || prefix.Bits() >= 31 {
+		return addr.String() + "/32"
+	}
+	return addr.Next().String() + "/32"
+}
+
+// tunRoutePlan is the command line that pins the outlet socket to a dedicated
 // routing table.
 //
 //	ip route replace default via <hop> dev <dev> table <table>
-//	ip rule del  from <cidr> lookup <table>           (drops what a killed run left)
-//	ip rule add  from <cidr> lookup <table> [prio <p>]
+//	ip rule del  from <source> lookup <table>           (drops what a killed run left)
+//	ip rule add  from <source> lookup <table> [prio <p>]
+//
+// source is the address the outlet binds (see tunEgressSource), not the range:
+// see egressRuleArgs for why the range must stay out of this rule.
 //
 // prio is optional. When mark routing is on, the outlet rule has to be
 // consulted before "fwmark <mark> lookup <table>": otherwise the sockets the
 // stack opens are marked again and steered back into the device.
-func tunRoutePlan(cidr, hop, dev, table, prio string) *tunEgressPlan {
+func tunRoutePlan(source, hop, dev, table, prio string) *tunEgressPlan {
 	var route []string
 	switch {
 	case hop != "" && dev != "":
@@ -278,9 +314,9 @@ func tunRoutePlan(cidr, hop, dev, table, prio string) *tunEgressPlan {
 		table: table,
 		route: route,
 		// The delete is deliberately wider than the add: it drops any rule for
-		// this range and table whatever priority an earlier run gave it.
-		delRule: egressRuleArgs("del", cidr, table, ""),
-		addRule: egressRuleArgs("add", cidr, table, prio),
+		// this source and table whatever priority an earlier run gave it.
+		delRule: egressRuleArgs("del", source, table, ""),
+		addRule: egressRuleArgs("add", source, table, prio),
 	}
 }
 
@@ -335,6 +371,11 @@ func (p *FakeIPNatPlugin) applyTunEgressPlan(ctx context.Context, plan *tunEgres
 	}
 	// A previous run may have left the rule behind; the delete is best effort.
 	_, _ = p.runner.Run(ctx, "ip", plan.delRule...)
+	// Older versions matched the whole range; leaving that rule in place keeps
+	// hijacking every reply the stack sends to a client, so it goes too.
+	if len(plan.staleRule) != 0 {
+		_, _ = p.runner.Run(ctx, "ip", plan.staleRule...)
+	}
 	if err := p.runTunEgressStep(ctx, "rule", plan.addRule); err != nil {
 		_, _ = p.runner.Run(ctx, "ip", "route", "del", "default", "table", plan.table)
 		return "rule", err
