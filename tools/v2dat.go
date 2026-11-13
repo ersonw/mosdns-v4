@@ -30,6 +30,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -65,6 +67,144 @@ func newUnpackIPCmd() *cobra.Command {
 	}
 	c.Flags().StringVarP(&ourDir, "out", "o", "", "output dir")
 	return c
+}
+
+func newQueryDomainCmd() *cobra.Command {
+	var (
+		tagFilter string
+		limit     int
+		regexMode bool
+	)
+	c := &cobra.Command{
+		Use:     "query-domain <geosite.dat[:tag1[,tag2]...]> <query>",
+		Aliases: []string{"search-domain"},
+		Args:    cobra.ExactArgs(2),
+		Short:   "Search domain entries in a v2ray domain data file without unpacking it.",
+		Long: "Search domain entries in a geosite.dat without writing every tag to disk. " +
+			"The default mode is a case-insensitive substring match on the domain value. " +
+			"Output is one match per line: tag<TAB>rule. Use a tag suffix or --tag to limit the search.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit < 0 {
+				return fmt.Errorf("limit must be >= 0")
+			}
+			return QueryDomainDAT(
+				args[0], args[1], cmd.OutOrStdout(), cmd.ErrOrStderr(),
+				tagFilter, limit, regexMode,
+			)
+		},
+		DisableFlagsInUseLine: true,
+	}
+	c.Flags().StringVarP(&tagFilter, "tag", "t", "", "only search these tags (comma separated)")
+	c.Flags().IntVarP(&limit, "limit", "l", 0, "stop after N matches (0 = no limit)")
+	c.Flags().BoolVarP(&regexMode, "regex", "r", false, "treat query as a Go regular expression")
+	return c
+}
+
+// QueryDomainDAT searches a geosite.dat without unpacking all tags.
+func QueryDomainDAT(in, query string, out, errOut io.Writer, tagFilter string, limit int, regexMode bool) error {
+	filePath, wantTags := splitTags(in)
+	b, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	geoSiteList, err := domain.LoadGeoSiteList(b)
+	if err != nil {
+		return err
+	}
+
+	entries := make(map[string]*v2data.GeoSite)
+	for _, geoSite := range geoSiteList.GetEntry() {
+		entries[strings.ToLower(geoSite.GetCountryCode())] = geoSite
+	}
+
+	selected := make(map[string]struct{})
+	if len(wantTags) > 0 {
+		for _, tag := range wantTags {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			if tag == "" {
+				continue
+			}
+			if _, ok := entries[tag]; !ok {
+				return fmt.Errorf("cannot find entry %s", tag)
+			}
+			selected[tag] = struct{}{}
+		}
+	} else {
+		for tag := range entries {
+			selected[tag] = struct{}{}
+		}
+	}
+
+	if tagFilter != "" {
+		allowed := make(map[string]struct{})
+		for _, tag := range strings.Split(tagFilter, ",") {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			if tag == "" {
+				continue
+			}
+			if _, ok := entries[tag]; !ok {
+				return fmt.Errorf("cannot find entry %s", tag)
+			}
+			allowed[tag] = struct{}{}
+		}
+		for tag := range selected {
+			if _, ok := allowed[tag]; !ok {
+				delete(selected, tag)
+			}
+		}
+	}
+
+	tags := make([]string, 0, len(selected))
+	for tag := range selected {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return fmt.Errorf("query is empty")
+	}
+	var match func(string) bool
+	if regexMode {
+		re, err := regexp.Compile("(?i)" + query)
+		if err != nil {
+			return fmt.Errorf("invalid query regexp: %w", err)
+		}
+		match = re.MatchString
+	} else {
+		query = strings.ToLower(query)
+		match = func(value string) bool {
+			return strings.Contains(strings.ToLower(value), query)
+		}
+	}
+
+	matches := 0
+	matchedTags := 0
+outer:
+	for _, tag := range tags {
+		geoSite := entries[tag]
+		printed := false
+		for _, domainEntry := range geoSite.GetDomain() {
+			if !match(domainEntry.GetValue()) {
+				continue
+			}
+			rule, err := formatV2Domain(domainEntry)
+			if err != nil {
+				return fmt.Errorf("tag %s: %w", tag, err)
+			}
+			if !printed {
+				printed = true
+				matchedTags++
+			}
+			fmt.Fprintf(out, "%s\t%s\n", tag, rule)
+			matches++
+			if limit > 0 && matches >= limit {
+				break outer
+			}
+		}
+	}
+	fmt.Fprintf(errOut, "matched %d entries in %d tags\n", matches, matchedTags)
+	return nil
 }
 
 func splitTags(s string) (string, []string) {
@@ -142,22 +282,30 @@ func convertV2DomainToTextFile(domain []*v2data.Domain, file string) error {
 	return convertV2DomainToText(domain, f)
 }
 
+func formatV2Domain(r *v2data.Domain) (string, error) {
+	var prefix string
+	switch r.Type {
+	case v2data.Domain_Plain:
+		prefix = "keyword:"
+	case v2data.Domain_Regex:
+		prefix = "regexp:"
+	case v2data.Domain_Domain:
+		prefix = ""
+	case v2data.Domain_Full:
+		prefix = "full:"
+	default:
+		return "", fmt.Errorf("invalid domain type %d", r.Type)
+	}
+	return prefix + r.Value, nil
+}
+
 func convertV2DomainToText(domain []*v2data.Domain, w io.Writer) error {
 	for _, r := range domain {
-		var prefix string
-		switch r.Type {
-		case v2data.Domain_Plain:
-			prefix = "keyword:"
-		case v2data.Domain_Regex:
-			prefix = "regexp:"
-		case v2data.Domain_Domain:
-			prefix = ""
-		case v2data.Domain_Full:
-			prefix = "full:"
-		default:
-			return fmt.Errorf("invalid domain type %d", r.Type)
+		rule, err := formatV2Domain(r)
+		if err != nil {
+			return err
 		}
-		_, err := w.Write([]byte(prefix + r.Value + "\n"))
+		_, err = w.Write([]byte(rule + "\n"))
 		if err != nil {
 			return err
 		}

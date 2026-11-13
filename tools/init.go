@@ -38,11 +38,12 @@ func init() {
 
 	v2datCmd := &cobra.Command{
 		Use:   "v2dat",
-		Short: "Tools that can unpack v2ray data file to text files.",
+		Short: "Tools that can unpack or query v2ray data files.",
 	}
 	v2datCmd.AddCommand(
 		newUnpackDomainCmd(),
 		newUnpackIPCmd(),
+		newQueryDomainCmd(),
 	)
 	coremain.AddSubCmd(v2datCmd)
 
