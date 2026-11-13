@@ -2,9 +2,11 @@ package fakeipnat
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ersonw/mosdns-v4/coremain"
 	"go.uber.org/zap"
@@ -111,10 +113,93 @@ func TestTunEgressPlanRunsTheAdd(t *testing.T) {
 	}
 }
 
+// retryRunner fails the first route replaces, then behaves like a healthy
+// runner: the shape of a machine whose default route is not ready yet.
+type retryRunner struct {
+	fakeRunner
+	failFirst int
+	routes    int
+}
+
+func (r *retryRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
+	call := name + " " + strings.Join(args, " ")
+	if strings.HasPrefix(call, "ip route replace") {
+		r.routes++
+		if r.routes <= r.failFirst {
+			return "", fmt.Errorf("network is unreachable")
+		}
+	}
+	return r.fakeRunner.Run(ctx, name, args...)
+}
+
+// TestTunEgressPlanRetriesTheRoute: the outlet is installed during boot, before
+// the kernel necessarily has a default route. A failed route must be retried a
+// bounded number of times instead of leaving the range on the host table for the
+// rest of the process lifetime.
+func TestTunEgressPlanRetriesTheRoute(t *testing.T) {
+	oldDelay := tunEgressRetryDelay
+	tunEgressRetryDelay = time.Millisecond
+	defer func() { tunEgressRetryDelay = oldDelay }()
+
+	runner := &retryRunner{failFirst: 2}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	plan := tunRoutePlan(p.cidr, "192.168.1.1", "eth0", "103", "999")
+	if plan == nil {
+		t.Fatalf("plan is nil")
+	}
+	step, err := p.applyTunEgressPlan(context.Background(), plan)
+	if err != nil {
+		t.Fatalf("the retry did not recover: step=%q err=%v", step, err)
+	}
+	if runner.routes != 3 {
+		t.Fatalf("route replace attempts = %d, want 3", runner.routes)
+	}
+	// The rule must only be added once the route finally succeeded.
+	calls := runner.all()
+	joined := strings.Join(calls, "\n")
+	if !strings.Contains(joined, "ip rule add from "+p.cidr+" lookup 103 prio 999") {
+		t.Fatalf("the add never ran after the retry:\n%s", joined)
+	}
+}
+
+// TestTunEgressPlanStopsRetryingWhenTheContextEnds: a shutdown during the backoff
+// must not hold the process for the remaining attempts.
+func TestTunEgressPlanStopsRetryingWhenTheContextEnds(t *testing.T) {
+	oldDelay := tunEgressRetryDelay
+	tunEgressRetryDelay = time.Second
+	defer func() { tunEgressRetryDelay = oldDelay }()
+
+	runner := &fakeRunner{failContains: "route replace"}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	plan := tunRoutePlan(p.cidr, "192.168.1.1", "eth0", "104", "")
+	if plan == nil {
+		t.Fatalf("plan is nil")
+	}
+	start := time.Now()
+	step, err := p.applyTunEgressPlan(ctx, plan)
+	if err == nil {
+		t.Fatalf("a failing route must be reported")
+	}
+	if step != "route" {
+		t.Fatalf("failed step = %q, want \"route\"", step)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("retries ignored the context and waited %v", elapsed)
+	}
+}
+
 // TestTunEgressPlanRollsBackTheRouteOnRuleFailure: a rule that cannot be added
 // has to take the default route with it, otherwise the table keeps a default
 // route that no rule points at — the state that made the outlet look installed.
 func TestTunEgressPlanRollsBackTheRouteOnRuleFailure(t *testing.T) {
+	oldDelay := tunEgressRetryDelay
+	tunEgressRetryDelay = time.Millisecond
+	defer func() { tunEgressRetryDelay = oldDelay }()
+
 	runner := &fakeRunner{failContains: "rule add"}
 	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
 

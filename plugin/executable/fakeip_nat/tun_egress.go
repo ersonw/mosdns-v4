@@ -284,6 +284,42 @@ func tunRoutePlan(cidr, hop, dev, table, prio string) *tunEgressPlan {
 	}
 }
 
+// The outlet is installed while the machine may still be bringing its network
+// up. At boot the kernel has no default route yet, so "ip route replace" fails
+// with "Network is unreachable" or "Cannot find device" and the outlet is then
+// skipped for the whole process lifetime — the range quietly falls back to the
+// host table. A few short attempts cover that window; they cost at most
+// (attempts-1) * delay and only run when a command actually failed.
+const tunEgressRetryAttempts = 3
+
+// tunEgressRetryDelay is a variable, not a constant: tests drive the retry path
+// and must not spend real seconds on it.
+var tunEgressRetryDelay = 500 * time.Millisecond
+
+// runTunEgressStep runs one command of the plan, retrying a bounded number of
+// times. The context is honoured between attempts, so a shutdown in the middle
+// of the backoff does not delay the process.
+func (p *FakeIPNatPlugin) runTunEgressStep(ctx context.Context, step string, args []string) error {
+	var err error
+	for attempt := 1; attempt <= tunEgressRetryAttempts; attempt++ {
+		if _, err = p.runner.Run(ctx, "ip", args...); err == nil {
+			return nil
+		}
+		if attempt == tunEgressRetryAttempts {
+			break
+		}
+		p.L().Debug("tun egress: command failed, retrying",
+			zap.String("step", step), zap.Int("attempt", attempt),
+			zap.Duration("delay", tunEgressRetryDelay), zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(tunEgressRetryDelay):
+		}
+	}
+	return err
+}
+
 // applyTunEgressPlan runs the plan in order: the route first (nothing else can
 // work without it), a best-effort delete of what a killed run left behind, and
 // then the rule. A rule that cannot be added takes the route back out, so the
@@ -294,12 +330,12 @@ func tunRoutePlan(cidr, hop, dev, table, prio string) *tunEgressPlan {
 // it has to be provable on any host, not only on linux. The step name is
 // returned alongside the error so the caller can log which command failed.
 func (p *FakeIPNatPlugin) applyTunEgressPlan(ctx context.Context, plan *tunEgressPlan) (string, error) {
-	if _, err := p.runner.Run(ctx, "ip", plan.route...); err != nil {
+	if err := p.runTunEgressStep(ctx, "route", plan.route); err != nil {
 		return "route", err
 	}
 	// A previous run may have left the rule behind; the delete is best effort.
 	_, _ = p.runner.Run(ctx, "ip", plan.delRule...)
-	if _, err := p.runner.Run(ctx, "ip", plan.addRule...); err != nil {
+	if err := p.runTunEgressStep(ctx, "rule", plan.addRule); err != nil {
 		_, _ = p.runner.Run(ctx, "ip", "route", "del", "default", "table", plan.table)
 		return "rule", err
 	}
