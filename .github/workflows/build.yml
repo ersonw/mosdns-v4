@@ -1,13 +1,9 @@
-# Build every platform the release script targets, on one runner, with cgo off.
-# The version stamped into the binary comes from an explicit input when one is
-# given, otherwise from `git describe --tags --long --always` by the tool
-# itself, so a build from main still says which commit it came from.
+# Manual cross-build helper. Automatic builds and publishing run from
+# release.yml on a v* tag only; pushing main or opening a pull request does not
+# start a build.
 name: build
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
       version:
