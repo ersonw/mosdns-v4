@@ -4,7 +4,7 @@
 
 This repository is not the upstream project and is not affiliated with or
 endorsed by it. It keeps the upstream v4 plugin framework and adds the
-`exec_script`, `fakeip_nat`, `ocserv_ctl`, `radius`, `telegram_bot` and release
+`exec_script`, `fakeip_nat`, `asn_tun`, `ocserv_ctl`, `radius`, `telegram_bot` and release
 automation used by this deployment.
 
 [简体中文](README.cn.md) | English
@@ -14,6 +14,9 @@ automation used by this deployment.
 - DNS forwarding, caching, hosts, ECS, EDNS0 filtering and sequence routing.
 - `fakeip_nat`: fake-IP mapping through nftables NAT or a userspace TUN stack,
   with optional SOCKS5 / HTTP / Trojan / gost egress.
+- `asn_tun`: mark traffic destined for selected ASN IPv4 prefixes and carry its
+  real destination IPs through a userspace TUN stack, with optional proxy or
+  direct egress.
 - `telegram_bot`: role-based remote operations, including `/watch` and `/stop`.
 - `ocserv_ctl` and `radius`: ocserv user mapping and a local RADIUS server.
 - `exec_script`: run a bound script for resolved addresses.

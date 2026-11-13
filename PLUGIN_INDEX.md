@@ -31,6 +31,7 @@
 | `ipset` | ✅ | `plugin/executable/ipset` | 把响应 IP 写入 ipset（**仅 linux 有效**） | — |
 | `nftset` | ✅ | `plugin/executable/nftset` | 把响应 IP 写入 nftables set（**仅 linux 有效**） | — |
 | `reverse_lookup` | ✅ | `plugin/executable/reverse_lookup` | 记录 域名↔IP 映射，可应答 PTR，并提供 HTTP 查询接口 | — |
+| `asn_tun` | ✅ | `plugin/executable/asn_tun` | **定制**：按 ASN 的 IPv4 前缀用 nftables 打标，把标记流量送到 TUN；gVisor 处理真实目的 IP 的 TCP/UDP，再按有代理/无代理出站。不做 fake IP，不支持 ICMP/IPv6 | — |
 | `fakeip_nat` | ✅ | `plugin/executable/fakeip_nat` | **定制**：A 记录改写成假 IP，落 SQLite；默认用内置 NAT（nftables DNAT + host route + CIDR 聚合），`use_tun` 可切到 TUN 数据面（TCP/UDP/ICMP 统一 SNAT，逐跳探测把 traceroute 全路径送回 tun） | — |
 | `ocserv_ctl` | ✅ | `plugin/executable/ocserv_ctl` | **定制**：把 DNS 请求的源地址映射到 ocserv 登录用户（`occtl show users`），命中时给查询打标记 | — |
 | `telegram_bot` | ✅ | `plugin/executable/telegram_bot` | **定制**：Telegram 长轮询管理 fakeip / ocserv / RADIUS 账号 / 配置 / 脚本，按角色下发权限 | — |

@@ -3,7 +3,7 @@
 **[mosdns](https://github.com/IrineSistiana/mosdns) 的非官方魔改版。**
 
 本仓库不是上游项目，与上游没有隶属关系，也未获得其背书。它保留上游 v4 插件框架，
-并加入本部署使用的 `exec_script`、`fakeip_nat`、`ocserv_ctl`、`radius`、
+并加入本部署使用的 `exec_script`、`fakeip_nat`、`asn_tun`、`ocserv_ctl`、`radius`、
 `telegram_bot` 和发布自动化。
 
 [English](README.md) | 简体中文
@@ -13,6 +13,8 @@
 - DNS 转发、缓存、hosts、ECS、EDNS0 过滤与 sequence 路由。
 - `fakeip_nat`：通过 nftables NAT 或用户态 TUN 栈实现 fake-IP 映射，可选
   SOCKS5 / HTTP / Trojan / gost 出口。
+- `asn_tun`：按 ASN 的 IPv4 前缀给流量打标，送进用户态 TUN 栈处理真实目的 IP，
+  可选代理或直连出口。
 - `telegram_bot`：基于角色的远程运维，包含 `/watch` 与 `/stop`。
 - `ocserv_ctl` 与 `radius`：ocserv 用户映射和本地 RADIUS 服务端。
 - `exec_script`：对解析出的地址执行已绑定的脚本。

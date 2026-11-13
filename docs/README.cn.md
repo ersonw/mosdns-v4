@@ -21,7 +21,7 @@
 
 ## 插件文档
 
-全部 30 个插件类型与仅预置 helper 见
+全部 31 个插件类型与仅预置 helper 见
 [plugins/README.cn.md](plugins/README.cn.md)，单独的英文与中文卡片都在
 `plugins/` 下。
 

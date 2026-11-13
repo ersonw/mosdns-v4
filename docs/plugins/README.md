@@ -2,7 +2,7 @@
 
 # Plugin reference
 
-All 30 plugin types and preset-only helpers in this repository. The card for each plugin is the same content as the corresponding `.cn.md` / `.md` pair.
+All 31 plugin types and preset-only helpers in this repository. The card for each plugin is the same content as the corresponding `.cn.md` / `.md` pair.
 
 ## Chain and routing
 
@@ -38,6 +38,7 @@ All 30 plugin types and preset-only helpers in this repository. The card for eac
 
 | Plugin | Kind | English | 简体中文 |
 |---|---|---|---|
+| `asn_tun` | executable, linux | [asn_tun.md](asn_tun.md) | [asn_tun.cn.md](asn_tun.cn.md) |
 | `fakeip_nat` | executable | [fakeip_nat.md](fakeip_nat.md) | [fakeip_nat.cn.md](fakeip_nat.cn.md) |
 | `ocserv_ctl` | executable | [ocserv_ctl.md](ocserv_ctl.md) | [ocserv_ctl.cn.md](ocserv_ctl.cn.md) |
 | `telegram_bot` | executable | [telegram_bot.md](telegram_bot.md) | [telegram_bot.cn.md](telegram_bot.cn.md) |

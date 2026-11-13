@@ -2,7 +2,7 @@
 
 # 插件参考
 
-本仓库全部 30 个插件与仅预置 helper 的索引；每项都链接到对应的英文与中文卡片。
+本仓库全部 31 个插件与仅预置 helper 的索引；每项都链接到对应的英文与中文卡片。
 
 ## 链与路由
 
@@ -38,6 +38,7 @@
 
 | 插件 | 类型 | English | 简体中文 |
 |---|---|---|---|
+| `asn_tun` | executable, linux | [asn_tun.md](asn_tun.md) | [asn_tun.cn.md](asn_tun.cn.md) |
 | `fakeip_nat` | executable | [fakeip_nat.md](fakeip_nat.md) | [fakeip_nat.cn.md](fakeip_nat.cn.md) |
 | `ocserv_ctl` | executable | [ocserv_ctl.md](ocserv_ctl.md) | [ocserv_ctl.cn.md](ocserv_ctl.cn.md) |
 | `telegram_bot` | executable | [telegram_bot.md](telegram_bot.md) | [telegram_bot.cn.md](telegram_bot.cn.md) |

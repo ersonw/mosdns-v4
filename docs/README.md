@@ -24,7 +24,7 @@ counterpart with the `.cn.md` suffix.
 
 ## Plugin references
 
-All 30 plugin types and preset-only helpers are listed in
+All 31 plugin types and preset-only helpers are listed in
 [plugins/README.md](plugins/README.md), with individual English and Chinese
 cards under `plugins/`.
 
