@@ -10,47 +10,128 @@ import (
 	"go.uber.org/zap"
 )
 
+// ipCmd renders one step of a plan the way the runner receives it: the "ip"
+// binary plus its arguments.
+func ipCmd(args []string) string {
+	return "ip " + strings.Join(args, " ")
+}
+
 func TestTunRoutePlan(t *testing.T) {
 	plan := tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100", "")
-	if len(plan) != 4 {
-		t.Fatalf("plan has %d steps, want 4", len(plan))
+	if plan == nil {
+		t.Fatalf("plan is nil although a gateway and a device are known")
 	}
 	want := "ip route replace default via 192.168.1.1 dev en0 table 100"
-	if got := strings.Join(plan[0], " "); got != want {
+	if got := ipCmd(plan.route); got != want {
 		t.Fatalf("route step = %q, want %q", got, want)
 	}
-	if got := strings.Join(plan[1], " "); got != "ip rule del from 198.18.0.0/15 lookup 100" {
+	if got := ipCmd(plan.delRule); got != "ip rule del from 198.18.0.0/15 lookup 100" {
 		t.Fatalf("stale rule delete step = %q", got)
 	}
-	if got := strings.Join(plan[2], " "); got != "ip rule del from 198.18.0.0/15 to ! 198.18.0.0/15 lookup 100" {
-		t.Fatalf("rule delete step = %q", got)
-	}
-	if got := strings.Join(plan[3], " "); got != "ip rule add from 198.18.0.0/15 to ! 198.18.0.0/15 lookup 100" {
+	if got := ipCmd(plan.addRule); got != "ip rule add from 198.18.0.0/15 lookup 100" {
 		t.Fatalf("rule add step = %q", got)
+	}
+	// "ip rule add from X to !X" is rejected by iproute2 ("any valid prefix is
+	// expected rather than \"!\"") and must never come back. The exclusion it
+	// expressed is carried by the fake range rule at priority 5 instead.
+	for _, step := range [][]string{plan.delRule, plan.addRule} {
+		if joined := strings.Join(step, " "); strings.Contains(joined, "!") {
+			t.Fatalf("rule step carries the unsupported \"!\" token: %q", joined)
+		}
 	}
 
 	// Without a device the gateway alone still describes the table.
 	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "", "100", "")
-	if got := strings.Join(plan[0], " "); got != "ip route replace default via 192.168.1.1 table 100" {
+	if got := ipCmd(plan.route); got != "ip route replace default via 192.168.1.1 table 100" {
 		t.Fatalf("gateway-only route = %q", got)
 	}
 
 	// Without a gateway the device alone carries the default route.
 	plan = tunRoutePlan("198.18.0.0/15", "", "en0", "100", "")
-	if got := strings.Join(plan[0], " "); got != "ip route replace default dev en0 table 100" {
+	if got := ipCmd(plan.route); got != "ip route replace default dev en0 table 100" {
 		t.Fatalf("device-only route = %q", got)
 	}
 
 	// With mark routing the outlet rule carries an explicit priority so it is
-	// consulted before the mark rule instead of landing behind it.
+	// consulted before the mark rule instead of landing behind it. The delete
+	// stays wider than the add, so a stale rule with another priority goes too.
 	plan = tunRoutePlan("198.18.0.0/15", "192.168.1.1", "en0", "100", "999")
-	if got := strings.Join(plan[3], " "); got != "ip rule add from 198.18.0.0/15 to ! 198.18.0.0/15 lookup 100 prio 999" {
+	if got := ipCmd(plan.addRule); got != "ip rule add from 198.18.0.0/15 lookup 100 prio 999" {
 		t.Fatalf("prioritized rule add step = %q", got)
+	}
+	if got := ipCmd(plan.delRule); got != "ip rule del from 198.18.0.0/15 lookup 100" {
+		t.Fatalf("delete must not pin a priority, got %q", got)
 	}
 
 	// Neither one: nothing can be installed.
 	if plan := tunRoutePlan("198.18.0.0/15", "", "", "100", ""); plan != nil {
 		t.Fatalf("plan without gateway or device = %v, want nil", plan)
+	}
+}
+
+// TestTunEgressPlanRunsTheAdd is the regression for the positional plan: the
+// installer used to run the second delete where the add was meant, so no outlet
+// rule was ever installed while the log blamed an "add ip rule failed".
+func TestTunEgressPlanRunsTheAdd(t *testing.T) {
+	runner := &fakeRunner{}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	plan := tunRoutePlan(p.cidr, "192.168.1.1", "eth0", "101", "999")
+	if plan == nil {
+		t.Fatalf("plan is nil")
+	}
+	if _, err := p.applyTunEgressPlan(context.Background(), plan); err != nil {
+		t.Fatalf("apply plan: %v", err)
+	}
+
+	calls := runner.all()
+	joined := strings.Join(calls, "\n")
+	want := "ip rule add from " + p.cidr + " lookup 101 prio 999"
+	if !strings.Contains(joined, want) {
+		t.Fatalf("the add never ran, want %q in:\n%s", want, joined)
+	}
+	// Order matters: the route has to exist before the rule can point at it,
+	// and the stale rule is dropped before the new one is added.
+	index := func(substr string) int {
+		for i, call := range calls {
+			if strings.Contains(call, substr) {
+				return i
+			}
+		}
+		return -1
+	}
+	routeAt := index("ip route replace default")
+	staleAt := index("ip rule del from " + p.cidr)
+	addAt := index(want)
+	if routeAt < 0 || staleAt < 0 || addAt < 0 {
+		t.Fatalf("missing step in:\n%s", joined)
+	}
+	if !(routeAt < staleAt && staleAt < addAt) {
+		t.Fatalf("steps out of order (route=%d del=%d add=%d):\n%s", routeAt, staleAt, addAt, joined)
+	}
+}
+
+// TestTunEgressPlanRollsBackTheRouteOnRuleFailure: a rule that cannot be added
+// has to take the default route with it, otherwise the table keeps a default
+// route that no rule points at — the state that made the outlet look installed.
+func TestTunEgressPlanRollsBackTheRouteOnRuleFailure(t *testing.T) {
+	runner := &fakeRunner{failContains: "rule add"}
+	p := newNativePlugin(t, runner, func(context.Context, string) bool { return true })
+
+	plan := tunRoutePlan(p.cidr, "192.168.1.1", "eth0", "102", "")
+	if plan == nil {
+		t.Fatalf("plan is nil")
+	}
+	step, err := p.applyTunEgressPlan(context.Background(), plan)
+	if err == nil {
+		t.Fatalf("a failing rule add must be reported")
+	}
+	if step != "rule" {
+		t.Fatalf("failed step = %q, want \"rule\"", step)
+	}
+	calls := strings.Join(runner.all(), "\n")
+	if !strings.Contains(calls, "ip route del default table 102") {
+		t.Fatalf("the default route was left behind:\n%s", calls)
 	}
 }
 

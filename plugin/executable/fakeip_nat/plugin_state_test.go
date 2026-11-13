@@ -173,7 +173,7 @@ func TestNonTunStartCleansTunOutlet(t *testing.T) {
 	if !strings.Contains(calls, "nft delete table ip "+p.tunSNATTableName()) {
 		t.Fatalf("snat table was left behind:\n%s", calls)
 	}
-	if !strings.Contains(calls, "ip rule del from 198.18.0.0/16 to ! 198.18.0.0/16 lookup 101") {
+	if !strings.Contains(calls, "ip rule del from 198.18.0.0/16 lookup 101") {
 		t.Fatalf("outlet rule was left behind:\n%s", calls)
 	}
 	if strings.Contains(calls, "route del") {

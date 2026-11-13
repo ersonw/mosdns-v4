@@ -26,35 +26,37 @@ func (p *FakeIPNatPlugin) installTunEgressRoute(ctx context.Context) (func(), bo
 		prio = strconv.Itoa(int(p.routeRulePriority - 1))
 	}
 	plan := tunRoutePlan(p.cidr, p.tunEgressHop, p.tunEgressDev, table, prio)
-	if len(plan) == 0 {
+	if plan == nil {
 		p.L().Warn("tun egress: neither gateway nor device is known, route table not installed")
 		return nil, false
 	}
 
-	if _, err := p.runner.Run(ctx, plan[0][0], plan[0][1:]...); err != nil {
-		p.L().Warn("tun egress: install default route failed",
-			zap.String("table", table), zap.String("next_hop", p.tunEgressHop),
-			zap.String("dev", p.tunEgressDev), zap.Error(err))
-		return nil, false
-	}
-
-	// A previous run may have left the rule behind; the delete is best effort.
-	_, _ = p.runner.Run(ctx, plan[1][0], plan[1][1:]...)
-	if _, err := p.runner.Run(ctx, plan[2][0], plan[2][1:]...); err != nil {
-		p.L().Warn("tun egress: add ip rule failed",
-			zap.String("from", p.cidr), zap.String("table", table), zap.Error(err))
-		_, _ = p.runner.Run(ctx, "ip", "route", "del", "default", "table", table)
+	step, err := p.applyTunEgressPlan(ctx, plan)
+	if err != nil {
+		if step == "route" {
+			p.L().Warn("tun egress: install default route failed",
+				zap.String("table", table), zap.String("next_hop", p.tunEgressHop),
+				zap.String("dev", p.tunEgressDev), zap.Error(err))
+		} else {
+			p.L().Warn("tun egress: add ip rule failed",
+				zap.String("from", p.cidr), zap.String("table", table), zap.Error(err))
+		}
 		return nil, false
 	}
 
 	p.L().Info("tun egress: routing table installed",
 		zap.String("table", table), zap.String("next_hop", p.tunEgressHop),
-		zap.String("dev", p.tunEgressDev), zap.String("from", p.cidr))
+		zap.String("dev", p.tunEgressDev), zap.String("from", p.cidr),
+		zap.String("prio", prio))
 
 	return func() {
 		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 		defer cancel()
-		_, _ = p.runner.Run(ctx, "ip", "rule", "del", "from", p.cidr, "to", "!", p.cidr, "lookup", table)
+		// Delete by the exact spec that was added, priority included, so a
+		// policy rule of the host that happens to share the range cannot be
+		// removed by mistake.
+		del := egressRuleArgs("del", p.cidr, table, prio)
+		_, _ = p.runner.Run(ctx, "ip", del...)
 		_, _ = p.runner.Run(ctx, "ip", "route", "del", "default", "table", table)
 		p.L().Debug("tun egress: routing table removed", zap.String("table", table), zap.String("from", p.cidr))
 	}, true

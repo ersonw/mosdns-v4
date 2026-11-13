@@ -226,13 +226,11 @@ func (p *FakeIPNatPlugin) removeRecordedTunEgress(ctx context.Context, state str
 		return
 	}
 	removed := false
-	for _, args := range [][]string{
-		{"rule", "del", "from", cidr, "to", "! " + cidr, "lookup", table},
-		{"rule", "del", "from", cidr, "lookup", table},
-	} {
-		if _, err := p.runner.Run(ctx, "ip", args...); err == nil {
-			removed = true
-		}
+	// One shape, the one egressRuleArgs installs: the priority is not part of
+	// the record, so the delete names the range and the table and lets the
+	// kernel find whatever priority a previous run gave it.
+	if _, err := p.runner.Run(ctx, "ip", egressRuleArgs("del", cidr, table, "")...); err == nil {
+		removed = true
 	}
 	if _, err := p.runner.Run(ctx, "ip", "route", "del", "default", "table", table); err == nil {
 		removed = true
