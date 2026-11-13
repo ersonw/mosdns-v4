@@ -12,9 +12,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -88,8 +90,8 @@ func (p *telegramBot) handleProvider(ctx context.Context, args []string, langs .
 		return "", err
 	}
 	for _, value := range values {
-		if err := validateDomainArg(value, l); err != nil {
-			return "", fmt.Errorf(l.t("invalid domain %q: %w", "域名 %q 无效：%w"), value, err)
+		if err := validateProviderRule(value, prov.Kind == "text", l); err != nil {
+			return "", fmt.Errorf(l.t("invalid rule %q: %w", "规则 %q 无效：%w"), value, err)
 		}
 	}
 
@@ -303,8 +305,8 @@ func (p *telegramBot) providerList(prov domainProvider, args []string, l lang) (
 		return "", err
 	}
 	domains := make([]string, 0, len(set))
-	for d := range set {
-		domains = append(domains, d)
+	for _, rule := range set {
+		domains = append(domains, rule)
 	}
 	sort.Strings(domains)
 	total := len(domains)
@@ -333,6 +335,153 @@ func (p *telegramBot) providerList(prov domainProvider, args []string, l lang) (
 	return b.String(), nil
 }
 
+func normalizeProviderRule(s string) (key, text string, ok bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", "", false
+	}
+	lower := strings.ToLower(s)
+
+	switch {
+	case strings.HasPrefix(lower, "domain:"):
+		value := strings.TrimPrefix(s[len("domain:"):], "*.")
+		value = strings.TrimSpace(value)
+		d := domainKey(value)
+		if !validDomainName(d) {
+			return "", "", false
+		}
+		return "domain:" + d, "domain:" + d, true
+	case strings.HasPrefix(lower, "full:"):
+		value := strings.TrimSpace(s[len("full:"):])
+		d := domainKey(value)
+		if !validDomainName(d) {
+			return "", "", false
+		}
+		return "full:" + d, "full:" + d, true
+	case strings.HasPrefix(lower, "keyword:"):
+		value := strings.TrimSpace(s[len("keyword:"):])
+		if value == "" || strings.ContainsAny(value, " \t\r\n") {
+			return "", "", false
+		}
+		value = strings.ToLower(value)
+		return "keyword:" + value, "keyword:" + value, true
+	case strings.HasPrefix(lower, "regexp:"):
+		value := strings.TrimSpace(s[len("regexp:"):])
+		if value == "" {
+			return "", "", false
+		}
+		if _, err := regexp.Compile(value); err != nil {
+			return "", "", false
+		}
+		return "regexp:" + value, "regexp:" + value, true
+	}
+
+	if ipKey, display, ok := normalizeIPRule(s); ok {
+		return "ip:" + ipKey, display, true
+	}
+
+	value := strings.TrimPrefix(s, "*.")
+	d := domainKey(value)
+	if !validDomainName(d) {
+		return "", "", false
+	}
+	return "domain:" + d, d, true
+}
+
+func normalizeIPRule(s string) (key, display string, ok bool) {
+	s = strings.TrimSpace(s)
+	if strings.Contains(s, "/") {
+		_, network, err := net.ParseCIDR(s)
+		if err != nil {
+			return "", "", false
+		}
+		return network.String(), network.String(), true
+	}
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return "", "", false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return v4.String() + "/32", v4.String(), true
+	}
+	return ip.String() + "/128", ip.String(), true
+}
+
+func validDomainName(s string) bool {
+	if len(s) > 253 || !strings.Contains(s, ".") || net.ParseIP(s) != nil {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) < 1 || len(label) > 63 {
+			return false
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func ruleKey(s string) string {
+	if key, _, ok := normalizeProviderRule(s); ok {
+		return key
+	}
+	return "raw:" + strings.ToLower(strings.TrimSpace(s))
+}
+
+func providerRuleText(s string) string {
+	if _, text, ok := normalizeProviderRule(s); ok {
+		return text
+	}
+	return strings.TrimSpace(s)
+}
+
+func validateProviderRule(s string, allowIP bool, l lang) error {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return errors.New(l.t("empty rule", "规则为空"))
+	}
+	lower := strings.ToLower(s)
+	switch {
+	case strings.HasPrefix(lower, "domain:"):
+		value := strings.TrimPrefix(s[len("domain:"):], "*.")
+		return validateDomainArg(value, l)
+	case strings.HasPrefix(lower, "full:"):
+		return validateDomainArg(strings.TrimSpace(s[len("full:"):]), l)
+	case strings.HasPrefix(lower, "keyword:"):
+		value := strings.TrimSpace(s[len("keyword:"):])
+		if value == "" {
+			return errors.New(l.t("empty keyword", "keyword 为空"))
+		}
+		if strings.ContainsAny(value, " \t\r\n") {
+			return errors.New(l.t("keyword contains whitespace", "keyword 包含空白"))
+		}
+		return nil
+	case strings.HasPrefix(lower, "regexp:"):
+		value := strings.TrimSpace(s[len("regexp:"):])
+		if value == "" {
+			return errors.New(l.t("empty regexp", "regexp 为空"))
+		}
+		if _, err := regexp.Compile(value); err != nil {
+			return fmt.Errorf(l.t("invalid regexp: %w", "regexp 无效：%w"), err)
+		}
+		return nil
+	}
+
+	if allowIP && (strings.Contains(s, "/") || net.ParseIP(s) != nil) {
+		if _, _, ok := normalizeIPRule(s); !ok {
+			return errors.New(l.t("invalid IP or CIDR", "IP 或 CIDR 无效"))
+		}
+		return nil
+	}
+	return validateDomainArg(s, l)
+}
+
 func validateDomainArg(s string, l lang) error {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -343,6 +492,9 @@ func validateDomainArg(s string, l lang) error {
 	}
 	if strings.HasPrefix(s, "-") || strings.ContainsAny(s, " \t\r\n/\\;|&$`'\"") {
 		return errors.New(l.t("domain contains a forbidden character", "域名包含不允许的字符"))
+	}
+	if net.ParseIP(s) != nil {
+		return errors.New(l.t("IP address is not a domain", "IP 地址不是域名"))
 	}
 	s = strings.TrimSuffix(strings.ToLower(s), ".")
 	if !strings.Contains(s, ".") {
@@ -457,26 +609,31 @@ func providerUsage(l lang) string {
 /provider <tag>                   one provider and its examples
 /provider <tag> list              list a .txt provider (first 50)
 /provider <tag> list <page> <page_size>  list a .txt provider page
-/provider <tag> add <domain>      add a domain
-/provider <tag> mod <old> <new>    replace a domain
-/provider <tag> del <domain>      delete a domain
+/provider <tag> add <rule>        add a rule
+/provider <tag> mod <old> <new>    replace a rule
+/provider <tag> del <rule>        delete a rule
 /provider <tag> clear             empty the list or one v2dat category
 
-For a v2dat provider the category is taken from the config when it is unique;
-otherwise put it before the domain, e.g. "/provider geosite add cn example.com".
+Rules: bare domain or domain: (suffix), full: (exact), keyword:, regexp:.
+Text providers also accept IPv4/IPv6 addresses and CIDR; geosite providers accept
+domain rules only. For a v2dat provider the category is taken from the config when
+it is unique; otherwise put it before the rule, e.g.
+"/provider geosite add cn example.com".
 Page and page size must be supplied together.`,
 		`用法：
 /provider                         列出数据源和示例
 /provider <tag>                   单个数据源及其示例
 /provider <tag> list              列出 .txt 数据源（默认前 50 条）
 /provider <tag> list <page> <page_size>  按页列出 .txt 数据源
-/provider <tag> add <domain>      增加域名
-/provider <tag> mod <old> <new>   修改域名
-/provider <tag> del <domain>      删除域名
+/provider <tag> add <rule>        增加规则
+/provider <tag> mod <old> <new>   修改规则
+/provider <tag> del <rule>        删除规则
 /provider <tag> clear             清空列表或一个 v2dat 分类
 
+规则：裸域名或 domain:（后缀）、full:（精确）、keyword:、regexp:。
+文本数据源还支持 IPv4/IPv6 地址和 CIDR；geosite 只支持域名规则。
 v2dat 数据源在配置中只有一个分类时会自动使用该分类；
-否则把分类放在域名前面，例如 "/provider geosite add cn example.com"。
+否则把分类放在规则前面，例如 "/provider geosite add cn example.com"。
 页码和分页大小必须同时提供。`)
 }
 
@@ -487,20 +644,20 @@ func (p *telegramBot) providerText(ctx context.Context, prov domainProvider, act
 	}
 	switch action {
 	case providerAdd:
-		if existing[domainKey(values[0])] {
+		if _, ok := existing[ruleKey(values[0])]; ok {
 			return l.t(fmt.Sprintf("%s already present in %s", values[0], prov.Tag),
 				fmt.Sprintf("%s 已存在于 %s", values[0], prov.Tag)), nil
 		}
 	case providerDel:
-		if !existing[domainKey(values[0])] {
+		if _, ok := existing[ruleKey(values[0])]; !ok {
 			return l.t(fmt.Sprintf("%s is not present in %s", values[0], prov.Tag),
 				fmt.Sprintf("%s 不在 %s 中", values[0], prov.Tag)), nil
 		}
 	case providerMod:
-		if domainKey(values[0]) == domainKey(values[1]) {
+		if ruleKey(values[0]) == ruleKey(values[1]) {
 			return l.t("old and new domain are identical", "旧域名和新域名相同"), nil
 		}
-		if !existing[domainKey(values[0])] {
+		if _, ok := existing[ruleKey(values[0])]; !ok {
 			return "", fmt.Errorf(l.t("%s is not present in %s", "%s 不在 %s 中"), values[0], prov.Tag)
 		}
 	case providerClear:
@@ -601,26 +758,26 @@ func (p *telegramBot) providerV2Dat(ctx context.Context, prov domainProvider, ac
 	if err != nil {
 		return "", err
 	}
-	set := make(map[string]bool, len(existing))
+	set := make(map[string]string, len(existing))
 	for _, d := range existing {
-		set[domainKey(d)] = true
+		set[ruleKey(d)] = providerRuleText(d)
 	}
 	switch action {
 	case providerAdd:
-		if set[domainKey(values[0])] {
+		if _, ok := set[ruleKey(values[0])]; ok {
 			return l.t(fmt.Sprintf("%s already present in %s/%s", values[0], prov.Tag, category),
 				fmt.Sprintf("%s 已存在于 %s/%s", values[0], prov.Tag, category)), nil
 		}
 	case providerDel:
-		if !set[domainKey(values[0])] {
+		if _, ok := set[ruleKey(values[0])]; !ok {
 			return l.t(fmt.Sprintf("%s is not present in %s/%s", values[0], prov.Tag, category),
 				fmt.Sprintf("%s 不在 %s/%s 中", values[0], prov.Tag, category)), nil
 		}
 	case providerMod:
-		if domainKey(values[0]) == domainKey(values[1]) {
+		if ruleKey(values[0]) == ruleKey(values[1]) {
 			return l.t("old and new domain are identical", "旧域名和新域名相同"), nil
 		}
-		if !set[domainKey(values[0])] {
+		if _, ok := set[ruleKey(values[0])]; !ok {
 			return "", fmt.Errorf(l.t("%s is not present in %s/%s", "%s 不在 %s/%s 中"),
 				values[0], prov.Tag, category)
 		}
@@ -630,22 +787,22 @@ func (p *telegramBot) providerV2Dat(ctx context.Context, prov domainProvider, ac
 	// txt2dat.py (it rejects an empty input), so that one case removes the
 	// category directly from the dat.
 	before := make([]string, 0, len(set))
-	for d := range set {
-		before = append(before, d)
+	for _, rule := range set {
+		before = append(before, rule)
 	}
 	sort.Strings(before)
 	switch action {
 	case providerAdd:
-		set[domainKey(values[0])] = true
+		set[ruleKey(values[0])] = providerRuleText(values[0])
 	case providerDel:
-		delete(set, domainKey(values[0]))
+		delete(set, ruleKey(values[0]))
 	case providerMod:
-		delete(set, domainKey(values[0]))
-		set[domainKey(values[1])] = true
+		delete(set, ruleKey(values[0]))
+		set[ruleKey(values[1])] = providerRuleText(values[1])
 	}
 	after := make([]string, 0, len(set))
-	for d := range set {
-		after = append(after, d)
+	for _, rule := range set {
+		after = append(after, rule)
 	}
 	sort.Strings(after)
 	if len(after) == 0 {
@@ -869,25 +1026,32 @@ func (b *limitedBuffer) String() string {
 	return b.buf.String()
 }
 
-func readTextDomains(path string) (map[string]bool, error) {
+func readTextDomains(path string) (map[string]string, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return map[string]bool{}, nil
+			return map[string]string{}, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	set := make(map[string]bool)
+	set := make(map[string]string)
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
+		// regexp: may contain '#', so only strip a trailing comment on other
+		// rule types. A single space before '#' is the script's convention.
+		if !strings.HasPrefix(strings.ToLower(line), "regexp:") {
+			if i := strings.Index(line, " #"); i >= 0 {
+				line = strings.TrimSpace(line[:i])
+			}
+		}
+		key, text, ok := normalizeProviderRule(line)
+		if !ok {
 			continue
 		}
-		set[domainKey(fields[0])] = true
+		set[key] = text
 	}
 	return set, nil
 }
@@ -901,14 +1065,18 @@ func writeDomainList(f *os.File, domains []string) error {
 	return nil
 }
 
-func verifyTextChange(after map[string]bool, action string, values []string) bool {
+func verifyTextChange(after map[string]string, action string, values []string) bool {
 	switch action {
 	case providerAdd:
-		return after[domainKey(values[0])]
+		_, ok := after[ruleKey(values[0])]
+		return ok
 	case providerDel:
-		return !after[domainKey(values[0])]
+		_, ok := after[ruleKey(values[0])]
+		return !ok
 	case providerMod:
-		return !after[domainKey(values[0])] && after[domainKey(values[1])]
+		_, oldOK := after[ruleKey(values[0])]
+		_, newOK := after[ruleKey(values[1])]
+		return !oldOK && newOK
 	}
 	return false
 }
@@ -923,11 +1091,11 @@ func domainsEqual(a, b []string) bool {
 	}
 	as := make([]string, len(a))
 	for i, s := range a {
-		as[i] = domainKey(s)
+		as[i] = ruleKey(s)
 	}
 	bs := make([]string, len(b))
 	for i, s := range b {
-		bs[i] = domainKey(s)
+		bs[i] = ruleKey(s)
 	}
 	sort.Strings(as)
 	sort.Strings(bs)
@@ -965,11 +1133,25 @@ func readGeoSiteDomains(path, category string, l lang) ([]string, error) {
 		}
 		var out []string
 		for _, d := range site.GetDomain() {
-			if d.GetType() != v2data.Domain_Domain || len(d.GetAttribute()) > 0 {
-				return nil, fmt.Errorf(l.t("category %s contains a %s domain or attributes; refusing to rewrite it with txt2dat.py",
-					"分类 %s 包含 %s 类型或带属性的域名；拒绝用 txt2dat.py 改写"), category, d.GetType().String())
+			if len(d.GetAttribute()) > 0 {
+				return nil, fmt.Errorf(l.t("category %s contains attributes; refusing to rewrite it with txt2dat.py",
+					"分类 %s 包含属性；拒绝用 txt2dat.py 改写"), category)
 			}
-			out = append(out, d.GetValue())
+			var rule string
+			switch d.GetType() {
+			case v2data.Domain_Domain:
+				rule = d.GetValue()
+			case v2data.Domain_Plain:
+				rule = "keyword:" + d.GetValue()
+			case v2data.Domain_Regex:
+				rule = "regexp:" + d.GetValue()
+			case v2data.Domain_Full:
+				rule = "full:" + d.GetValue()
+			default:
+				return nil, fmt.Errorf(l.t("category %s contains a %s entry; refusing to rewrite it with txt2dat.py",
+					"分类 %s 包含 %s 类型条目；拒绝用 txt2dat.py 改写"), category, d.GetType().String())
+			}
+			out = append(out, rule)
 		}
 		return out, nil
 	}

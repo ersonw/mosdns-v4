@@ -113,6 +113,88 @@ func TestProviderTextActionsAndPagination(t *testing.T) {
 	assertProviderFile(t, file)
 }
 
+func TestProviderTextTypedRulesAndIP(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "domains.txt")
+	if err := os.WriteFile(file, []byte("cip.cc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := writeProviderTestConfig(t, dir)
+
+	p := newStubPlugin()
+	p.args.ConfigPath = cfg
+	p.args.DomainManageScript = "/fake/domain_manage.py"
+	p.args.Txt2DatScript = "/fake/txt2dat.py"
+	p.domainRunner = fakeDomainRunner
+
+	reply, err := p.handleText(context.Background(), 123, "/provider cn_domains_text add domain:cip.cc")
+	if err != nil || (!strings.Contains(reply, "已存在") && !strings.Contains(reply, "already present")) {
+		t.Fatalf("typed suffix duplicate = %q err=%v", reply, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/provider cn_domains_text mod cip.cc domain:cip.cc")
+	if err != nil || (!strings.Contains(reply, "相同") && !strings.Contains(reply, "identical")) {
+		t.Fatalf("typed suffix mod = %q err=%v", reply, err)
+	}
+
+	reply, err = p.handleText(context.Background(), 123, "/provider cn_domains_text add domain:new.example.com")
+	if err != nil || !strings.Contains(reply, "action: add") {
+		t.Fatalf("typed suffix add = %q err=%v", reply, err)
+	}
+	reply, err = p.handleText(context.Background(), 123, "/provider cn_domains_text add 10.0.0.0/8")
+	if err != nil || !strings.Contains(reply, "action: add") {
+		t.Fatalf("IP add = %q err=%v", reply, err)
+	}
+	assertProviderFile(t, file, "cip.cc", "domain:new.example.com", "10.0.0.0/8")
+
+	reply, err = p.handleText(context.Background(), 123, "/provider cn_domains_text list 1 10")
+	if err != nil || !strings.Contains(reply, "domain:new.example.com") || !strings.Contains(reply, "10.0.0.0/8") {
+		t.Fatalf("typed list = %q err=%v", reply, err)
+	}
+}
+
+func TestProviderV2DatTypedRules(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "geosite.dat")
+	writeProviderTestDat(t, file, "cn", "a.example.com")
+	cfg := writeProviderTestConfig(t, dir)
+
+	p := newStubPlugin()
+	p.args.ConfigPath = cfg
+	p.args.DomainManageScript = "/fake/domain_manage.py"
+	p.args.Txt2DatScript = "/fake/txt2dat.py"
+	p.domainRunner = fakeDomainRunner
+
+	for _, rule := range []string{"full:api.example.com", "keyword:tiktok", `regexp:^ads\.example\.com$`} {
+		reply, err := p.handleText(context.Background(), 123, "/provider geosite add "+rule)
+		if err != nil || !strings.Contains(reply, "action: add") {
+			t.Fatalf("v2dat add %s = %q err=%v", rule, reply, err)
+		}
+	}
+	assertProviderDat(t, file, "cn", "a.example.com", "full:api.example.com", "keyword:tiktok", `regexp:^ads\.example\.com$`)
+}
+
+func TestReadTextDomainsNormalizesRules(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "rules.txt")
+	body := "# comment\ndomain:cip.cc\nfull:api.example.com\nkeyword:TikTok\nregexp:^ads\\.example\\.com$\n10.0.0.0/8 # CIDR\nbare.example.com # suffix\n"
+	if err := os.WriteFile(file, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readTextDomains(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range []string{"domain:cip.cc", "full:api.example.com", "keyword:tiktok", `regexp:^ads\.example\.com$`, "10.0.0.0/8", "bare.example.com"} {
+		if _, ok := got[ruleKey(rule)]; !ok {
+			t.Fatalf("missing %s in %#v", rule, got)
+		}
+	}
+	if len(got) != 6 {
+		t.Fatalf("rules = %#v want 6 entries", got)
+	}
+}
+
 func TestProviderV2DatAddModDelCategory(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "geosite.dat")
@@ -230,7 +312,7 @@ func assertProviderFile(t *testing.T, path string, want ...string) {
 		t.Fatalf("%s domains = %v want %v", path, got, want)
 	}
 	for _, d := range want {
-		if !got[d] {
+		if _, ok := got[ruleKey(d)]; !ok {
 			t.Fatalf("%s lacks %s: %v", path, d, got)
 		}
 	}
@@ -302,9 +384,31 @@ func fakeDomainRunner(_ context.Context, script string, args ...string) (string,
 		site := &v2data.GeoSite{CountryCode: category}
 		for _, line := range strings.Split(string(b), "\n") {
 			line = strings.TrimSpace(line)
-			if line != "" {
-				site.Domain = append(site.Domain, &v2data.Domain{Type: v2data.Domain_Domain, Value: line})
+			if line == "" {
+				continue
 			}
+			key, text, ok := normalizeProviderRule(line)
+			if !ok {
+				continue
+			}
+			dtype := v2data.Domain_Domain
+			value := text
+			switch {
+			case strings.HasPrefix(key, "full:"):
+				dtype = v2data.Domain_Full
+				value = strings.TrimPrefix(text, "full:")
+			case strings.HasPrefix(key, "keyword:"):
+				dtype = v2data.Domain_Plain
+				value = strings.TrimPrefix(text, "keyword:")
+			case strings.HasPrefix(key, "regexp:"):
+				dtype = v2data.Domain_Regex
+				value = strings.TrimPrefix(text, "regexp:")
+			case strings.HasPrefix(key, "ip:"):
+				continue
+			case strings.HasPrefix(key, "domain:"):
+				value = strings.TrimPrefix(text, "domain:")
+			}
+			site.Domain = append(site.Domain, &v2data.Domain{Type: dtype, Value: value})
 		}
 		replaced := false
 		for i, s := range list.Entry {

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import ipaddress
 import sys
 import os
 
@@ -171,11 +172,62 @@ def decode_geosite_file(file_path: str) -> dict:
                 break
     return sites
 
+def is_ip_rule(value: str) -> bool:
+    try:
+        ipaddress.ip_network(value, strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_rule_line(line: str):
+    """Parse one provider rule line into (v2dat type, value).
+
+    Type mapping follows v2data.Domain_Type:
+      0 Plain -> keyword:, 1 Regex -> regexp:, 2 Domain -> suffix, 3 Full -> full:
+    Bare domains and domain: both mean a suffix rule. Comments are preserved
+    by domain_manage.py, so a normal rule may have a trailing " # comment";
+    regexp rules are kept verbatim.
+    """
+    raw = line.strip()
+    if not raw or raw.startswith('#'):
+        return None
+
+    lower = raw.lower()
+    if lower.startswith('regexp:'):
+        value = raw[len('regexp:'):].strip()
+        if not value:
+            raise ValueError("empty regexp rule")
+        return 1, value
+
+    if ' #' in raw:
+        raw = raw.split(' #', 1)[0].strip()
+    if not raw:
+        return None
+
+    lower = raw.lower()
+    for prefix, dtype in (('full:', 3), ('keyword:', 0), ('domain:', 2)):
+        if lower.startswith(prefix):
+            value = raw[len(prefix):].strip()
+            if not value:
+                raise ValueError("empty %s rule" % prefix[:-1])
+            if dtype in (2, 3) and is_ip_rule(value):
+                raise ValueError("IP/CIDR rule %r cannot be stored in geosite" % value)
+            if dtype == 2 and value.startswith('*.'):
+                value = value[2:]
+            return dtype, value
+
+    if is_ip_rule(raw):
+        raise ValueError("IP/CIDR rule %r cannot be stored in geosite" % raw)
+    return 2, raw
+
+
 def main():
     if len(sys.argv) < 4:
         print("Usage: python3 txt2dat.py <input_txt> <output_dat> <category_name> [--overwrite]")
         print("  Default: preserve existing categories, update the specified one")
         print("  --overwrite: clear all existing content, keep only the specified category")
+        print("  Rule prefixes: domain: (suffix), full:, keyword:, regexp:; bare = suffix")
         sys.exit(1)
 
     input_txt = sys.argv[1]
@@ -183,14 +235,17 @@ def main():
     category = sys.argv[3]
     overwrite = len(sys.argv) >= 5 and sys.argv[4] == "--overwrite"
 
-    # Read domains from txt file (all use type 2 = suffix match)
+    # Read rules from txt file. Type prefixes select the v2dat domain type.
     new_domains = []
     with open(input_txt, 'r', encoding='utf-8') as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            new_domains.append((2, line))
+            try:
+                parsed = parse_rule_line(line)
+            except ValueError as e:
+                print("Error: %s" % e)
+                sys.exit(1)
+            if parsed is not None:
+                new_domains.append(parsed)
 
     if not new_domains:
         print("Error: no valid domains found in input file")
