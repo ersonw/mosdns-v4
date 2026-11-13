@@ -49,10 +49,20 @@ func (p *FakeIPNatPlugin) AdminWatchStart(ctx context.Context, sourceIP string) 
 		return nil
 	}
 	if p.useTun {
+		// The tun reader is authoritative, but conntrack is a useful fallback:
+		// traffic can be carried by the nft path while the tun route is not
+		// active, and a failed tun reader leaves tunStarted true. This poll
+		// must never turn a valid tun watch into an error.
+		if p.runner != nil {
+			if err := p.startConntrackWatch(ctx, source, false); err != nil {
+				p.L().Debug("traffic watch: conntrack fallback unavailable",
+					zap.String("source_ip", source), zap.Error(err))
+			}
+		}
 		p.L().Info("traffic watch started on the tun plane", zap.String("source_ip", source))
 		return nil
 	}
-	if err := p.startConntrackWatch(ctx, source); err != nil {
+	if err := p.startConntrackWatch(ctx, source, true); err != nil {
 		p.watch.remove(source)
 		return err
 	}
@@ -111,15 +121,20 @@ func normalizeWatchSource(raw string) (string, error) {
 	return addr.String(), nil
 }
 
-// startConntrackWatch performs one read synchronously, so a missing or unusable
-// conntrack command is reported to the administrator instead of showing an
-// empty live message. The periodic loop starts only after that read succeeds.
-func (p *FakeIPNatPlugin) startConntrackWatch(ctx context.Context, source string) error {
+// startConntrackWatch performs one read synchronously. In strict mode (the
+// non-tun plane) a missing or unusable conntrack command is reported to the
+// administrator instead of showing an empty live message. In fallback mode
+// (the tun plane) the initial read is best-effort and the loop still starts.
+func (p *FakeIPNatPlugin) startConntrackWatch(ctx context.Context, source string, strict bool) error {
 	if p.runner == nil {
 		return fmt.Errorf("conntrack reader is not available")
 	}
 	if err := p.pollConntrack(ctx, source); err != nil {
-		return err
+		if strict {
+			return err
+		}
+		p.L().Debug("traffic watch: initial conntrack poll failed",
+			zap.String("source_ip", source), zap.Error(err))
 	}
 
 	p.watchMu.Lock()

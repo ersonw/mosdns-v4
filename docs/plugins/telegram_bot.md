@@ -35,7 +35,8 @@ are ignored, and an unauthorized command returns
 - `/fip [tag] {tags|help|list [n]|get <domain|fake_ip>|add|del|stats|clear confirm}`
 - `/watch [tag] <source_ip>`: watch one source IP and keep editing one message
   with the latest 20 destination/domain/protocol/port records. TUN uses packet
-  capture; non-TUN fakeip uses `conntrack -L -s <ip>`.
+  capture plus `conntrack -L -s <ip>` as a fallback; non-TUN fakeip uses the
+  conntrack poll alone.
 - `/stop`: stops every watch session owned by the current chat.
 - `/vpn [tag] {tags|help|users|status|sessions|kick|term|run <occtl args...>|pool|alloc <user> [ip]|free <user>|reload|restart|events [n] [user]}`
 - `/user [tag] {tags|help|list|add <name> <pass> [group]|del|pass|enable|disable|group|ip <name> <ipv4|->|limit <name> <max|0|-> [period|0|-]|usage <name>|reset <name>|sessions [active] [n]}`

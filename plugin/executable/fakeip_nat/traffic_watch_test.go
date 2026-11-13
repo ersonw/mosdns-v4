@@ -198,6 +198,28 @@ func TestAdminWatchTunRequiresRunningDataPath(t *testing.T) {
 	}
 }
 
+func TestAdminWatchTunAlsoUsesConntrackFallback(t *testing.T) {
+	p := newWatchTestPlugin()
+	p.useTun = true
+	p.tunStarted = true
+	p.runner = watchRunner{out: "tcp 6 431999 ESTABLISHED src=192.0.2.10 dst=198.18.0.5 " +
+		"sport=50000 dport=443 src=203.0.113.9 dst=192.0.2.10 sport=443 dport=50000 [ASSURED]\n"}
+	if err := p.AdminWatchStart(context.Background(), "192.0.2.10"); err != nil {
+		t.Fatalf("AdminWatchStart: %v", err)
+	}
+	defer func() {
+		_ = p.AdminWatchStop(context.Background(), "192.0.2.10")
+		p.stopTrafficWatch()
+	}()
+	events, _, err := p.AdminWatchSnapshot(context.Background(), "192.0.2.10", 20)
+	if err != nil {
+		t.Fatalf("AdminWatchSnapshot: %v", err)
+	}
+	if len(events) != 1 || events[0].Domain != "example.com" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
 func TestAdminWatchRejectsIPv6Source(t *testing.T) {
 	p := newWatchTestPlugin()
 	if err := p.AdminWatchStart(context.Background(), "2001:db8::1"); err == nil {

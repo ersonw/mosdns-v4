@@ -107,7 +107,8 @@ tag is the default target and a command can name another target first.
 
 `/watch [tag] <source_ip>` keeps editing one message with the latest 20 records
 for that source IP: destination, domain, protocol and port. TUN mode captures
-packets directly; non-TUN fake-IP mode polls `conntrack -L -s <ip>`. `/stop`
+packets directly and also polls `conntrack -L -s <ip>` as a fallback; non-TUN
+fake-IP mode relies on that poll. `/stop`
 stops every watch session owned by the current chat.
 
 `/reload confirm` validates the config and exits with a non-zero code; a
