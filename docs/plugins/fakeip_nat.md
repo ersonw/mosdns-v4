@@ -114,6 +114,13 @@ A gVisor netstack terminates TCP and UDP. With a working proxy, TCP is dialed
 as `domain:port` and the proxy resolves the name. Without a proxy, the plugin
 looks up the most recent real IP for the domain and dials it directly.
 
+DNS answers prefer IPv4 globally: AAAA queries get an empty answer, and A
+queries with an A record get a fake IPv4. With `use_tun: true` and a working
+proxy, a name that has only AAAA records still receives a fake IPv4 and a
+synthesized A answer; the proxy dials the domain and resolves it over IPv6 on
+its side. This path is proxy-only: direct NAT/TUN has no real IPv4 to dial and
+does not synthesize an A for an IPv6-only name.
+
 ### Direct egress and SNAT
 
 Without a proxy, Linux installs a dedicated route table

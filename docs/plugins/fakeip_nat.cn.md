@@ -104,6 +104,11 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
 有可用代理时把 **域名** 直接交给代理（`CONNECT domain:port`），没有代理时回查数据库里该域名的
 **最近真实 IP** 后再直连。因此 `use_tun: true` 需要 Go 1.20 及以上构建（`go.mod` 已标注 `go 1.20`），
 并依赖 `github.com/metacubex/gvisor`。
+
+DNS 层全局优先 IPv4：AAAA 查询直接返回空答复；A 查询有 A 记录时分配 fake IPv4。
+在 `use_tun: true` 且代理生效时，如果 A 查询没有 A 记录、但域名存在 AAAA（纯 IPv6），
+插件仍会分配一个 fake IPv4 并返回合成的 A 记录；代理按域名拨号，由代理侧用 IPv6 完成出站。
+该行为只用于代理模式：直连 NAT/TUN 没有真实 IPv4 可拨号，不会为纯 IPv6 域名伪造 A。
 ```yaml
   - tag: fakeip_tun
     type: fakeip_nat

@@ -1054,17 +1054,47 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	resp := qCtx.R()
 	if resp != nil && question.Qtype == dns.TypeA {
 		var realIPs []string
+		hasAAAA := false
 		for _, ans := range resp.Answer {
-			if aRecord, ok := ans.(*dns.A); ok {
-				realIPs = append(realIPs, aRecord.A.String())
+			switch rr := ans.(type) {
+			case *dns.A:
+				realIPs = append(realIPs, rr.A.String())
+			case *dns.AAAA:
+				// Some upstreams put an AAAA in an A response. Treat it as
+				// proof that the name is usable over IPv6 without a second
+				// lookup.
+				hasAAAA = true
 			}
 		}
 
-		if len(realIPs) > 0 {
+		// A proxied outlet dials the domain, not a real IPv4, so an
+		// IPv6-only name is still usable through it. Give the client a fake
+		// IPv4 instead of leaving it with an empty A answer; otherwise a
+		// client that asks A first can never reach the name through the
+		// proxy. This is limited to proxy mode: the direct NAT/TUN path
+		// needs a real IPv4 to dial.
+		ipv6Only := false
+		if len(realIPs) == 0 && p.proxyActive && !p.realIP && resp.Rcode == dns.RcodeSuccess {
 			domain := strings.TrimSuffix(question.Name, ".")
-			p.L().Debug("fakeip nat: real ips collected",
-				zap.String("domain", domain), zap.Int("count", len(realIPs)), zap.Strings("real_ips", realIPs))
-			p.learnWatchRealIPs(domain, realIPs)
+			if p.runtime != nil {
+				if _, ok := p.runtime.fakeOf(domain); ok {
+					ipv6Only = true
+				}
+			}
+			if !ipv6Only && (hasAAAA || p.domainHasAAAA(ctx, qCtx, next)) {
+				ipv6Only = true
+				p.L().Debug("fakeip nat: ipv6-only domain allocated for proxy",
+					zap.String("domain", domain))
+			}
+		}
+
+		if len(realIPs) > 0 || ipv6Only {
+			domain := strings.TrimSuffix(question.Name, ".")
+			if len(realIPs) > 0 {
+				p.L().Debug("fakeip nat: real ips collected",
+					zap.String("domain", domain), zap.Int("count", len(realIPs)), zap.Strings("real_ips", realIPs))
+				p.learnWatchRealIPs(domain, realIPs)
+			}
 			if p.realIP {
 				// Pure routing mode: the answer keeps the real IPs and the
 				// plugin only steers each of them out of the chosen gateway.
@@ -1127,6 +1157,39 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 	return nil
+}
+
+// domainHasAAAA asks the rest of the chain whether the name has an AAAA
+// record. It is only used in proxy mode when an A answer came back empty:
+// the proxy carries the domain, so an IPv6-only name can still get a fake
+// IPv4 for the client to connect to. The query goes through the same chain
+// as the original A query, so cache and upstream selection stay consistent.
+func (p *FakeIPNatPlugin) domainHasAAAA(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) bool {
+	if next == nil {
+		return false
+	}
+	q := qCtx.Q()
+	if len(q.Question) == 0 {
+		return false
+	}
+	aaaaQ := q.Copy()
+	aaaaQ.Question[0].Qtype = dns.TypeAAAA
+	aaaaCtx := query_context.NewContext(aaaaQ, qCtx.ReqMeta())
+	if err := executable_seq.ExecChainNode(ctx, aaaaCtx, next); err != nil {
+		p.L().Debug("fakeip nat: aaaa lookup for ipv6-only domain failed",
+			zap.String("name", q.Question[0].Name), zap.Error(err))
+		return false
+	}
+	resp := aaaaCtx.R()
+	if resp == nil || resp.Rcode != dns.RcodeSuccess {
+		return false
+	}
+	for _, ans := range resp.Answer {
+		if _, ok := ans.(*dns.AAAA); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // recordAndAllocate returns a stable fake ip for domain and records the
