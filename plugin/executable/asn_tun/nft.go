@@ -39,6 +39,16 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) (string,
 	return string(out), nil
 }
 
+// markHookPriority must run after every other chain that assigns a routing
+// mark. VyOS policy routing hooks prerouting at priority mangle (-150) and
+// marks any non-CN destination with 0x7fffff9b; MosDNS's own oversea chain
+// hooks prerouting at priority filter (0) and marks it with 0xa. A chain at
+// priority 0 that also required "meta mark 0" therefore never matched on a
+// real deployment: the packet arrived already marked, the ASN prefixes were
+// never re-marked, and no traffic ever entered the TUN. Running late and
+// overriding the policy mark is what makes the hijack effective.
+const markHookPriority = 10
+
 // nftFile is pure text so a test can compare the complete ruleset without
 // running nft. The table is recreated on every install; that is the only
 // reliable way to remove chains and sets from a previous version.
@@ -50,7 +60,7 @@ func nftFile(table string, mark uint32, prefixes []netip.Prefix, bypass []netip.
 	if len(skip) > 0 {
 		fmt.Fprintf(&b, "add set inet %s skip4 { type ipv4_addr; flags interval; }\n", table)
 	}
-	fmt.Fprintf(&b, "add chain inet %s mark_pre { type filter hook prerouting priority 0; policy accept; }\n", table)
+	fmt.Fprintf(&b, "add chain inet %s mark_pre { type filter hook prerouting priority %d; policy accept; }\n", table, markHookPriority)
 	preMatch := ""
 	if mirrorDev != "" {
 		preMatch = fmt.Sprintf("iifname %q ", mirrorDev)
@@ -59,13 +69,13 @@ func nftFile(table string, mark uint32, prefixes []netip.Prefix, bypass []netip.
 	if len(skip) > 0 {
 		skipMatch = "ip daddr != @skip4 "
 	}
-	fmt.Fprintf(&b, "add rule inet %s mark_pre %smeta mark 0 ip daddr != @bypass4 %sip daddr @asn4 meta mark set %d\n", table, preMatch, skipMatch, mark)
+	fmt.Fprintf(&b, "add rule inet %s mark_pre %smeta mark != %d ip daddr != @bypass4 %sip daddr @asn4 meta mark set %d\n", table, preMatch, mark, skipMatch, mark)
 	// A mirror/SPAN interface feeds ingress only. The output chain would mark
 	// locally generated traffic as well, which is not part of the mirrored
 	// stream, so it is installed only in the global (all-interface) mode.
 	if mirrorDev == "" {
-		fmt.Fprintf(&b, "add chain inet %s mark_out { type route hook output priority 0; policy accept; }\n", table)
-		fmt.Fprintf(&b, "add rule inet %s mark_out meta mark 0 ip daddr != @bypass4 %sip daddr @asn4 meta mark set %d\n", table, skipMatch, mark)
+		fmt.Fprintf(&b, "add chain inet %s mark_out { type route hook output priority %d; policy accept; }\n", table, markHookPriority)
+		fmt.Fprintf(&b, "add rule inet %s mark_out meta mark != %d ip daddr != @bypass4 %sip daddr @asn4 meta mark set %d\n", table, mark, skipMatch, mark)
 	}
 
 	for _, chunk := range prefixChunks(prefixes, 100) {

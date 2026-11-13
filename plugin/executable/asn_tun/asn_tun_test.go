@@ -46,8 +46,9 @@ func TestNftFileContainsIntervalSetAndBypass(t *testing.T) {
 	for _, want := range []string{
 		"add table inet asn_tun",
 		"type ipv4_addr; flags interval",
-		"add rule inet asn_tun mark_pre meta mark 0 ip daddr != @bypass4 ip daddr @asn4 meta mark set 291",
-		"add rule inet asn_tun mark_out meta mark 0 ip daddr != @bypass4 ip daddr @asn4 meta mark set 291",
+		"add chain inet asn_tun mark_pre { type filter hook prerouting priority 10; policy accept; }",
+		"add rule inet asn_tun mark_pre meta mark != 291 ip daddr != @bypass4 ip daddr @asn4 meta mark set 291",
+		"add rule inet asn_tun mark_out meta mark != 291 ip daddr != @bypass4 ip daddr @asn4 meta mark set 291",
 		"add element inet asn_tun asn4 { 1.2.3.0/24, 5.6.0.0/16 }",
 		"add element inet asn_tun bypass4 { 8.8.8.8 }",
 	} {
@@ -64,7 +65,7 @@ func TestNftFileMirrorDevRestrictsIngress(t *testing.T) {
 		netip.MustParseAddr("8.8.8.8"),
 	}, nil, "mirror0")
 	for _, want := range []string{
-		`add rule inet asn_tun mark_pre iifname "mirror0" meta mark 0 ip daddr != @bypass4 ip daddr @asn4 meta mark set 291`,
+		`add rule inet asn_tun mark_pre iifname "mirror0" meta mark != 291 ip daddr != @bypass4 ip daddr @asn4 meta mark set 291`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("nft file missing %q:\n%s", want, text)
@@ -195,7 +196,7 @@ func TestNftFileSkipsDestinationPrefixes(t *testing.T) {
 	}, "")
 	for _, want := range []string{
 		"add set inet asn_tun skip4 { type ipv4_addr; flags interval; }",
-		"add rule inet asn_tun mark_pre meta mark 0 ip daddr != @bypass4 ip daddr != @skip4 ip daddr @asn4 meta mark set 291",
+		"add rule inet asn_tun mark_pre meta mark != 291 ip daddr != @bypass4 ip daddr != @skip4 ip daddr @asn4 meta mark set 291",
 		"add element inet asn_tun skip4 { 10.0.0.0/8, 192.168.0.0/16 }",
 	} {
 		if !strings.Contains(text, want) {
