@@ -766,13 +766,17 @@ func sortCandidates(list []gostCandidate) {
 }
 
 // DialContext picks the list that matches the flow: UDP only ever uses a
-// protocol whose association was granted, TCP uses the fastest one available.
+// protocol whose association was granted; TCP uses the fastest protocol for
+// HTTP/HTTPS ports and prefers socks5 for every other port, so an SSH flow
+// never lands on gost's HTTP listener just because its handshake was quicker.
 // A flavour that fails while connecting falls through to the next, and when the
 // list is exhausted the connection leaves without the proxy.
 func (e *gostEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	list := e.tcp
 	if strings.HasPrefix(network, "udp") {
 		list = e.udp
+	} else {
+		list = e.tcpFor(addr)
 	}
 
 	var lastErr error
@@ -793,6 +797,40 @@ func (e *gostEgress) DialContext(ctx context.Context, network, addr string) (net
 		return nil, err
 	}
 	return conn, nil
+}
+
+// tcpFor keeps the measured fastest-first order for HTTP/HTTPS ports. For all
+// other ports it puts the socks5 flavours first and preserves their relative
+// order, then appends the remaining protocols in their original order. If no
+// socks5 flavour survived the probe, the original list is used unchanged.
+func (e *gostEgress) tcpFor(addr string) []gostCandidate {
+	if isHTTPPort(addr) {
+		return e.tcp
+	}
+	socks := make([]gostCandidate, 0, len(e.tcp))
+	other := make([]gostCandidate, 0, len(e.tcp))
+	for _, c := range e.tcp {
+		if _, ok := c.dialer.(*socks5Egress); ok {
+			socks = append(socks, c)
+			continue
+		}
+		other = append(other, c)
+	}
+	if len(socks) == 0 {
+		return e.tcp
+	}
+	return append(socks, other...)
+}
+
+// isHTTPPort reports whether addr targets the conventional HTTP or HTTPS
+// port. The port is compared as text because net.SplitHostPort already
+// normalizes an IPv6 bracket form and a missing port has no HTTP meaning.
+func isHTTPPort(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return port == "80" || port == "443"
 }
 
 // tcpProtocols reports the TCP order kept for this outlet, for the startup log.

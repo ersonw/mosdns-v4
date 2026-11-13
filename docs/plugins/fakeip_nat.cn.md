@@ -42,10 +42,11 @@ TCP 走 CONNECT；UDP 上 socks5 用 RFC 1928 UDP ASSOCIATE、trojan 用流内 u
 按首字节嗅探）。插件会为该地址同时构造 socks5h、socks5、trojan、https、http 五种出口，启动时各探测
 一次并计时：能握手的保留，握不上的剔除，日志 `gost outlet protocols selected` 列出 `tcp_protocols`
 （按握手耗时从快到慢）与 `udp_protocols`（只含真正接受了 UDP ASSOCIATE 的协议，同样按耗时排序）。
-之后按流量类型各走各的：TCP 只用 `tcp_protocols` 里最快的那个，连不上就退到下一个；UDP 只用
-`udp_protocols`，为空则直接走宿主机网络（http/https 只有 CONNECT，本来就不承载 UDP）。某个协议这次
-连不上就换下一个，整张列表都失败则直接走宿主机网络（等同没配代理）。若五种全部探测失败，启动日志
-仍然是 `proxy is not usable, falling back to direct egress`。
+之后按流量类型各走各的：TCP 在 80/443 端口使用 `tcp_protocols` 里最快的那个；其他端口优先使用
+socks5h/socks5，只有它们都连不上时才按耗时顺序回退到 trojan/https/http，避免 SSH（22）这类流量被
+gost 的 HTTP 监听接走。UDP 只用 `udp_protocols`，为空则直接走宿主机网络（http/https 只有 CONNECT，
+本来就不承载 UDP）。某个协议这次连不上就换下一个，整张列表都失败则直接走宿主机网络（等同没配代理）。
+若五种全部探测失败，启动日志仍然是 `proxy is not usable, falling back to direct egress`。
 ICMP echo 不经过任何代理协议（socks5 / trojan / http 都不承载 ICMP）。配了代理时，发往假 IP 的
 echo 请求**由插件本地合成 echo reply**（保留客户端的 id、序列号和 payload），因为转发出去只可能超时：
 这一跳的 `ping` 反映的是本设备而不是真实主机。没有代理时，echo 走宿主机的原始套接字，并把该

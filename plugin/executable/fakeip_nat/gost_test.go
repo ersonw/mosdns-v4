@@ -6,6 +6,7 @@ package fakeipnat
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"strings"
@@ -235,5 +236,43 @@ func TestSortCandidatesFastestFirst(t *testing.T) {
 	}
 	if list[2].dialer != c {
 		t.Fatalf("slowest candidate is not last")
+	}
+}
+
+// An SSH flow must not be routed through gost's HTTP listener just because
+// HTTP won the startup probe. Non-HTTP ports prefer socks5; 80/443 keep the
+// measured fastest-first order.
+func TestGostTCPPrefersSocks5OutsideHTTPPorts(t *testing.T) {
+	socksh := &socks5Egress{server: "a:1080", remoteDNS: true}
+	socks := &socks5Egress{server: "b:1080"}
+	trojan := &trojanEgress{server: "c:443"}
+	https := &httpEgress{server: "d:443", tlsCfg: &tls.Config{}}
+	http := &httpEgress{server: "e:3128"}
+
+	g := &gostEgress{tcp: []gostCandidate{
+		{dialer: http, latency: time.Millisecond},
+		{dialer: https, latency: 2 * time.Millisecond},
+		{dialer: trojan, latency: 3 * time.Millisecond},
+		{dialer: socksh, latency: 30 * time.Millisecond},
+		{dialer: socks, latency: 40 * time.Millisecond},
+	}}
+
+	ssh := g.tcpFor("ph-vpn.dyize.com:22")
+	if len(ssh) != 5 {
+		t.Fatalf("ssh candidates = %d, want 5", len(ssh))
+	}
+	if ssh[0].dialer != socksh || ssh[1].dialer != socks {
+		t.Fatalf("ssh order = %v, want socks5h then socks5", describeCandidates(ssh))
+	}
+	if ssh[2].dialer != http || ssh[3].dialer != https || ssh[4].dialer != trojan {
+		t.Fatalf("ssh fallback order = %v, want http, https, trojan", describeCandidates(ssh))
+	}
+
+	web := g.tcpFor("example.com:443")
+	if web[0].dialer != http {
+		t.Fatalf("https order = %v, want the fastest candidate first", describeCandidates(web))
+	}
+	if plain := g.tcpFor("example.com:80"); plain[0].dialer != http {
+		t.Fatalf("http order = %v, want the fastest candidate first", describeCandidates(plain))
 	}
 }

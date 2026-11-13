@@ -151,7 +151,9 @@ Supported schemes:
 - `trojan://`: TLS with `sha256(password)[:56]`, plus its UDP associate frames.
 - `gost://user:pass@host:1080`: probes socks5h, socks5, trojan, https and http,
   keeps the protocols that complete a handshake, and chooses the fastest TCP
-  and UDP protocol.
+  and UDP protocol. For TCP, ports 80/443 keep the fastest protocol; every
+  other port prefers socks5h/socks5 first and only falls back to
+  trojan/https/http, so an SSH flow is not carried by gost's HTTP listener.
 
 `socks5://` normally resolves locally, but the local resolver is often this
 plugin, so it can answer with a fake IP. The plugin detects that and keeps the
