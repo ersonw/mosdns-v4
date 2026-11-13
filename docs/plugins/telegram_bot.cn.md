@@ -41,8 +41,8 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       ocserv_tags: ["ocserv_user"]        # /vpn 可查询的 ocserv_ctl 插件 tag
       radius_tags: ["radius"]             # /user 可管理的 radius 插件 tag
       config_path: etc/mosdns/config.yaml # /config 改写的文件，留空取 -c 参数
-      domain_manage_script: /etc/mosdns/domain_manage.py # 文本域名列表脚本
-      txt2dat_script: /etc/mosdns/txt2dat.py             # 文本 -> v2dat 脚本
+      domain_manage_script: scripts/domain_manage.py # 默认 <配置目录>/scripts/，缺失自动下载
+      txt2dat_script: scripts/txt2dat.py             # 默认 <配置目录>/scripts/，缺失自动下载
       domain_python: python3              # *.py 使用这个解释器
       domain_timeout: 30                  # 单次脚本超时（秒）
       audit_log: ""                       # 审计日志，留空取配置目录下 telegram_bot_audit.log
@@ -51,3 +51,8 @@ HTTP(S)/SOCKS5 代理，`api_base` 便于指向镜像或测试端点。
       poll_timeout: 30
       timezone: Asia/Shanghai            # 留空则跟随数据源插件，最终兜底上海时区
 ```
+
+`domain_manage_script` 和 `txt2dat_script` 的相对路径按配置文件所在目录解析；
+留空时默认使用 `<配置目录>/scripts/domain_manage.py` 和
+`<配置目录>/scripts/txt2dat.py`。脚本不存在时，Bot 启动阶段会从仓库 raw 链接
+`.../etc/mosdns/scripts/` 下载到该目录；下载失败只记录告警，不阻止 Bot 启动。

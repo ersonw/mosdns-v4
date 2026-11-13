@@ -15,6 +15,7 @@ import (
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/data_provider"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
+	"github.com/ersonw/mosdns-v4/pkg/helperscript"
 	"github.com/ersonw/mosdns-v4/pkg/matcher/netlist"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/ersonw/mosdns-v4/plugin/executable/fakeip_nat"
@@ -32,8 +33,8 @@ const (
 	defaultTunMTU      = 1500
 	defaultProxyTunMTU = 1400
 	defaultRulePrio    = 1000
-	defaultFetchScript = "/etc/mosdns/bgpq3_fetch_asn.py"
-	defaultMergeScript = "/etc/mosdns/cidr_merge.py"
+	defaultFetchScript = "bgpq3_fetch_asn.py"
+	defaultMergeScript = "cidr_merge.py"
 	defaultPython      = "python3"
 	refreshTimeout     = 5 * time.Minute
 )
@@ -121,9 +122,13 @@ type ASNTunPlugin struct {
 	tunDev  string
 	tunAddr netip.Addr
 	tunFile *os.File
-	stack   *tunStack
+	// tunCreated records whether this instance created the link, so Close
+	// removes only plugin-owned interfaces and leaves a pre-existing one alone.
+	tunCreated bool
+	stack      *tunStack
 
 	mirrorDev string
+	configDir string
 
 	mark        uint32
 	routeTable  string
@@ -187,14 +192,16 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 		return nil, fmt.Errorf("unsupported source %q: use ipverse or bgpq3", cfg.Source)
 	}
 
-	fetchScript := strings.TrimSpace(cfg.FetchScript)
-	if fetchScript == "" {
-		fetchScript = defaultFetchScript
+	configDir := ""
+	if bp != nil && bp.M() != nil {
+		configDir = bp.M().ConfigDir()
 	}
-	mergeScript := strings.TrimSpace(cfg.MergeScript)
-	if mergeScript == "" {
-		mergeScript = defaultMergeScript
+	if configDir == "" {
+		configDir, _ = os.Getwd()
 	}
+
+	fetchScript := helperscript.ConfiguredPath(configDir, cfg.FetchScript, defaultFetchScript)
+	mergeScript := helperscript.ConfiguredPath(configDir, cfg.MergeScript, defaultMergeScript)
 	python := strings.TrimSpace(cfg.Python)
 	if python == "" {
 		python = defaultPython
@@ -235,6 +242,7 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load skip_ip: %w", err)
 	}
+	skipPrefixes = normalizePrefixes(skipPrefixes)
 
 	nftTable := strings.TrimSpace(cfg.NftTable)
 	if nftTable == "" {
@@ -317,6 +325,7 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 		tunDev:       tunDev,
 		tunAddr:      tunAddr,
 		mirrorDev:    mirrorDev,
+		configDir:    configDir,
 		skipPrefixes: skipPrefixes,
 		mark:         mark,
 		routeTable:   routeTable,
@@ -623,7 +632,7 @@ func (p *ASNTunPlugin) refreshPrefixes(ctx context.Context) error {
 	case "bgpq3":
 		prefixes, err = p.fetchPrefixesBGpq3(ctx)
 	default:
-		prefixes, err = fetchPrefixes(ctx, p.asns)
+		prefixes, err = p.fetchPrefixesIPVerse(ctx)
 	}
 	if err != nil {
 		return fmt.Errorf("fetch ASN prefixes: %w", err)
@@ -631,12 +640,14 @@ func (p *ASNTunPlugin) refreshPrefixes(ctx context.Context) error {
 	if len(prefixes) == 0 {
 		return fmt.Errorf("no IPv4 prefixes returned for ASN list")
 	}
+	prefixes = normalizePrefixes(prefixes)
 
 	skip, skipErr := loadSkipPrefixes(p.BP, p.args.SkipIP)
 	if skipErr != nil {
 		p.L().Warn("asn_tun: reloading skip_ip failed, keeping the current skip set", zap.Error(skipErr))
 		skip = p.skipPrefixes
 	}
+	skip = normalizePrefixes(skip)
 
 	prefixChanged := !prefixesEqual(p.prefixes, prefixes)
 	skipChanged := !prefixesEqual(p.skipPrefixes, skip)
@@ -728,6 +739,9 @@ func (p *ASNTunPlugin) Close() error {
 				err = delErr
 			}
 		}
+		// The link is removed after the policy routes, otherwise deleting it
+		// first would leave rules pointing at a nonexistent device.
+		p.cleanupTun(ctx)
 	})
 	return err
 }

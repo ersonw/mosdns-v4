@@ -14,6 +14,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ersonw/mosdns-v4/pkg/helperscript"
+	"go.uber.org/zap"
 )
 
 const (
@@ -27,7 +30,44 @@ type prefixCache struct {
 	IPv4    []string  `json:"ipv4"`
 }
 
+func (p *ASNTunPlugin) mergePrefixData(ctx context.Context, data []byte) ([]netip.Prefix, error) {
+	mergeScript, mergeDownloaded, err := helperscript.Resolve(ctx, p.configDir, p.args.MergeScript, defaultMergeScript)
+	if err != nil {
+		return nil, err
+	}
+	if mergeDownloaded && p.BP != nil {
+		p.L().Info("asn_tun: downloaded helper script",
+			zap.String("script", defaultMergeScript), zap.String("path", mergeScript))
+	}
+
+	merge := exec.CommandContext(ctx, p.args.Python, mergeScript, "--ipv4-only")
+	merge.Stdin = bytes.NewReader(data)
+	var stderr bytes.Buffer
+	merge.Stderr = &stderr
+	merged, err := merge.Output()
+	if err != nil {
+		return nil, fmt.Errorf("merge script %s: %w: %s", mergeScript, err, strings.TrimSpace(stderr.String()))
+	}
+	prefixes, err := parsePrefixLines(string(merged))
+	if err != nil {
+		return nil, err
+	}
+	if len(prefixes) == 0 {
+		return nil, fmt.Errorf("merge script returned no IPv4 prefixes")
+	}
+	return normalizePrefixes(prefixes), nil
+}
+
 func (p *ASNTunPlugin) fetchPrefixesBGpq3(ctx context.Context) ([]netip.Prefix, error) {
+	fetchScript, fetchDownloaded, err := helperscript.Resolve(ctx, p.configDir, p.args.FetchScript, defaultFetchScript)
+	if err != nil {
+		return nil, err
+	}
+	if fetchDownloaded && p.BP != nil {
+		p.L().Info("asn_tun: downloaded helper script",
+			zap.String("script", defaultFetchScript), zap.String("path", fetchScript))
+	}
+
 	asnFile, err := os.CreateTemp("", "asn_tun-asn-*.txt")
 	if err != nil {
 		return nil, err
@@ -55,11 +95,11 @@ func (p *ASNTunPlugin) fetchPrefixesBGpq3(ctx context.Context) ([]netip.Prefix, 
 	}
 	defer os.Remove(prefixPath)
 
-	fetch := exec.CommandContext(ctx, p.args.Python, p.args.FetchScript,
+	fetch := exec.CommandContext(ctx, p.args.Python, fetchScript,
 		asnPath, prefixPath, "--ipv4-only", "-w", "4", "-d", "0")
 	out, err := fetch.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("fetch script %s: %w: %s", p.args.FetchScript, err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("fetch script %s: %w: %s", fetchScript, err, strings.TrimSpace(string(out)))
 	}
 	data, err := os.ReadFile(prefixPath)
 	if err != nil {
@@ -68,30 +108,14 @@ func (p *ASNTunPlugin) fetchPrefixesBGpq3(ctx context.Context) ([]netip.Prefix, 
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil, fmt.Errorf("fetch script returned no IPv4 prefixes")
 	}
-
-	merge := exec.CommandContext(ctx, p.args.Python, p.args.MergeScript, "--ipv4-only")
-	merge.Stdin = bytes.NewReader(data)
-	var stderr bytes.Buffer
-	merge.Stderr = &stderr
-	merged, err := merge.Output()
-	if err != nil {
-		return nil, fmt.Errorf("merge script %s: %w: %s", p.args.MergeScript, err, strings.TrimSpace(stderr.String()))
-	}
-	prefixes, err := parsePrefixLines(string(merged))
-	if err != nil {
-		return nil, err
-	}
-	if len(prefixes) == 0 {
-		return nil, fmt.Errorf("merge script returned no IPv4 prefixes")
-	}
-	return prefixes, nil
+	return p.mergePrefixData(ctx, data)
 }
 
-func fetchPrefixes(ctx context.Context, asns []uint32) ([]netip.Prefix, error) {
+func (p *ASNTunPlugin) fetchPrefixesIPVerse(ctx context.Context) ([]netip.Prefix, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	seen := make(map[string]struct{})
 	var out []netip.Prefix
-	for _, asn := range asns {
+	for _, asn := range p.asns {
 		url := fmt.Sprintf(prefixURLBase, asn)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -122,8 +146,12 @@ func fetchPrefixes(ctx context.Context, asns []uint32) ([]netip.Prefix, error) {
 			out = append(out, prefix)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	return out, nil
+	var body strings.Builder
+	for _, prefix := range out {
+		body.WriteString(prefix.String())
+		body.WriteByte('\n')
+	}
+	return p.mergePrefixData(ctx, []byte(body.String()))
 }
 
 func parsePrefixLines(body string) ([]netip.Prefix, error) {
@@ -193,8 +221,7 @@ func readPrefixCache(path string, asns []uint32) ([]netip.Prefix, error) {
 	if len(out) == 0 {
 		return nil, fmt.Errorf("cache contains no IPv4 prefixes")
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	return out, nil
+	return normalizePrefixes(out), nil
 }
 
 func writePrefixCache(path string, asns []uint32, prefixes []netip.Prefix) error {
@@ -210,6 +237,40 @@ func writePrefixCache(path string, asns []uint32, prefixes []netip.Prefix) error
 		return err
 	}
 	return os.WriteFile(path, data, 0o600)
+}
+
+// normalizePrefixes drops exact duplicates and contained sub-prefixes. nft's
+// interval sets reject overlapping intervals, and ASN feeds legitimately
+// contain both a /22 and one of its /23s.
+func normalizePrefixes(in []netip.Prefix) []netip.Prefix {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]netip.Prefix, 0, len(in))
+	for _, p := range in {
+		if !p.IsValid() || !p.Addr().Is4() {
+			continue
+		}
+		p = p.Masked()
+		if p.Bits() < 8 {
+			continue
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if c := out[i].Addr().Compare(out[j].Addr()); c != 0 {
+			return c < 0
+		}
+		return out[i].Bits() < out[j].Bits()
+	})
+	merged := out[:0]
+	for _, p := range out {
+		if len(merged) > 0 && merged[len(merged)-1].Contains(p.Addr()) {
+			continue
+		}
+		merged = append(merged, p)
+	}
+	return merged
 }
 
 func prefixesEqual(a, b []netip.Prefix) bool {

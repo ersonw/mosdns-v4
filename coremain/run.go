@@ -158,6 +158,7 @@ func startServer(sf *serverFlags, handleSignals bool) error {
 	}
 
 	cfgPath := v.ConfigFileUsed()
+	cfg.configDir = filepath.Dir(cfgPath)
 	if err := mergeInclude(cfg, 0, []string{cfgPath}, []string{tryGetAbsPath(cfgPath)}); err != nil {
 		return fmt.Errorf("failed to load sub config file, %w", err)
 	}

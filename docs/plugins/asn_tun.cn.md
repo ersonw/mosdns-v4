@@ -41,13 +41,14 @@ ASN 列表
 | `source` | `ipverse` | 前缀来源。`ipverse` 从 GitHub 拉取；`bgpq3` 调用本地 `fetch_script` 和 `merge_script`。 |
 | `refresh` | `12h` | 周期性刷新间隔；`0` 表示关闭周期刷新，但启动时仍会异步刷新一次。 |
 | `cache` | `/config/mosdns/asn_tun_prefixes.json` | 最近一次成功合并后的前缀列表。启动时同步读取并立即建立 nft 集合；异步刷新失败时继续使用缓存。 |
-| `fetch_script` | `/etc/mosdns/bgpq3_fetch_asn.py` | `source: bgpq3` 时使用的 ASN 前缀抓取脚本。 |
-| `merge_script` | `/etc/mosdns/cidr_merge.py` | 抓取全部 ASN 后使用的 CIDR 聚合脚本。 |
+| `fetch_script` | `<配置目录>/scripts/bgpq3_fetch_asn.py` | `source: bgpq3` 时使用的 ASN 前缀抓取脚本；缺失时自动从仓库 raw 链接下载。 |
+| `merge_script` | `<配置目录>/scripts/cidr_merge.py` | 抓取全部 ASN 后使用的 CIDR 聚合脚本；缺失时自动下载。 |
 | `python` | `python3` | 执行上述脚本的解释器。 |
 
-仓库中的两个脚本位于 `etc/mosdns/scripts/`；部署时请把 `fetch_script` 和
-`merge_script` 指向目标机上的实际路径。脚本本身不需要可执行位，插件通过
-`python` 指定的解释器调用。
+相对路径按配置文件所在目录解析。脚本缺失时会从
+`https://raw.githubusercontent.com/ersonw/mosdns-v4/refs/heads/main/etc/mosdns/scripts/`
+下载到 `<配置目录>/scripts/`。脚本本身不需要可执行位，插件通过 `python`
+指定的解释器调用。
 | `tun_dev` | `asn0` | TUN 设备名，最长 15 个字符。 |
 | `tun_addr` | `192.0.2.1/32` | 设备本机 IPv4 地址。它不是客户端可见的虚拟 IP，也不会出现在 DNS 应答中。 |
 | `tun_mtu` | `0` | `0` 表示自动：无代理 1500，有代理 1400；范围 576..1500。 |
@@ -106,8 +107,8 @@ plugins:
       source: bgpq3
       refresh: 12h
       cache: /config/mosdns/asn_tun_prefixes.json
-      fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
-      merge_script: /etc/mosdns/cidr_merge.py
+      fetch_script: scripts/bgpq3_fetch_asn.py
+      merge_script: scripts/cidr_merge.py
       python: python3
 
       tun_dev: asn0

@@ -19,11 +19,17 @@ func (p *ASNTunPlugin) setupTun(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	created := false
 	if _, err := p.runner.Run(ctx, "ip", "link", "show", "dev", dev); err != nil {
 		if _, err := p.runner.Run(ctx, "ip", "tuntap", "add", "dev", dev, "mode", "tun"); err != nil {
 			return fmt.Errorf("create tun %q: %w", dev, err)
 		}
+		created = true
 	}
+	// Record the device before opening it: openTunDevice or a later setup step
+	// may fail, and Close still needs to remove the link this call created.
+	p.tunDev = dev
+	p.tunCreated = created
 	f, err := openTunDevice(dev)
 	if err != nil {
 		return err
@@ -73,6 +79,20 @@ func (p *ASNTunPlugin) chooseTunName(ctx context.Context) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no free asn tun name")
+}
+
+func (p *ASNTunPlugin) cleanupTun(ctx context.Context) {
+	if !p.tunCreated || p.tunDev == "" {
+		return
+	}
+	if _, err := p.runner.Run(ctx, "ip", "link", "show", "dev", p.tunDev); err != nil {
+		return
+	}
+	if _, err := p.runner.Run(ctx, "ip", "link", "del", "dev", p.tunDev); err != nil {
+		p.L().Debug("asn_tun: deleting tun link failed", zap.String("dev", p.tunDev), zap.Error(err))
+		return
+	}
+	p.L().Info("asn_tun: tun link removed", zap.String("dev", p.tunDev))
 }
 
 func parseLinkNames(out string) map[string]bool {

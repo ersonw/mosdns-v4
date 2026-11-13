@@ -204,8 +204,8 @@ plugins:
       source: bgpq3               # ipverse or bgpq3 (bgpq3 uses fetch_script + merge_script)
       refresh: 0                  # 0 = no periodic refresh; startup still refreshes async
       cache: etc/mosdns/asn_tun_prefixes.json
-      fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
-      merge_script: /etc/mosdns/cidr_merge.py
+      fetch_script: scripts/bgpq3_fetch_asn.py
+      merge_script: scripts/cidr_merge.py
       python: python3
       tun_dev: asn0               # at most 15 characters
       tun_addr: 192.0.2.1/32      # device endpoint, never a client fake IP
@@ -475,8 +475,11 @@ plugins:
         # must keep the same argv contract:
         #   domain_manage.py: add|del [-a] [file_path] domain...
         #   txt2dat.py: <input_txt> <output_dat> <category> [--overwrite]
-        domain_manage_script: /etc/mosdns/domain_manage.py
-        txt2dat_script: /etc/mosdns/txt2dat.py
+        # Relative paths are resolved against the config directory. Empty
+        # defaults to <config dir>/scripts/<name>; a missing script is
+        # downloaded there at bot startup.
+        domain_manage_script: scripts/domain_manage.py
+        txt2dat_script: scripts/txt2dat.py
         domain_python: python3
         domain_timeout: 30
         audit_log: etc/mosdns/audit_log.log
@@ -749,10 +752,11 @@ servers:
 #           loaded synchronously at startup, so the TUN/nft path is ready
 #           immediately; a slow or failed fetch keeps using this cache.
 #           Default: /config/mosdns/asn_tun_prefixes.json
-#   fetch_script - bgpq3 fetch script used when source is "bgpq3".
-#                  Default: /etc/mosdns/bgpq3_fetch_asn.py
-#   merge_script - CIDR merge script used after all ASNs are fetched.
-#                  Default: /etc/mosdns/cidr_merge.py
+#   fetch_script - bgpq3 fetch script used when source is "bgpq3". Empty
+#                  defaults to <config dir>/scripts/bgpq3_fetch_asn.py. A
+#                  missing script is downloaded into that directory.
+#   merge_script - CIDR merge script run after all ASNs are fetched. Empty
+#                  defaults to <config dir>/scripts/cidr_merge.py.
 #   python - interpreter used to run the scripts. Default: python3
 #   tun_dev - TUN device name, at most 15 characters. Default: asn0
 #   tun_addr - local IPv4 /32 endpoint of the TUN device. It is not a client
@@ -815,8 +819,8 @@ servers:
 #       source: bgpq3
 #       refresh: 12h
 #       cache: /config/mosdns/asn_tun_prefixes.json
-#       fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
-#       merge_script: /etc/mosdns/cidr_merge.py
+#       fetch_script: scripts/bgpq3_fetch_asn.py
+#       merge_script: scripts/cidr_merge.py
 #       python: python3
 #       tun_dev: asn0
 #       tun_addr: 192.0.2.1/32

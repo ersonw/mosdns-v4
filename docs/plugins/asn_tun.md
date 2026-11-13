@@ -46,14 +46,15 @@ marking after the first async refresh completes.
 | `source` | `ipverse` | Prefix provider. `ipverse` fetches from GitHub; `bgpq3` runs local `fetch_script` and `merge_script`. |
 | `refresh` | `12h` | Periodic refresh interval; `0` disables the ticker, but one async refresh still runs at startup. |
 | `cache` | `/config/mosdns/asn_tun_prefixes.json` | Last successfully merged prefix list. It is loaded synchronously at startup to build the nft set; failed async refreshes keep using it. |
-| `fetch_script` | `/etc/mosdns/bgpq3_fetch_asn.py` | ASN prefix fetch script used when `source: bgpq3`. |
-| `merge_script` | `/etc/mosdns/cidr_merge.py` | CIDR merge script run after all ASNs are fetched. |
+| `fetch_script` | `<config dir>/scripts/bgpq3_fetch_asn.py` | ASN prefix fetch script used when `source: bgpq3`; downloaded automatically when missing. |
+| `merge_script` | `<config dir>/scripts/cidr_merge.py` | CIDR merge script run after all ASNs are fetched; downloaded automatically when missing. |
 | `python` | `python3` | Interpreter used for the scripts. |
 
-The two scripts are kept under `etc/mosdns/scripts/` in this repository; point
-`fetch_script` and `merge_script` at their real paths on the target host. They
-do not need an executable bit because the plugin runs them through the
-configured `python` interpreter.
+Relative paths are resolved against the directory of the config file. A missing
+script is downloaded from
+`https://raw.githubusercontent.com/ersonw/mosdns-v4/refs/heads/main/etc/mosdns/scripts/`
+into `<config dir>/scripts/`. They do not need an executable bit because the
+plugin runs them through the configured `python` interpreter.
 | `tun_dev` | `asn0` | TUN device name, at most 15 characters. |
 | `tun_addr` | `192.0.2.1/32` | Device-local IPv4 address. It is not a client-facing virtual IP and is never returned by DNS. |
 | `tun_mtu` | `0` | `0`: 1500 direct, 1400 proxy. Range 576..1500. |
@@ -120,8 +121,8 @@ plugins:
       source: bgpq3
       refresh: 12h
       cache: /config/mosdns/asn_tun_prefixes.json
-      fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
-      merge_script: /etc/mosdns/cidr_merge.py
+      fetch_script: scripts/bgpq3_fetch_asn.py
+      merge_script: scripts/cidr_merge.py
       python: python3
 
       tun_dev: asn0

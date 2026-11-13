@@ -263,8 +263,10 @@ func TestNewPluginAcceptsBGpq3Source(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.args.Source != "bgpq3" || p.args.FetchScript != defaultFetchScript ||
-		p.args.MergeScript != defaultMergeScript || p.args.Python != defaultPython {
+	if p.args.Source != "bgpq3" ||
+		filepath.Base(p.args.FetchScript) != defaultFetchScript ||
+		filepath.Base(p.args.MergeScript) != defaultMergeScript ||
+		p.args.Python != defaultPython {
 		t.Fatalf("bgpq3 defaults: source=%q fetch=%q merge=%q python=%q",
 			p.args.Source, p.args.FetchScript, p.args.MergeScript, p.args.Python)
 	}
@@ -282,6 +284,25 @@ func TestNewPluginRejectsMainRouteTable(t *testing.T) {
 	}
 }
 
+func TestNormalizePrefixesRemovesOverlaps(t *testing.T) {
+	in := []netip.Prefix{
+		netip.MustParsePrefix("91.108.56.0/23"),
+		netip.MustParsePrefix("149.154.168.0/22"),
+		netip.MustParsePrefix("91.108.56.0/22"),
+		netip.MustParsePrefix("91.108.56.0/22"),
+		netip.MustParsePrefix("91.108.4.0/22"),
+	}
+	out := normalizePrefixes(in)
+	want := []netip.Prefix{
+		netip.MustParsePrefix("91.108.4.0/22"),
+		netip.MustParsePrefix("91.108.56.0/22"),
+		netip.MustParsePrefix("149.154.168.0/22"),
+	}
+	if !prefixesEqual(out, want) {
+		t.Fatalf("normalized = %v, want %v", out, want)
+	}
+}
+
 func TestPolicyRuleUsesDistinctMarks(t *testing.T) {
 	p := &ASNTunPlugin{mark: 123, routeTable: "123", egressMark: 124, egressTable: "124", rulePrio: 1000}
 	if got := strings.Join(p.ingressRuleArgs("add"), " "); got != "rule add fwmark 123 lookup 123 prio 1000" {
@@ -289,5 +310,57 @@ func TestPolicyRuleUsesDistinctMarks(t *testing.T) {
 	}
 	if got := strings.Join(p.egressRuleArgs("add"), " "); got != "rule add fwmark 124 lookup 124 prio 1001" {
 		t.Fatalf("egress rule = %q", got)
+	}
+}
+
+type recordingRunner struct {
+	calls []string
+}
+
+func (r *recordingRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	r.calls = append(r.calls, strings.Join(append([]string{name}, args...), " "))
+	return "", nil
+}
+
+func TestCloseCleansRoutesAndNft(t *testing.T) {
+	bp := coremain.NewBP("asn", PluginType, zap.NewNop(), nil)
+	runner := new(recordingRunner)
+	p := &ASNTunPlugin{
+		BP:            bp,
+		runner:        runner,
+		args:          Args{NftTable: "asn_tun"},
+		mark:          123,
+		routeTable:    "123",
+		egressMark:    124,
+		egressTable:   "124",
+		rulePrio:      1000,
+		nftInstalled:  true,
+		routesStarted: true,
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"ip rule del fwmark 123 lookup 123 prio 1000",
+		"ip rule del fwmark 124 lookup 124 prio 1001",
+		"ip route del default table 123",
+		"ip route del default table 124",
+		"nft delete table inet asn_tun",
+	}
+	if len(runner.calls) != len(want) {
+		t.Fatalf("calls = %v", runner.calls)
+	}
+	for i := range want {
+		if runner.calls[i] != want[i] {
+			t.Fatalf("call %d = %q, want %q", i, runner.calls[i], want[i])
+		}
+	}
+
+	// Close is idempotent and must not repeat system changes.
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.calls) != len(want) {
+		t.Fatalf("second Close issued more calls: %v", runner.calls)
 	}
 }

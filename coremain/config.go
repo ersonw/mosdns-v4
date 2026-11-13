@@ -35,6 +35,15 @@ type Config struct {
 
 	// Experimental
 	Security SecurityConfig `yaml:"security"`
+
+	// configDir is the directory of the loaded main config file. It is filled
+	// by startServer after config loading and is not part of the YAML schema.
+	configDir string
+}
+
+// ConfigDir returns the directory of the loaded main config file.
+func (c *Config) ConfigDir() string {
+	return c.configDir
 }
 
 // PluginConfig represents a plugin config
@@ -75,8 +84,8 @@ type ServerListenerConfig struct {
 	URLPath             string `yaml:"url_path"`                // used by doh, http. If it's empty, any path will be handled.
 	GetUserIPFromHeader string `yaml:"get_user_ip_from_header"` // used by doh, http.
 	ProxyProtocol       bool   `yaml:"proxy_protocol"`          // accepting the PROXYProtocol
-    Unix                bool
-	IdleTimeout uint `yaml:"idle_timeout"` // (sec) used by tcp, dot, doh as connection idle timeout.
+	Unix                bool
+	IdleTimeout         uint `yaml:"idle_timeout"` // (sec) used by tcp, dot, doh as connection idle timeout.
 }
 
 type APIConfig struct {

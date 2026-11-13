@@ -26,6 +26,7 @@ package telegram_bot
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,7 @@ import (
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	fakeipadmin "github.com/ersonw/mosdns-v4/pkg/fakeip_admin"
+	"github.com/ersonw/mosdns-v4/pkg/helperscript"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"github.com/ersonw/mosdns-v4/plugin/executable/radius"
@@ -86,11 +88,12 @@ type Args struct {
 	ConfigPath string `yaml:"config_path"`
 	// DomainManageScript edits a plain-text domain provider. It must accept
 	// "add|del [file_path] domain..." (and "clear" is not used here).
-	// Default: /etc/mosdns/domain_manage.py.
+	// Default: <config dir>/scripts/domain_manage.py; a missing script is
+	// downloaded there from the project's raw GitHub mirror.
 	DomainManageScript string `yaml:"domain_manage_script"`
 	// Txt2DatScript regenerates a v2dat geosite file. It must accept
 	// "<input_txt> <output_dat> <category> [--overwrite]".
-	// Default: /etc/mosdns/txt2dat.py.
+	// Default: <config dir>/scripts/txt2dat.py; a missing script is downloaded.
 	Txt2DatScript string `yaml:"txt2dat_script"`
 	// DomainPython runs *.py domain scripts. Default "python3". A non-.py
 	// script is executed directly, so a custom helper can use its own shebang.
@@ -134,13 +137,7 @@ func (a *Args) initDefault() error {
 	}
 	a.ConfigPath = strings.TrimSpace(a.ConfigPath)
 	a.DomainManageScript = strings.TrimSpace(a.DomainManageScript)
-	if a.DomainManageScript == "" {
-		a.DomainManageScript = "/etc/mosdns/domain_manage.py"
-	}
 	a.Txt2DatScript = strings.TrimSpace(a.Txt2DatScript)
-	if a.Txt2DatScript == "" {
-		a.Txt2DatScript = "/etc/mosdns/txt2dat.py"
-	}
 	a.DomainPython = strings.TrimSpace(a.DomainPython)
 	if a.DomainPython == "" {
 		a.DomainPython = "python3"
@@ -316,6 +313,26 @@ func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		bp.L().Info("telegram bot disabled, token or chat_ids is empty")
 		return p, nil
 	}
+
+	configDir := filepath.Dir(p.configPath())
+	scriptCtx, scriptCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer scriptCancel()
+	resolve := func(name, configured string) string {
+		path := helperscript.ConfiguredPath(configDir, configured, name)
+		resolved, downloaded, err := helperscript.Resolve(scriptCtx, configDir, configured, name)
+		if err != nil {
+			p.L().Warn("telegram bot: resolving helper script failed",
+				zap.String("script", name), zap.String("path", path), zap.Error(err))
+			return path
+		}
+		if downloaded {
+			p.L().Info("telegram bot: downloaded helper script",
+				zap.String("script", name), zap.String("path", resolved))
+		}
+		return resolved
+	}
+	args.DomainManageScript = resolve("domain_manage.py", args.DomainManageScript)
+	args.Txt2DatScript = resolve("txt2dat.py", args.Txt2DatScript)
 
 	access, aerr := buildAccess(args)
 	if aerr != nil {

@@ -95,8 +95,8 @@ argument, for example `/fip <tag> stats`.
     ocserv_tags: ["ocserv_user"]
     radius_tags: ["radius"]
     config_path: etc/mosdns/config.yaml
-    domain_manage_script: /etc/mosdns/domain_manage.py
-    txt2dat_script: /etc/mosdns/txt2dat.py
+    domain_manage_script: scripts/domain_manage.py
+    txt2dat_script: scripts/txt2dat.py
     domain_python: python3
     domain_timeout: 30
     audit_log: ""
@@ -105,3 +105,10 @@ argument, for example `/fip <tag> stats`.
     poll_timeout: 30
     timezone: Asia/Shanghai
 ```
+
+Relative paths for `domain_manage_script` and `txt2dat_script` are resolved
+against the config file directory. When omitted they default to
+`<config dir>/scripts/domain_manage.py` and `<config dir>/scripts/txt2dat.py`.
+A missing script is downloaded from the repository's
+`.../etc/mosdns/scripts/` raw URL during bot startup; a failed download only
+logs a warning and does not block the bot.

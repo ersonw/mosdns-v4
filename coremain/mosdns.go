@@ -43,6 +43,10 @@ import (
 type Mosdns struct {
 	logger *zap.Logger
 
+	// configDir is the directory of the main config file; plugins use it to
+	// resolve relative assets such as helper scripts.
+	configDir string
+
 	// Data
 	dataManager *data_provider.DataManager
 
@@ -138,6 +142,7 @@ func RunMosdns(cfg *Config) error {
 
 	m := &Mosdns{
 		logger:      lg,
+		configDir:   cfg.configDir,
 		dataManager: data_provider.NewDataManager(),
 		execs:       make(map[string]executable_seq.Executable),
 		matchers:    make(map[string]executable_seq.Matcher),
@@ -289,6 +294,15 @@ func (m *Mosdns) addPlugin(p Plugin) {
 
 func (m *Mosdns) GetDataManager() *data_provider.DataManager {
 	return m.dataManager
+}
+
+// ConfigDir returns the directory of the main config file, or an empty string
+// when the instance was built without one (for example in tests).
+func (m *Mosdns) ConfigDir() string {
+	if m == nil {
+		return ""
+	}
+	return m.configDir
 }
 
 func (m *Mosdns) GetSafeClose() *safe_close.SafeClose {

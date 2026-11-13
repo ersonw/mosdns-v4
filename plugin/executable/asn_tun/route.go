@@ -64,7 +64,11 @@ func (p *ASNTunPlugin) installRoutes(ctx context.Context) error {
 }
 
 func (p *ASNTunPlugin) cleanupRoutes(ctx context.Context) {
-	_ = p.removeRoutes(ctx)
+	if err := p.removeRoutes(ctx); err != nil {
+		// Missing rules/routes are expected when a previous run only installed
+		// part of the policy. Keep the best-effort delete but leave a trace.
+		p.L().Debug("asn_tun: route cleanup incomplete", zap.Error(err))
+	}
 }
 
 func (p *ASNTunPlugin) removeRoutes(ctx context.Context) error {
