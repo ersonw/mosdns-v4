@@ -12,3 +12,5 @@ func (p *ASNTunPlugin) setupTun(context.Context) error {
 }
 
 func (p *ASNTunPlugin) cleanupTun(context.Context) {}
+
+func (p *ASNTunPlugin) deleteTunLink(context.Context) {}

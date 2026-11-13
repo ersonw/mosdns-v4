@@ -31,9 +31,11 @@ type prefixCache struct {
 }
 
 func (p *ASNTunPlugin) mergePrefixData(ctx context.Context, data []byte) ([]netip.Prefix, error) {
-	mergeScript, mergeDownloaded, err := helperscript.Resolve(ctx, p.configDir, p.args.MergeScript, defaultMergeScript)
-	if err != nil {
-		return nil, err
+	mergeScript, mergeDownloaded, resolveErr := helperscript.Resolve(ctx, p.configDir, p.args.MergeScript, defaultMergeScript)
+	if resolveErr != nil {
+		p.L().Warn("asn_tun: merge script unavailable, using built-in prefix aggregation",
+			zap.Error(resolveErr))
+		return p.parseAndAggregate(data, "merge script unavailable")
 	}
 	if mergeDownloaded && p.BP != nil {
 		p.L().Info("asn_tun: downloaded helper script",
@@ -46,16 +48,38 @@ func (p *ASNTunPlugin) mergePrefixData(ctx context.Context, data []byte) ([]neti
 	merge.Stderr = &stderr
 	merged, err := merge.Output()
 	if err != nil {
-		return nil, fmt.Errorf("merge script %s: %w: %s", mergeScript, err, strings.TrimSpace(stderr.String()))
+		p.L().Warn("asn_tun: merge script failed, using built-in prefix aggregation",
+			zap.String("script", mergeScript),
+			zap.String("stderr", strings.TrimSpace(stderr.String())),
+			zap.Error(err))
+		return p.parseAndAggregate(data, "merge script failed")
 	}
 	prefixes, err := parsePrefixLines(string(merged))
 	if err != nil {
 		return nil, err
 	}
 	if len(prefixes) == 0 {
-		return nil, fmt.Errorf("merge script returned no IPv4 prefixes")
+		p.L().Warn("asn_tun: merge script returned no prefixes, using built-in aggregation",
+			zap.String("script", mergeScript))
+		return p.parseAndAggregate(data, "merge script returned no prefixes")
 	}
 	return normalizePrefixes(prefixes), nil
+}
+
+// parseAndAggregate is the fallback when cidr_merge.py cannot be resolved
+// (for example, a missing raw download). normalizePrefixes removes contained
+// sub-prefixes, which is what nft's interval set needs to avoid
+// "conflicting intervals" on feeds that announce both a /22 and its /23.
+func (p *ASNTunPlugin) parseAndAggregate(data []byte, reason string) ([]netip.Prefix, error) {
+	prefixes, err := parsePrefixLines(string(data))
+	if err != nil {
+		return nil, err
+	}
+	prefixes = normalizePrefixes(prefixes)
+	if len(prefixes) == 0 {
+		return nil, fmt.Errorf("no IPv4 prefixes after built-in aggregation (%s)", reason)
+	}
+	return prefixes, nil
 }
 
 func (p *ASNTunPlugin) fetchPrefixesBGpq3(ctx context.Context) ([]netip.Prefix, error) {

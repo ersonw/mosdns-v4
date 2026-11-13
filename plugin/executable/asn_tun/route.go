@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"go.uber.org/zap"
 )
@@ -86,6 +87,61 @@ func (p *ASNTunPlugin) removeRoutes(ctx context.Context) error {
 	}
 	if _, err := p.runner.Run(ctx, "ip", "route", "del", "default", "table", p.egressTable); err != nil && first == nil {
 		first = err
+	}
+	return first
+}
+
+func (p *ASNTunPlugin) routeTableExists(ctx context.Context, table string) bool {
+	_, err := p.runner.Run(ctx, "ip", "route", "show", "table", table)
+	return err == nil
+}
+
+// removeAllRules removes all duplicate rules with the marks/tables owned by
+// this instance. Repeated starts can leave more than one rule; a single
+// "ip rule del" would leave the rest in the packet path.
+func (p *ASNTunPlugin) removeAllRules(ctx context.Context) error {
+	var first error
+	for _, spec := range []struct {
+		mark  uint32
+		table string
+	}{
+		{p.mark, p.routeTable},
+		{p.egressMark, p.egressTable},
+	} {
+		out, err := p.runner.Run(ctx, "ip", "rule", "show")
+		if err != nil {
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		count := 0
+		markHex := fmt.Sprintf("fwmark 0x%x", spec.mark)
+		tableLookup := "lookup " + spec.table
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, markHex) && strings.Contains(line, tableLookup) {
+				count++
+			}
+		}
+		if count == 0 {
+			// Backward-compatible best effort when the rule listing is empty or
+			// the kernel formats the mark differently.
+			count = 1
+		}
+		for i := 0; i < count; i++ {
+			var args []string
+			if spec.mark == p.mark {
+				args = p.ingressRuleArgs("del")
+			} else {
+				args = p.egressRuleArgs("del")
+			}
+			if _, err := p.runner.Run(ctx, "ip", args...); err != nil {
+				if first == nil {
+					first = err
+				}
+				break
+			}
+		}
 	}
 	return first
 }

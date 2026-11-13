@@ -478,6 +478,12 @@ func (p *ASNTunPlugin) start() error {
 	}
 	p.prefixes = prefixes
 
+	// A previous process may have been killed before Close ran. Reclaim the
+	// dedicated table/rule/route/TUN before creating the new instance, otherwise
+	// a stale asn0 or rule makes every later start fail and leaves the old
+	// objects in the packet path forever.
+	p.cleanupStaleState(ctx)
+
 	if err := p.setupEgress(ctx); err != nil {
 		return err
 	}
@@ -726,10 +732,11 @@ func (p *ASNTunPlugin) Close() error {
 		if p.tunFile != nil {
 			_ = p.tunFile.Close()
 		}
-		p.wg.Wait()
 
+		// Cleanup must not depend on the workers exiting. If a TUN read or
+		// netstack writer is stuck, waiting here first would leave nft/rules/
+		// routes/TUN behind after a systemd restart or failed start.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 		if p.routesStarted {
 			p.cleanupRoutes(ctx)
 		}
@@ -742,8 +749,55 @@ func (p *ASNTunPlugin) Close() error {
 		// The link is removed after the policy routes, otherwise deleting it
 		// first would leave rules pointing at a nonexistent device.
 		p.cleanupTun(ctx)
+		cancel()
+
+		done := make(chan struct{})
+		go func() {
+			p.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			p.L().Warn("asn_tun: worker shutdown timed out after cleanup")
+		}
 	})
 	return err
+}
+
+// cleanupStaleState removes objects that a previous process may have left
+// behind. The table/rule/route names are dedicated to this plugin, so a
+// startup reclaim is safe; a pre-existing TUN is removed only when the
+// corresponding stale routing objects prove that this plugin owned it.
+func (p *ASNTunPlugin) cleanupStaleState(ctx context.Context) {
+	hadNft := p.nftTableExists(ctx, p.args.NftTable)
+	hadRoute := p.routeTableExists(ctx, p.routeTable)
+	hadEgressRoute := p.routeTableExists(ctx, p.egressTable)
+	if hadNft || hadRoute || hadEgressRoute {
+		p.L().Warn("asn_tun: reclaiming stale state from a previous process",
+			zap.String("nft_table", p.args.NftTable),
+			zap.String("route_table", p.routeTable),
+			zap.String("egress_table", p.egressTable))
+	}
+
+	if err := p.removeAllRules(ctx); err != nil {
+		p.L().Debug("asn_tun: stale rule cleanup incomplete", zap.Error(err))
+	}
+	if err := p.removeRoutes(ctx); err != nil {
+		p.L().Debug("asn_tun: stale route cleanup incomplete", zap.Error(err))
+	}
+	if hadNft {
+		if err := deleteNft(ctx, p.runner, p.args.NftTable); err != nil {
+			p.L().Debug("asn_tun: stale nft cleanup incomplete", zap.Error(err))
+		}
+	}
+	// A failed nft check never creates the throwaway table, but clean it if
+	// an older build or an interrupted apply left one behind.
+	_ = deleteNft(ctx, p.runner, p.args.NftTable+"_check")
+
+	if hadNft || hadRoute || hadEgressRoute {
+		p.deleteTunLink(ctx)
+	}
 }
 
 func uniqueAddrs(in []netip.Addr) []netip.Addr {

@@ -108,7 +108,13 @@ func joinPrefixes(prefixes []netip.Prefix) string {
 }
 
 func (p *ASNTunPlugin) installNft(ctx context.Context) error {
-	content := nftFile(p.args.NftTable, p.mark, p.prefixes, p.bypass, p.skipPrefixes, p.mirrorDev)
+	// Normalize again at the final write boundary. Cached data, a provider
+	// response, or a future caller may contain overlapping prefixes; nft
+	// interval sets reject them as "conflicting intervals".
+	prefixes := normalizePrefixes(p.prefixes)
+	skip := normalizePrefixes(p.skipPrefixes)
+	bypass := uniqueAddrs(p.bypass)
+	content := nftFile(p.args.NftTable, p.mark, prefixes, bypass, skip, p.mirrorDev)
 	f, err := os.CreateTemp("", "asn_tun-*.nft")
 	if err != nil {
 		return err
@@ -126,7 +132,7 @@ func (p *ASNTunPlugin) installNft(ctx context.Context) error {
 	// with the table that is still present during a refresh, and applying a
 	// failed check must never remove a working mark set.
 	checkPath := path + ".check"
-	checkContent := nftFile(p.args.NftTable+"_check", p.mark, p.prefixes, p.bypass, p.skipPrefixes, p.mirrorDev)
+	checkContent := nftFile(p.args.NftTable+"_check", p.mark, prefixes, bypass, skip, p.mirrorDev)
 	if err := os.WriteFile(checkPath, []byte(checkContent), 0o600); err != nil {
 		return err
 	}
@@ -137,17 +143,26 @@ func (p *ASNTunPlugin) installNft(ctx context.Context) error {
 	if err := deleteNft(ctx, p.runner, p.args.NftTable); err != nil {
 		p.L().Debug("asn_tun: removing old nft table failed", zap.String("table", p.args.NftTable), zap.Error(err))
 	}
+	// Mark the table as owned before applying it. nft -f is transactional, but
+	// an interrupted/failed apply must still be visible to Close so a later
+	// shutdown can remove whatever this process created.
+	p.nftInstalled = true
 	if _, err := p.runner.Run(ctx, "nft", "-f", path); err != nil {
 		return err
 	}
 	p.L().Info("asn_tun: nft set installed",
 		zap.String("table", p.args.NftTable),
 		zap.String("mirror_dev", p.mirrorDev),
-		zap.Int("skip_prefix_count", len(p.skipPrefixes)),
+		zap.Int("skip_prefix_count", len(skip)),
 		zap.Uint32("mark", p.mark),
-		zap.Int("prefix_count", len(p.prefixes)),
-		zap.Int("bypass_count", len(p.bypass)))
+		zap.Int("prefix_count", len(prefixes)),
+		zap.Int("bypass_count", len(bypass)))
 	return nil
+}
+
+func (p *ASNTunPlugin) nftTableExists(ctx context.Context, table string) bool {
+	_, err := p.runner.Run(ctx, "nft", "list", "table", "inet", table)
+	return err == nil
 }
 
 func deleteNft(ctx context.Context, runner cmdRunner, table string) error {

@@ -85,6 +85,13 @@ func (p *ASNTunPlugin) cleanupTun(ctx context.Context) {
 	if !p.tunCreated || p.tunDev == "" {
 		return
 	}
+	p.deleteTunLink(ctx)
+}
+
+func (p *ASNTunPlugin) deleteTunLink(ctx context.Context) {
+	if p.tunDev == "" {
+		return
+	}
 	if _, err := p.runner.Run(ctx, "ip", "link", "show", "dev", p.tunDev); err != nil {
 		return
 	}

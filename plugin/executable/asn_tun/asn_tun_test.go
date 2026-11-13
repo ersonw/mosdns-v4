@@ -303,6 +303,27 @@ func TestNormalizePrefixesRemovesOverlaps(t *testing.T) {
 	}
 }
 
+func TestNormalizePrefixesRemovesTelegramOverlaps(t *testing.T) {
+	// These are the exact overlapping interval from the remote host: one
+	// Telegram prefix is a /22 containing a /23. Adjacent /21 and /22 blocks
+	// are not overlaps and must both remain.
+	in := []netip.Prefix{
+		netip.MustParsePrefix("149.154.160.0/21"),
+		netip.MustParsePrefix("149.154.168.0/22"),
+		netip.MustParsePrefix("91.108.56.0/22"),
+		netip.MustParsePrefix("91.108.56.0/23"),
+	}
+	out := normalizePrefixes(in)
+	want := []netip.Prefix{
+		netip.MustParsePrefix("91.108.56.0/22"),
+		netip.MustParsePrefix("149.154.160.0/21"),
+		netip.MustParsePrefix("149.154.168.0/22"),
+	}
+	if !prefixesEqual(out, want) {
+		t.Fatalf("normalized = %v, want %v", out, want)
+	}
+}
+
 func TestPolicyRuleUsesDistinctMarks(t *testing.T) {
 	p := &ASNTunPlugin{mark: 123, routeTable: "123", egressMark: 124, egressTable: "124", rulePrio: 1000}
 	if got := strings.Join(p.ingressRuleArgs("add"), " "); got != "rule add fwmark 123 lookup 123 prio 1000" {
