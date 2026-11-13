@@ -219,6 +219,30 @@ func (p *FakeIPNatPlugin) domainForFakeIP(ctx context.Context, fakeIP string) (s
 	return domain, nil
 }
 
+// domainForRealIP reverses the real-ip table for the traffic watch. The
+// runtime index is checked first by the caller; this method is the SQLite
+// fallback for rows that are older than the per-domain memory window.
+func (p *FakeIPNatPlugin) domainForRealIP(ctx context.Context, realIP string) (string, error) {
+	var domain string
+	err := p.db.QueryRowContext(ctx,
+		"SELECT domain FROM "+p.ipTable+" WHERE real_ip = ? ORDER BY last_seen DESC LIMIT 1",
+		realIP).Scan(&domain)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: %s", errNoFakeIPMapping, realIP)
+	}
+	if err != nil {
+		return "", fmt.Errorf("lookup real ip %s: %w", realIP, err)
+	}
+	if p.isFakeAddrString(domain) {
+		// A poisoned row must not make the watch print an address as a domain.
+		return "", fmt.Errorf("%w: %s names a fake ip", errNoFakeIPMapping, realIP)
+	}
+	if p.runtime != nil {
+		p.runtime.putReal(domain, []string{realIP})
+	}
+	return domain, nil
+}
+
 // primaryRealIP picks the most recently observed real ip of a domain. Rows
 // inside the plugin's own range are skipped: an upstream that answered with a
 // fake address, or a row written before this guard existed, would otherwise

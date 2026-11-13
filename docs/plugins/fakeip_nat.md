@@ -192,9 +192,10 @@ candidate.
 
 `record_ttl` retention runs 5 seconds after startup and then every
 `min(record_ttl, 1h)`, with a 1-minute floor. It compares the maximum of the
-in-memory touch, the DB `last_seen` and `created_at` with the cutoff. Pending
-rows never expire. The address is returned to the pool only after the delete
-transaction commits.
+in-memory touch, the DB `last_seen` and `created_at` with the cutoff. It drops
+both the domain/fake-IP row and the matching `real_ip` rows, and the same TTL
+expires the traffic-watch domain cache. Pending rows never expire. The address
+is returned to the pool only after the delete transaction commits.
 
 With `access_log`, every fake-IP answer inserts `(client_ip, domain)` into
 `<prefix>_access` with `fake_ip`, `first_seen`, `last_seen` and `hits`. Real IPs

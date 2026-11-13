@@ -240,9 +240,39 @@ func (p *FakeIPNatPlugin) describeWatchDestination(ctx context.Context, dst, rep
 			}
 			cancel()
 		}
-	} else if p.runtime != nil {
-		domain, _ = p.runtime.domainOfReal(dst)
-		if domain != "" {
+	} else {
+		if p.runtime != nil {
+			domain, _ = p.runtime.domainOfReal(dst)
+		}
+		if domain == "" && p.watchNames != nil {
+			domain, _ = p.watchNames.lookup(dst)
+		}
+		if domain == "" && lookupDB && p.db != nil {
+			allowed := true
+			if p.watchNames != nil {
+				allowed = p.watchNames.dbLookupAllowed(dst)
+			}
+			if allowed {
+				if p.watchNames != nil {
+					p.watchNames.markDBLookup(dst)
+				}
+				lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				if d, err := p.domainForRealIP(lookupCtx, dst); err == nil {
+					domain = d
+					if p.watchNames != nil {
+						p.watchNames.remember(dst, d)
+					}
+				}
+				cancel()
+			}
+		}
+		// A real IP outside the memory and historical tables can still be
+		// named by PTR. This runs in the background and feeds the same cache,
+		// so the current message is not blocked on DNS.
+		if domain == "" {
+			p.reverseLookupWatchName(dst)
+		}
+		if domain != "" && p.runtime != nil {
 			if fake, ok := p.runtime.fakeOf(domain); ok {
 				fakeIP = fake
 			}

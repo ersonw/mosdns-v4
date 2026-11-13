@@ -171,6 +171,10 @@ func (p *FakeIPNatPlugin) readFromTun(ctx context.Context, d tunDevice, st *tunS
 				ce.Write(zap.Int("len", n), zap.String("packet", desc))
 			}
 		}
+		// DNS answers are learned even when the ownership check below drops
+		// the packet: a direct answer still tells the watch which name a real
+		// address belongs to.
+		p.observeTunDNS(buf[:n])
 		// The device is this plugin's inlet, not a general packet sink: a
 		// packet some other route pushed into it has no mapping and no outlet
 		// assignment, so it is dropped here instead of being handed to the

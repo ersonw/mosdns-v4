@@ -225,6 +225,7 @@ type FakeIPNatPlugin struct {
 	// fakeip path polls conntrack because the kernel DNAT never exposes the
 	// packets to Go. Both paths share the same per-source ring.
 	watch            *trafficWatch
+	watchNames       *watchNameCache
 	watchMu          sync.Mutex
 	watchCtx         context.Context
 	watchCancel      context.CancelFunc
@@ -459,6 +460,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	stateTable := cfg.TablePrefix + "_plugin_state"
 	accessTable := cfg.TablePrefix + "_access"
 	idxName := "idx_" + cfg.TablePrefix + "_real_ips_domain"
+	idxIPName := "idx_" + cfg.TablePrefix + "_real_ips_ip"
 
 	initSQL := fmt.Sprintf(`
 	CREATE TABLE IF NOT EXISTS %s (
@@ -485,8 +487,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL DEFAULT ''
 	);
-	CREATE INDEX IF NOT EXISTS %s ON %s(domain);`,
-		mapTable, ipTable, routesTable, stateTable, idxName, ipTable,
+	CREATE INDEX IF NOT EXISTS %s ON %s(domain);
+	CREATE INDEX IF NOT EXISTS %s ON %s(real_ip);`,
+		mapTable, ipTable, routesTable, stateTable, idxName, ipTable, idxIPName, ipTable,
 	)
 
 	if _, err := db.Exec(initSQL); err != nil {
@@ -562,6 +565,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	p.conn = newConntrack(defaultConntrackSize, defaultConntrackTTL)
 	p.runtime = newRuntimeMap()
 	p.watch = newTrafficWatch()
+	p.watchNames = newWatchNameCache(recordTTL)
 
 	// The ledger is read once here: the sweep below and every later cleanup
 	// work from this copy instead of querying SQLite again.
@@ -1060,6 +1064,7 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 			domain := strings.TrimSuffix(question.Name, ".")
 			p.L().Debug("fakeip nat: real ips collected",
 				zap.String("domain", domain), zap.Int("count", len(realIPs)), zap.Strings("real_ips", realIPs))
+			p.learnWatchRealIPs(domain, realIPs)
 			if p.realIP {
 				// Pure routing mode: the answer keeps the real IPs and the
 				// plugin only steers each of them out of the chosen gateway.

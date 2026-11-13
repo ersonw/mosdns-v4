@@ -100,8 +100,9 @@ chat 只能看到自己角色允许的命令；`/help` 只列出当前可用命�
 
 `/watch [tag] <source_ip>` 持续编辑同一条消息，显示该源 IP 最新 20 条记录：
 目的地址、域名、协议和端口。TUN 模式直接抓包，并同时轮询
-`conntrack -L -s <ip>` 作为兜底；非 TUN 的 fakeip 模式只使用该轮询。`/stop`
-停止当前 chat 的全部监听会话。
+`conntrack -L -s <ip>` 作为兜底；非 TUN 的 fakeip 模式只使用该轮询。域名反查依次
+使用运行时 fake/real 索引、DNS 应答学习到的名字、`<prefix>_real_ips`，最后异步
+PTR；学到的名字同样按 `record_ttl` 过期。`/stop` 停止当前 chat 的全部监听会话。
 
 `/reload confirm` 校验配置后以非零码退出，必须由外部 supervisor 重新拉起。
 `telegram_bot` 会为 config、proxy、sweep、provider、reload、exec、fip 动作
