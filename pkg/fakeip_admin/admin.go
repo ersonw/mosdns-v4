@@ -52,6 +52,34 @@ type AccessRecord struct {
 	Hits      int
 }
 
+// TrafficEvent is one observed flow of a watched client. The data plane fills
+// the addresses it can see; the control surface only renders them.
+type TrafficEvent struct {
+	Time            int64  // unix seconds of the last observation
+	ClientIP        string // the watched source address
+	ClientPort      uint16
+	DestinationIP   string // real address when known, otherwise the fake one
+	DestinationPort uint16
+	FakeIP          string // set when the destination was a fake address
+	Domain          string // reverse mapping of FakeIP, when known
+	Protocol        string // "tcp", "udp" or "icmp"
+	Packets         int64  // packets seen on the tun path; 0 for conntrack polls
+}
+
+// WatchAdmin is the optional traffic-watch capability of a fakeip plugin. It is
+// a separate interface so a control surface that only lists mappings does not
+// need it, and a stub implementing Admin keeps compiling unchanged.
+type WatchAdmin interface {
+	// AdminWatchStart begins observing one source address. Repeated starts of
+	// the same address share one capture and are reference counted.
+	AdminWatchStart(ctx context.Context, sourceIP string) error
+	// AdminWatchSnapshot returns the newest flows and a version that changes
+	// whenever this source's record set changed.
+	AdminWatchSnapshot(ctx context.Context, sourceIP string, limit int) ([]TrafficEvent, uint64, error)
+	// AdminWatchStop releases one reference; capture stops with the last one.
+	AdminWatchStop(ctx context.Context, sourceIP string) error
+}
+
 // Admin is implemented by fakeip_nat. A control surface resolves a plugin by
 // tag, type-asserts it to Admin, and never needs to know the concrete type.
 type Admin interface {

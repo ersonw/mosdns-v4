@@ -221,6 +221,16 @@ type FakeIPNatPlugin struct {
 	runner   cmdRunner
 	probe    func(ctx context.Context, ip string) bool
 
+	// Traffic watch: the tun reader feeds trafficWatch directly; the non-tun
+	// fakeip path polls conntrack because the kernel DNAT never exposes the
+	// packets to Go. Both paths share the same per-source ring.
+	watch            *trafficWatch
+	watchMu          sync.Mutex
+	watchCtx         context.Context
+	watchCancel      context.CancelFunc
+	conntrackCancels map[string]context.CancelFunc
+	watchWG          sync.WaitGroup
+
 	// TUN data path: the whole ipv4_range is routed to a device requested from
 	// the system instead of being DNAT-ed hop by hop.
 	useTun bool
@@ -551,6 +561,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	p.egress = &directEgress{}
 	p.conn = newConntrack(defaultConntrackSize, defaultConntrackTTL)
 	p.runtime = newRuntimeMap()
+	p.watch = newTrafficWatch()
 
 	// The ledger is read once here: the sweep below and every later cleanup
 	// work from this copy instead of querying SQLite again.
@@ -973,6 +984,7 @@ func (p *FakeIPNatPlugin) Close() error {
 	p.stopRecordRetention()
 	p.stopTunDataPath()
 	p.stopTunEgress()
+	p.stopTrafficWatch()
 	if p.db != nil {
 		if err := p.db.Close(); err != nil {
 			p.L().Warn("fakeip nat: close sqlite failed", zap.String("db_path", p.dbPath), zap.Error(err))

@@ -213,6 +213,16 @@ func pickTag(tags []string, args []string) (string, []string) {
 // manageable.
 type mappingAdmin = fakeipadmin.Admin
 
+// watchAdmin is the optional live traffic capability of a fakeip plugin.
+type watchAdmin = fakeipadmin.WatchAdmin
+
+// telegramSender is the small part of the Telegram client the watch uses. A
+// test can substitute it without a live bot token.
+type telegramSender interface {
+	SendMessage(ctx context.Context, params *tgbot.SendMessageParams) (*models.Message, error)
+	EditMessageText(ctx context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error)
+}
+
 // ocservAdmin is the slice of ocserv_ctl this bot is allowed to use.
 type ocservAdmin interface {
 	AdminExec(ctx context.Context, argv []string) (string, error)
@@ -248,8 +258,9 @@ type execScriptAdmin interface {
 
 type telegramBot struct {
 	*coremain.BP
-	args *Args
-	tb   *tgbot.Bot
+	args   *Args
+	tb     *tgbot.Bot
+	sender telegramSender
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -261,6 +272,11 @@ type telegramBot struct {
 	admin      mappingAdmin
 	adminCache map[string]mappingAdmin
 	plane      planeAdmin // set by tests; production resolves by tag
+
+	watchMu       sync.Mutex
+	watchTest     watchAdmin // set by tests; production resolves by tag
+	watchCache    map[string]watchAdmin
+	watchSessions map[int64]map[*watchSession]struct{}
 
 	ocservMu    sync.Mutex
 	ocserv      ocservAdmin
@@ -286,13 +302,15 @@ func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		return nil, err
 	}
 	p := &telegramBot{
-		BP:          bp,
-		args:        args,
-		startedAt:   time.Now(),
-		adminCache:  make(map[string]mappingAdmin),
-		ocservCache: make(map[string]ocservAdmin),
-		radiusCache: make(map[string]radius.Admin),
-		loc:         args.loc,
+		BP:            bp,
+		args:          args,
+		startedAt:     time.Now(),
+		adminCache:    make(map[string]mappingAdmin),
+		ocservCache:   make(map[string]ocservAdmin),
+		radiusCache:   make(map[string]radius.Admin),
+		watchCache:    make(map[string]watchAdmin),
+		watchSessions: make(map[int64]map[*watchSession]struct{}),
+		loc:           args.loc,
 	}
 	if !args.enabled() {
 		bp.L().Info("telegram bot disabled, token or chat_ids is empty")
@@ -326,6 +344,7 @@ func newTelegramBot(bp *coremain.BP, args *Args) (coremain.Plugin, error) {
 		return nil, fmt.Errorf("init telegram bot: %w", err)
 	}
 	p.tb = tb
+	p.sender = tb
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
 	bp.L().Info("telegram bot started",
@@ -355,6 +374,7 @@ func (p *telegramBot) Close() error {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	p.closeWatches()
 	p.wg.Wait()
 	return nil
 }
@@ -459,6 +479,10 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string,
 		return p.handleConfig(fields[1:], l)
 	case "/provider":
 		return p.handleProvider(ctx, fields[1:], l)
+	case "/watch":
+		return p.handleWatch(ctx, chatID, fields[1:], l)
+	case "/stop":
+		return p.handleStop(ctx, chatID, l)
 	case "/reload":
 		return p.handleReload(fields[1:], l)
 	case "/exec":
@@ -953,6 +977,10 @@ var helpGroups = []helpGroup{
 		{"/access <user> [days]        export that user's visit records as xlsx (default 7 days)", PermAccess},
 		{"/access <ip> [days]          export one client address directly", PermAccess},
 	}},
+	{title: "traffic watch", items: []helpItem{
+		{"/watch [tag] <source_ip>     live newest 20 flows of one source", PermWatch},
+		{"/stop                        stop every watch of this chat", PermWatch},
+	}},
 	{title: "data plane", items: []helpItem{
 		{"/net [tag]                   data plane: device, proxy, mark, rules, routes", PermStatus},
 		{"/ledger [tag]                recorded objects a later run would clean", PermStatus},
@@ -1137,6 +1165,10 @@ var helpGroupsZH = []helpGroup{
 	{title: "访问记录", items: []helpItem{
 		{"/access <user> [days]        导出该用户的访问记录为 xlsx（默认 7 天）", PermAccess},
 		{"/access <ip> [days]          直接导出某个客户端地址的记录", PermAccess},
+	}},
+	{title: "流量监听", items: []helpItem{
+		{"/watch [tag] <source_ip>     持续显示单个源 IP 的最新 20 条流量", PermWatch},
+		{"/stop                        停止本聊天的全部监听", PermWatch},
 	}},
 	{title: "数据面", items: []helpItem{
 		{"/net [tag]                   数据面：设备、代理、标记、规则、路由", PermStatus},

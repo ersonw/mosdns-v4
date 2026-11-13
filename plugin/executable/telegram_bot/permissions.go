@@ -42,6 +42,7 @@ const (
 	PermReload     = "reload"      // /reload confirm
 	PermExecScript = "exec_script" // /exec <tag> <ip> <domain>
 	PermAccess     = "access"      // /access <user> [days]: export visit records
+	PermWatch      = "watch"       // /watch and global /stop: live traffic
 
 	// PermAll is the wildcard a role may write in allow to mean "everything".
 	PermAll = "all"
@@ -51,8 +52,9 @@ const (
 // and a config role may inherit them.
 const (
 	// RoleAdmin observes: status, user management, ocserv, the access record
-	// export and data_providers domain lists. It cannot touch the config file,
-	// run scripts, reload the process or rewrite fakeip mappings.
+	// export, live traffic watch and data_providers domain lists. It cannot
+	// touch the config file, run scripts, reload the process or rewrite fakeip
+	// mappings.
 	RoleAdmin = "admin"
 	// RoleSuperAdmin inherits RoleAdmin and adds every remaining permission.
 	RoleSuperAdmin = "superadmin"
@@ -69,6 +71,7 @@ var allPermissions = []string{
 	PermReload,
 	PermExecScript,
 	PermAccess,
+	PermWatch,
 }
 
 // adminPermissions is the built-in plain administrator: see everything, manage
@@ -80,6 +83,7 @@ var adminPermissions = []string{
 	PermRadius,
 	PermAccess,
 	PermProvider,
+	PermWatch,
 }
 
 // superAdminPermissions is explicit inheritance: everything admin may do, plus
@@ -287,6 +291,8 @@ func requiredPermission(cmd string) string {
 		return PermRadius
 	case "/access":
 		return PermAccess
+	case "/watch", "/stop":
+		return PermWatch
 	case "/config", "/proxy", "/sweep":
 		return PermConfig
 	case "/provider":

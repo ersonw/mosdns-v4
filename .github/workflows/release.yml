@@ -35,9 +35,9 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # VERSION is the tag name and is what the binary reports. SLUG is the same
-      # string with slashes replaced, because a version such as dev/abc
-      # cannot appear in a file name.
+      # VERSION is the tag name and is what the binary reports. Asset names do
+      # not carry it: GitHub already scopes assets per release, and a stable
+      # name lets /releases/latest/download/<asset> follow the newest release.
       - name: resolve version
         run: |
           set -euo pipefail
@@ -51,8 +51,7 @@ jobs:
             exit 1
           fi
           echo "VERSION=${version}" >> "${GITHUB_ENV}"
-          echo "SLUG=${version//\//-}" >> "${GITHUB_ENV}"
-          echo "version ${version} (files use ${version//\//-})"
+          echo "version ${version} (binaries report it; asset names stay unversioned)"
 
       - name: vet
         run: go vet ./...
@@ -70,15 +69,16 @@ jobs:
           set -euo pipefail
           mkdir -p dist
 
-          # Binaries, renamed to carry the version so assets do not collide
-          # between releases.
+          # Keep the asset name stable across releases. The version is already
+          # stamped into the binary, and GitHub scopes assets per release, so
+          # the prefix is not needed to avoid collisions.
           for f in build/mosdns-*; do
             target="${f#build/mosdns-}"
             ext=""
             case "${target}" in
               *.exe) ext=".exe"; target="${target%.exe}" ;;
             esac
-            cp "${f}" "dist/mosdns-${SLUG}-${target}${ext}"
+            cp "${f}" "dist/mosdns-${target}${ext}"
           done
 
           # One checksum file for everything that is about to be published.

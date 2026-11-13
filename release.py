@@ -1,116 +1,141 @@
-# !/usr/bin/env python3
+#!/usr/bin/env python3
+"""Build mosdns-v4 for every supported target, or for selected targets.
+
+Usage:
+    python3 release.py
+    python3 release.py linux/amd64
+    python3 release.py linux/amd64 windows/amd64
+    python3 release.py linux-amd64
+    python3 release.py --version v4.0.2
+    python3 release.py --list
+
+With no target argument the script builds all supported targets. Target
+arguments accept either the Go form ``GOOS/GOARCH`` or the asset form
+``GOOS-GOARCH``. Build outputs are written by ``tools/crossbuild`` to
+``build/`` as ``mosdns-<target>[.exe]``; the version is injected into the
+binary and does not appear in the file name.
+"""
+
+from __future__ import annotations
+
 import argparse
-import logging
 import os
+import shlex
 import subprocess
-import zipfile
+import sys
+from pathlib import Path
 
-parser = argparse.ArgumentParser()
-parser.add_argument("-upx", action="store_true")
-parser.add_argument("-i", type=int)
-args = parser.parse_args()
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-PROJECT_NAME = 'mosdns'
-RELEASE_DIR = './release'
+# Keep this list in sync with tools/crossbuild/main.go.
+SUPPORTED_TARGETS = (
+    "darwin/arm64",
+    "darwin/amd64",
+    "linux/amd64",
+    "linux/arm64",
+    "linux/armv6",
+    "linux/armv7",
+    "linux/386",
+    "linux/ppc64le",
+    "freebsd/amd64",
+    "windows/amd64",
+)
 
-logger = logging.getLogger(__name__)
-
-# more info: https://golang.org/doc/install/source
-# [(env : value),(env : value)]
-envs = [
-    [['GOOS', 'darwin'], ['GOARCH', 'amd64']],
-    [['GOOS', 'darwin'], ['GOARCH', 'arm64']],
-    # [['GOOS', 'linux'], ['GOARCH', '386']],
-    [['GOOS', 'linux'], ['GOARCH', 'amd64']],
-
-    [['GOOS', 'linux'], ['GOARCH', 'arm'], ['GOARM', '5']],
-    [['GOOS', 'linux'], ['GOARCH', 'arm'], ['GOARM', '6']],
-    [['GOOS', 'linux'], ['GOARCH', 'arm'], ['GOARM', '7']],
-    [['GOOS', 'linux'], ['GOARCH', 'arm64']],
-
-    # [['GOOS', 'linux'], ['GOARCH', 'mips'], ['GOMIPS', 'hardfloat']],
-    # [['GOOS', 'linux'], ['GOARCH', 'mips'], ['GOMIPS', 'softfloat']],
-    # [['GOOS', 'linux'], ['GOARCH', 'mipsle'], ['GOMIPS', 'hardfloat']],
-    [['GOOS', 'linux'], ['GOARCH', 'mipsle'], ['GOMIPS', 'softfloat']],
-
-    # [['GOOS', 'linux'], ['GOARCH', 'mips64'], ['GOMIPS64', 'hardfloat']],
-    # [['GOOS', 'linux'], ['GOARCH', 'mips64'], ['GOMIPS64', 'softfloat']],
-    [['GOOS', 'linux'], ['GOARCH', 'mips64le'], ['GOMIPS64', 'hardfloat']],
-    # [['GOOS', 'linux'], ['GOARCH', 'mips64le'], ['GOMIPS64', 'softfloat']],
-
-    [['GOOS', 'linux'], ['GOARCH', 'ppc64le']],
-
-    # [['GOOS', 'freebsd'], ['GOARCH', '386']],
-    [['GOOS', 'freebsd'], ['GOARCH', 'amd64']],
-
-    # [['GOOS', 'windows'], ['GOARCH', '386']],
-    [['GOOS', 'windows'], ['GOARCH', 'amd64']],
-]
+# Accept the names used by release assets as aliases.
+ALIASES = {
+    "darwin-arm64": "darwin/arm64",
+    "darwin-amd64": "darwin/amd64",
+    "linux-amd64": "linux/amd64",
+    "linux-arm64": "linux/arm64",
+    "linux-armv6": "linux/armv6",
+    "linux-armv7": "linux/armv7",
+    "linux-386": "linux/386",
+    "linux-ppc64le": "linux/ppc64le",
+    "freebsd-amd64": "freebsd/amd64",
+    "windows-amd64": "windows/amd64",
+}
 
 
-def go_build():
-    logger.info(f'building {PROJECT_NAME}')
+def normalize_targets(values: list[str]) -> list[str]:
+    """Return validated, de-duplicated targets in the order given."""
+    if not values:
+        return []
 
-    global envs
-    if args.i:
-        envs = [envs[args.i]]
+    selected: list[str] = []
+    for value in values:
+        for raw in value.split(","):
+            name = raw.strip()
+            if not name:
+                continue
+            if name == "all":
+                return []
+            target = ALIASES.get(name, name)
+            if target not in SUPPORTED_TARGETS:
+                raise argparse.ArgumentTypeError(
+                    f"unsupported target: {name}\n"
+                    "supported targets: " + ", ".join(SUPPORTED_TARGETS)
+                )
+            if target not in selected:
+                selected.append(target)
+    return selected
 
-    VERSION = 'dev/unknown'
+
+def build_command(targets: list[str], version: str | None) -> list[str]:
+    command = ["go", "run", "./tools/crossbuild"]
+    if version:
+        command.extend(["-version", version])
+    command.extend(targets)
+    return command
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Build all supported mosdns-v4 targets, or only selected ones."
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        metavar="TARGET",
+        help="GOOS/GOARCH or GOOS-GOARCH; omit to build all supported targets",
+    )
+    parser.add_argument(
+        "-version",
+        "--version",
+        dest="version",
+        help="version to inject into main.version (default: git describe)",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print supported targets and exit",
+    )
+    args = parser.parse_args()
+
+    if args.list:
+        for target in SUPPORTED_TARGETS:
+            print(target)
+        return 0
+
     try:
-        VERSION = subprocess.check_output('git describe --tags --long --always', shell=True).decode().rstrip()
-    except subprocess.CalledProcessError as e:
-        logger.error(f'get git tag failed: {e.args}')
+        targets = normalize_targets(args.targets)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
+
+    command = build_command(targets, args.version)
+    print("running: " + " ".join(shlex.quote(part) for part in command), flush=True)
+    print(f"working directory: {PROJECT_ROOT}", flush=True)
+    if not targets:
+        print("building all supported targets", flush=True)
 
     try:
-        subprocess.check_call('go run ../ config gen config.yaml', shell=True, env=os.environ)
-    except Exception:
-        logger.exception('failed to generate config template')
-        raise
-
-    for env in envs:
-        os_env = os.environ.copy()  # new env
-
-        s = PROJECT_NAME
-        for pairs in env:
-            os_env[pairs[0]] = pairs[1]  # add env
-            s = s + '-' + pairs[1]
-        zip_filename = s + '.zip'
-
-        suffix = '.exe' if os_env['GOOS'] == 'windows' else ''
-        bin_filename = PROJECT_NAME + suffix
-
-        logger.info(f'building {zip_filename}')
-        try:
-            subprocess.check_call(
-                f'go build -ldflags "-s -w -X main.version={VERSION}" -trimpath -o {bin_filename} ../', shell=True,
-                env=os_env)
-
-            if args.upx:
-                try:
-                    subprocess.check_call(f'upx -9 -q {bin_filename}', shell=True, stderr=subprocess.DEVNULL,
-                                          stdout=subprocess.DEVNULL)
-                except subprocess.CalledProcessError as e:
-                    logger.error(f'upx failed: {e.args}')
-
-            with zipfile.ZipFile(zip_filename, mode='w', compression=zipfile.ZIP_DEFLATED,
-                                 compresslevel=5) as zf:
-                zf.write(bin_filename)
-                zf.write('../README.md', 'README.md')
-                zf.write('./config.yaml', 'config.yaml')
-                zf.write('../LICENSE', 'LICENSE')
-
-        except subprocess.CalledProcessError as e:
-            logger.error(f'build {zip_filename} failed: {e.args}')
-        except Exception:
-            logger.exception('unknown err')
+        return subprocess.call(command, cwd=os.fspath(PROJECT_ROOT))
+    except FileNotFoundError:
+        print("go was not found in PATH", file=sys.stderr)
+        return 127
+    except KeyboardInterrupt:
+        print("build interrupted", file=sys.stderr)
+        return 130
 
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO)
-
-    if len(RELEASE_DIR) != 0:
-        if not os.path.exists(RELEASE_DIR):
-            os.mkdir(RELEASE_DIR)
-        os.chdir(RELEASE_DIR)
-
-    go_build()
+if __name__ == "__main__":
+    raise SystemExit(main())

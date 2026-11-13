@@ -31,6 +31,9 @@ type runtimeMap struct {
 	// kept current by every answer that records ips, so a data path decision
 	// never waits on SQLite.
 	realByDomain map[string][]string
+	// byReal is the reverse of realByDomain, used by the traffic watch to name
+	// the domain of a real destination in realip / tun mode.
+	byReal map[string]string
 }
 
 func newRuntimeMap() *runtimeMap {
@@ -39,6 +42,7 @@ func newRuntimeMap() *runtimeMap {
 		byFake:       make(map[string]string),
 		lastSeen:     make(map[string]int64),
 		realByDomain: make(map[string][]string),
+		byReal:       make(map[string]string),
 	}
 }
 
@@ -80,6 +84,16 @@ func (m *runtimeMap) putReal(domain string, ips []string) {
 		}
 	}
 	m.realByDomain[domain] = merged
+	// refresh the reverse index for this domain, dropping addresses this
+	// domain no longer owns before installing the merged list.
+	for ip, owner := range m.byReal {
+		if owner == domain {
+			delete(m.byReal, ip)
+		}
+	}
+	for _, ip := range merged {
+		m.byReal[ip] = domain
+	}
 }
 
 func (m *runtimeMap) realsOf(domain string) []string {
@@ -92,6 +106,16 @@ func (m *runtimeMap) realsOf(domain string) []string {
 	out := make([]string, len(ips))
 	copy(out, ips)
 	return out
+}
+
+func (m *runtimeMap) domainOfReal(realIP string) (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	domain, ok := m.byReal[realIP]
+	if !ok || domain == "" {
+		return "", false
+	}
+	return domain, true
 }
 
 func (m *runtimeMap) realSize() int {
@@ -130,6 +154,7 @@ func (m *runtimeMap) clear() {
 	m.byFake = make(map[string]string)
 	m.lastSeen = make(map[string]int64)
 	m.realByDomain = make(map[string][]string)
+	m.byReal = make(map[string]string)
 }
 
 func (m *runtimeMap) remove(domain string) {
@@ -141,6 +166,11 @@ func (m *runtimeMap) remove(domain string) {
 	// Realip runs leave no byDomain entry behind, so the newest-ip cache is
 	// dropped on its own: an expired domain must not keep its addresses alive.
 	delete(m.realByDomain, domain)
+	for ip, owner := range m.byReal {
+		if owner == domain {
+			delete(m.byReal, ip)
+		}
+	}
 	fakeIP, ok := m.byDomain[domain]
 	if !ok {
 		return

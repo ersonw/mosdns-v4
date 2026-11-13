@@ -181,6 +181,9 @@ func (p *FakeIPNatPlugin) readFromTun(ctx context.Context, d tunDevice, st *tunS
 			}
 			continue
 		}
+		// The watch sees only traffic this plugin actually carries, and it runs
+		// before precheck so a TTL probe is still attributed to its source.
+		p.observeTunPacket(buf[:n])
 		// A packet whose TTL ran out is answered here, because the stack never
 		// forwards: this is the first hop traceroute sees.
 		if reply, drop := st.precheck(buf[:n]); drop {

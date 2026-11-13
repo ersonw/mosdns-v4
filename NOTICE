@@ -1,0 +1,25 @@
+mosdns-v4
+Copyright (C) 2026 ersonw and contributors
+
+This project is an unofficial, modified fork of mosdns v4. The upstream
+project is maintained by IrineSistiana:
+
+    https://github.com/IrineSistiana/mosdns
+
+The upstream project and its contributors retain all copyright in the
+original mosdns source code. Source files that carry an upstream copyright
+header keep that header and are used under the terms of the GNU General
+Public License, version 3 or later.
+
+This fork adds and changes plugins, release automation, configuration
+examples and documentation. Those changes are also distributed under the
+GNU General Public License, version 3 or later.
+
+This project is not affiliated with, sponsored by, or endorsed by the
+upstream mosdns project. "mosdns" is used only to identify the upstream
+project this repository is derived from.
+
+License: GPL-3.0-or-later
+Full license text: LICENSE
+Third-party components: THIRD_PARTY_LICENSES.md
+Bundled license texts: third_party/licenses/
