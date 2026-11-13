@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Add, delete or clean domains in a plain-text list.
+"""Add, delete or clean MosDNS domain/IP rules in a plain-text list.
 
 Input is messy by nature: URLs, wildcards, ports, trailing notes and pasted
-chat lines. Every line is reduced to bare lower-case domains first, validated
-against DNS label rules, then merged into the file as a sorted set.
+chat lines. Each rule is normalized to a MosDNS text-loader form: bare domain
+(suffix), full:, domain:, keyword:, regexp:, or an IP/CIDR. In-place edits
+preserve comments and blank lines and de-duplicate only real rule lines.
 
 Without a file path the normalized list goes to stdout, so it can feed a
 pipe; the summary goes to stderr. With a file path the list is edited in
@@ -155,6 +156,16 @@ _DOMAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# MosDNS domain matcher directives. A bare domain uses the default "domain"
+# suffix matcher; the explicit prefixes select full, keyword or regexp.
+_RULE_RE = re.compile(
+    r"^(keyword|full|domain|regexp):(.*)$", re.IGNORECASE | re.DOTALL
+)
+
+# A comment starts at whitespace followed by '#'. Requiring the whitespace
+# avoids treating a URL fragment such as http://foo.com/#bar as a comment.
+_INLINE_COMMENT_RE = re.compile(r"\s+#")
+
 
 def normalize_domain(candidate):
     """Return a bare valid domain or None.
@@ -192,20 +203,94 @@ def normalize_domain(candidate):
     return domain
 
 
-def extract_domains(line):
-    """Pull domains out of one raw line.
+def validate_regexp(value):
+    """Check Python syntax and reject constructs Go's RE2 does not support."""
+    try:
+        re.compile(value)
+    except re.error:
+        return False
+    # Go regexp/RE2 has no lookahead, lookbehind, conditional or backrefs.
+    if re.search(r"\(\?[=!<]", value):
+        return False
+    if "(?P=" in value or "(?(" in value:
+        return False
+    if re.search(r"\\[1-9]", value):
+        return False
+    return True
 
-    A URL contributes only its host, so a query string carrying another
-    domain does not leak into the list. Free-form lines (wildcards, ports,
-    trailing notes) fall back to scanning every domain-like token.
+
+def split_rule_line(raw_line):
+    """Split a rule line from its trailing comment.
+
+    regexp: lines are left intact because '#' can be part of the expression.
+    """
+    if raw_line.strip().lower().startswith("regexp:"):
+        return raw_line, ""
+    comment = _INLINE_COMMENT_RE.search(raw_line)
+    if comment:
+        return raw_line[: comment.start()], raw_line[comment.start() :]
+    return raw_line, ""
+
+
+def rule_key(rule):
+    """Return a stable key for matching duplicate rules."""
+    if rule["type"] == "ip":
+        try:
+            return ("ip", str(ipaddress.ip_network(rule["value"], strict=False)))
+        except ValueError:
+            return ("ip", rule["value"])
+    return (rule["type"], rule["value"])
+
+
+def format_rule(rule):
+    """Render a rule in the form MosDNS' text loader understands."""
+    if rule["type"] == "ip":
+        return rule["value"]
+    return rule["prefix"] + rule["value"]
+
+
+def extract_rules(line):
+    """Parse one raw line into MosDNS domain/IP rules.
+
+    A bare domain is a suffix rule. Explicit full:/domain:/keyword:/regexp:
+    prefixes are honored. URLs contribute their host, and a leading "*." is
+    stripped because MosDNS does not treat it as a wildcard. A valid IP or
+    CIDR is kept as an address-list rule.
     """
     text = line.strip().lstrip("\ufeff")
     if not text or text.startswith("#"):
         return []
-    # "*.example.com" is not a valid name for mosdns' subdomain matcher: the
-    # "*" becomes a literal label, so the pattern never matches. Strip it and
-    # keep example.com, which matches the exact host and all subdomains.
-    text = re.sub(r"\*\.", "", text)
+
+    match = _RULE_RE.match(text)
+    if match:
+        kind = match.group(1).lower()
+        value = match.group(2).strip()
+        if kind == "keyword":
+            if not value or re.search(r"\s", value):
+                return []
+            return [{"type": "keyword", "value": value.lower(),
+                     "prefix": "keyword:"}]
+        if kind == "regexp":
+            if not value or not validate_regexp(value):
+                return []
+            return [{"type": "regexp", "value": value, "prefix": "regexp:"}]
+        if kind == "domain":
+            value = re.sub(r"^\*\.", "", value)
+        domain = normalize_domain(value)
+        if not domain:
+            return []
+        return [{"type": kind, "value": domain, "prefix": kind + ":"}]
+
+    # An IP or CIDR line belongs to netlist (query_matcher client_ip/ecs,
+    # response_matcher ip), not to the domain matcher.
+    try:
+        if "/" in text:
+            value = str(ipaddress.ip_network(text, strict=False))
+        else:
+            value = str(ipaddress.ip_address(text))
+        return [{"type": "ip", "value": value, "prefix": ""}]
+    except ValueError:
+        pass
 
     # A line containing a URL is a URL line: only its host counts, even when
     # the host is unusable (localhost, an IP literal). Otherwise a path such
@@ -219,61 +304,127 @@ def extract_domains(line):
         except ValueError:
             host = None
         domain = normalize_domain(host) if host else None
-        return [domain] if domain else []
+        return [{"type": "domain", "value": domain, "prefix": ""}] if domain else []
 
+    # Free-form line: pull every domain-like token. A leading "*." is not a
+    # wildcard for MosDNS, so drop it and keep the suffix.
+    text = re.sub(r"\*\.", "", text)
     found = []
     for match in _DOMAIN_RE.finditer(text):
         domain = normalize_domain(match.group(0))
         if domain:
-            found.append(domain)
+            found.append({"type": "domain", "value": domain, "prefix": ""})
     return found
 
 
-def load_domains(path):
-    """Read the file and normalize every entry.
+def load_file(path):
+    """Read a rule file while keeping comments and blank lines.
 
-    Returns (domains, cleaned, dropped, raw). cleaned counts lines that were
-    not already a bare domain (URL, wildcard, duplicate); dropped counts lines
-    with no usable domain at all; raw is the number of non-comment lines.
+    Returns (entries, rules, cleaned, dropped, raw). Each entry is a dict:
+      {"kind": "blank"|"comment"} with "raw"
+      {"kind": "rule", "rule": ..., "suffix": ...}
+
+    Comments and blank lines are kept verbatim. Domain/IP rules are normalized
+    and de-duplicated; an inline comment on a dropped duplicate is retained.
     """
-    domains = set()
+    entries = []
+    rules = set()
     cleaned = 0
     dropped = 0
     raw = 0
     if not os.path.exists(path):
-        return domains, cleaned, dropped, raw
+        return entries, rules, cleaned, dropped, raw
     if os.path.isdir(path):
         raise SystemExit(f"Error: {path} is a directory")
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            text = line.strip()
-            if not text or text.startswith("#"):
+            raw_line = line.rstrip("\r\n")
+            text = raw_line.strip()
+            if not text:
+                entries.append({"kind": "blank", "raw": raw_line})
                 continue
+            if text.startswith("#"):
+                entries.append({"kind": "comment", "raw": raw_line})
+                continue
+
             raw += 1
-            found = extract_domains(text)
+            code, suffix = split_rule_line(raw_line)
+            found = extract_rules(code)
             if not found:
                 dropped += 1
                 cleaned += 1
+                if suffix:
+                    entries.append({"kind": "comment", "raw": suffix.lstrip()})
                 continue
-            if len(found) != 1 or text.lower().rstrip(".") != found[0]:
+
+            canonical = format_rule(found[0]) if len(found) == 1 else None
+            if canonical is None or code.strip() != canonical:
                 cleaned += 1
-            for domain in found:
-                if domain in domains:
+
+            for i, rule in enumerate(found):
+                key = rule_key(rule)
+                if key in rules:
                     cleaned += 1
-                domains.add(domain)
-    return domains, cleaned, dropped, raw
+                    if i == 0 and suffix:
+                        entries.append({"kind": "comment", "raw": suffix.lstrip()})
+                    continue
+                rules.add(key)
+                line_suffix = suffix if i == 0 else ""
+                entries.append(
+                    {"kind": "rule", "rule": rule, "suffix": line_suffix}
+                )
+    return entries, rules, cleaned, dropped, raw
 
 
-def save_domains(path, domains):
-    """Write a sorted list atomically, keeping the original file mode."""
+def insert_rules(entries, rules):
+    """Insert new rules after the last existing rule, sorted by type/value."""
+    if not rules:
+        return
+    pos = len(entries)
+    for i in range(len(entries) - 1, -1, -1):
+        if entries[i]["kind"] == "rule":
+            pos = i + 1
+            break
+    for rule in sorted(rules, key=rule_key):
+        entries.insert(pos, {"kind": "rule", "rule": rule, "suffix": ""})
+        pos += 1
+
+
+def save_entries(path, entries):
+    """Write preserved comments and normalized rules atomically."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".domain_manage.", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            for domain in sorted(domains):
-                f.write(domain + "\n")
+            for entry in entries:
+                if entry["kind"] == "rule":
+                    f.write(format_rule(entry["rule"]) + entry["suffix"] + "\n")
+                else:
+                    f.write(entry["raw"] + "\n")
+        try:
+            os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+        except FileNotFoundError:
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def save_rules(path, rules):
+    """Write a sorted rule-only output file, keeping the original file mode."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".domain_manage.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for rule in sorted(rules.values(), key=rule_key):
+                f.write(format_rule(rule) + "\n")
         try:
             os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
         except FileNotFoundError:
@@ -288,17 +439,28 @@ def save_domains(path, domains):
 
 
 USAGE = """Usage:
-  python3 domain_manage.py [-o out_file] [file_path] domain1 [domain2 ...]
-  python3 domain_manage.py add|del [file_path] domain1 [domain2 ...]
+  python3 domain_manage.py [-o out_file] [file_path] rule1 [rule2 ...]
+  python3 domain_manage.py add|del [file_path] rule1 [rule2 ...]
   python3 domain_manage.py clean [file_path]
-  cat domain_list.txt | python3 domain_manage.py [-o out_file] [add|del]
+  cat rule_list.txt | python3 domain_manage.py [-o out_file] [add|del]
 
-Action defaults to add. Without file_path the sorted domains are printed to
+Action defaults to add. Without file_path the sorted rules are printed to
 stdout, or to -o out_file when given; -o never reads the output file, so it
-is for "extract and save", not for merging. With file_path the list is edited
-in place. Only the summary goes to stderr in stream mode. The TLD is checked
-against the IANA list; -a/--any-tld accepts internal suffixes such as .lan.
-URLs, wildcards, ports and trailing notes are reduced to bare domains."""
+is for "extract and save", not for merging. With file_path the file is edited
+in place and comments/blank lines are preserved.
+
+Supported rules:
+  example.com             default MosDNS domain matcher (suffix)
+  domain:example.com      explicit suffix matcher
+  full:example.com        exact host only
+  keyword:tiktok          substring match
+  regexp:^ad\\.             Go/MosDNS regular expression
+  1.2.3.4                 single IP for netlist
+  1.2.3.0/24              IPv4 or IPv6 CIDR for netlist
+
+The TLD is checked against the IANA list; -a/--any-tld accepts internal
+suffixes such as .lan. URLs, "*." wildcards, ports and trailing notes are
+reduced to bare domains. Inline "# comments" are preserved."""
 
 
 def parse_args(argv):
@@ -380,13 +542,16 @@ def main(argv=None):
     valid = []
     skipped = 0
     for line in inputs:
-        found = extract_domains(line)
+        code, _suffix = split_rule_line(line)
+        found = extract_rules(code)
         if not found:
             skipped += 1
             continue
         valid.extend(found)
 
-    unique_input = set(valid)
+    unique_input = {}
+    for rule in valid:
+        unique_input.setdefault(rule_key(rule), rule)
     duplicate_input = len(valid) - len(unique_input)
 
     # No file: write the normalized set to -o, or print it to stdout.
@@ -395,13 +560,13 @@ def main(argv=None):
             print("Error: del needs a file path", file=sys.stderr)
             return 1
         if not unique_input:
-            print("Error: no valid domain found in input", file=sys.stderr)
+            print("Error: no valid rule found in input", file=sys.stderr)
             return 1
         if output is not None:
-            save_domains(output, unique_input)
+            save_rules(output, unique_input)
         else:
-            for domain in sorted(unique_input):
-                print(domain)
+            for rule in sorted(unique_input.values(), key=rule_key):
+                print(format_rule(rule))
         print(
             f"Input: {len(inputs)} lines, {len(unique_input)} valid, "
             f"{duplicate_input} duplicate, {skipped} skipped",
@@ -409,37 +574,49 @@ def main(argv=None):
         )
         return 0
 
-    existing, cleaned, dropped, raw = load_domains(path)
+    entries, existing, cleaned, dropped, raw = load_file(path)
     original = len(existing)
 
     if action != "clean" and not unique_input:
-        print("Error: no valid domain found in input", file=sys.stderr)
+        print("Error: no valid rule found in input", file=sys.stderr)
         return 1
 
     changed = 0
     if action == "add":
-        for domain in unique_input:
-            if domain not in existing:
-                existing.add(domain)
-                changed += 1
+        new_rules = [
+            rule for key, rule in unique_input.items() if key not in existing
+        ]
+        insert_rules(entries, new_rules)
+        for rule in new_rules:
+            existing.add(rule_key(rule))
+        changed = len(new_rules)
     elif action == "del":
-        for domain in unique_input:
-            if domain in existing:
-                existing.discard(domain)
-                changed += 1
+        remove = set(unique_input) & existing
+        if remove:
+            new_entries = []
+            for entry in entries:
+                if (
+                    entry["kind"] == "rule"
+                    and rule_key(entry["rule"]) in remove
+                ):
+                    changed += 1
+                    continue
+                new_entries.append(entry)
+            entries = new_entries
+            existing.difference_update(remove)
 
     # clean rewrites even when only the existing entries needed fixing.
     if changed > 0 or (action == "clean" and cleaned > 0):
-        save_domains(path, existing)
+        save_entries(path, entries)
 
     print(f"File     : {path}")
     print(f"Action   : {action}")
     print(f"Input    : {len(inputs)} lines, {len(unique_input)} valid"
           f", {duplicate_input} duplicate, {skipped} skipped")
-    print(f"Existing : {raw} lines, {original} entries, {cleaned} normalized/dropped"
-          f" ({dropped} with no domain)")
+    print(f"Existing : {raw} lines, {original} rules, {cleaned} normalized/dropped"
+          f" ({dropped} with no rule)")
     print(f"Changed  : {changed} entries")
-    print(f"Total    : {len(existing)} entries")
+    print(f"Total    : {len(existing)} rules")
     return 0
 
 
