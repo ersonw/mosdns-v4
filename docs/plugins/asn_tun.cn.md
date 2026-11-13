@@ -20,27 +20,39 @@ TUN 栈。它**不分配虚拟 IP**，也**不修改 DNS 答案**：客户端拿
 ASN 列表
   -> IPv4 前缀列表（ipverse）
   -> nftables interval set
-  -> prerouting + output 打标（只处理未打标包）
+  -> 目的地过滤（`skip_ip` 命中的包不进入后续流程，未命中的继续）
+  -> prerouting 打标（`mirror_dev` 为空时处理全部入口；非空时只处理该入站网卡）
+  -> output 打标（仅 `mirror_dev` 为空时安装）
   -> ip rule fwmark <mark> lookup <route_table>
   -> default dev <tun_dev>
   -> gVisor TCP/UDP 栈
   -> 代理（真实目标 IP）或直连出口（真实目标 IP）
 ```
 
-前缀集合在插件启动前就已写入 nftables，所以首包就能被正确打标，不依赖抓包
-学习或被动镜像。
+缓存中的前缀集合在启动时同步加载并写入 nftables，所以重启后首包仍能被正确
+打标；随后后台线程再抓取全部 ASN、调用 `cidr_merge.py` 聚合，只有结果变化时
+才替换 nft 集合。没有缓存时以空集合启动，等首次异步刷新完成后再开始打标。
 
 ## 参数
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `asn` | 必填 | 需要加载的 ASN 编号，例如 `[4134, 4837]`。 |
-| `source` | `ipverse` | 前缀来源，目前只实现 `ipverse`。 |
-| `refresh` | `12h` | 前缀刷新周期；`0` 表示不刷新。 |
-| `cache` | `/config/mosdns/asn_tun_prefixes.json` | 最近一次成功的前缀列表；远端失败时回退使用。 |
+| `source` | `ipverse` | 前缀来源。`ipverse` 从 GitHub 拉取；`bgpq3` 调用本地 `fetch_script` 和 `merge_script`。 |
+| `refresh` | `12h` | 周期性刷新间隔；`0` 表示关闭周期刷新，但启动时仍会异步刷新一次。 |
+| `cache` | `/config/mosdns/asn_tun_prefixes.json` | 最近一次成功合并后的前缀列表。启动时同步读取并立即建立 nft 集合；异步刷新失败时继续使用缓存。 |
+| `fetch_script` | `/etc/mosdns/bgpq3_fetch_asn.py` | `source: bgpq3` 时使用的 ASN 前缀抓取脚本。 |
+| `merge_script` | `/etc/mosdns/cidr_merge.py` | 抓取全部 ASN 后使用的 CIDR 聚合脚本。 |
+| `python` | `python3` | 执行上述脚本的解释器。 |
+
+仓库中的两个脚本位于 `etc/mosdns/scripts/`；部署时请把 `fetch_script` 和
+`merge_script` 指向目标机上的实际路径。脚本本身不需要可执行位，插件通过
+`python` 指定的解释器调用。
 | `tun_dev` | `asn0` | TUN 设备名，最长 15 个字符。 |
 | `tun_addr` | `192.0.2.1/32` | 设备本机 IPv4 地址。它不是客户端可见的虚拟 IP，也不会出现在 DNS 应答中。 |
 | `tun_mtu` | `0` | `0` 表示自动：无代理 1500，有代理 1400；范围 576..1500。 |
+| `mirror_dev` | 空 | 指定镜像流量的入站网卡。设置后 nft 只处理从该网卡进入的包（`iifname`），并且不安装本机 output 打标链；为空表示全局模式，处理所有入口和本机出站流量。 |
+| `skip_ip` | 空 | 目的地地址跳过列表。格式与 `response_matcher` 的 `ip` 字段一致，支持 CIDR、`provider:<tag>` 和 `provider:<tag>:<category>`；命中的目的地不会打 ASN 标记，只有未命中的目的地进入后续 ASN/TUN 流程。 |
 | `nft_table` | `asn_tun` | nftables 表名，只允许字母、数字和下划线。 |
 | `mark` | `123` | 目标流量使用的 fwmark。 |
 | `route_table` | `123` | 存放 `default dev <tun_dev>` 的独立路由表，不能是 `main`。 |
@@ -66,6 +78,13 @@ ASN 列表
 ## 关键行为
 
 - `tun_addr` 只是 TUN 设备端点地址，不参与 DNS，也没有 fake IP 映射表。
+- `mirror_dev` 用于交换机镜像口/SPAN 的流量：设置后只匹配该网卡的入站包，
+  不会再处理本机 `output` 流量；为空时才是全局模式。它不是复制数据包，而是
+  把该网卡上收到的镜像副本改道进 TUN，因此该网卡应当是专用镜像口，不能是
+  生产流量的入口网卡。
+- `skip_ip` 在 nft 层做目的地过滤：命中列表的包不会被打标，也不会进入 TUN；
+  只有未命中的包继续走 ASN 流程。它和 `bypass` 的区别是，`bypass` 只保护
+  代理服务器/`next_hop` 自身地址，`skip_ip` 是用户可配置的业务跳过列表。
 - 代理服务器地址和 `next_hop` 会加入 nft `bypass4` 集合，避免“代理服务器
   本身属于目标 ASN”时被再次打标送回 TUN。
 - 被打标的包不能直接送到 `next_hop`，必须进入 TUN；`next_hop` 只服务于
@@ -84,13 +103,19 @@ plugins:
     type: asn_tun
     args:
       asn: [4134, 4837]
-      source: ipverse
+      source: bgpq3
       refresh: 12h
       cache: /config/mosdns/asn_tun_prefixes.json
+      fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
+      merge_script: /etc/mosdns/cidr_merge.py
+      python: python3
 
       tun_dev: asn0
       tun_addr: 192.0.2.1/32
       tun_mtu: 1400
+      mirror_dev: ""             # 例如 eth1；空 = 全局
+      skip_ip:                   # 不进入 ASN 打标的 destination 列表
+        - "provider:geoip:cn"
 
       nft_table: asn_tun
       mark: 123

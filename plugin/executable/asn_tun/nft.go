@@ -42,18 +42,39 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) (string,
 // nftFile is pure text so a test can compare the complete ruleset without
 // running nft. The table is recreated on every install; that is the only
 // reliable way to remove chains and sets from a previous version.
-func nftFile(table string, mark uint32, prefixes []netip.Prefix, bypass []netip.Addr) string {
+func nftFile(table string, mark uint32, prefixes []netip.Prefix, bypass []netip.Addr, skip []netip.Prefix, mirrorDev string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "add table inet %s\n", table)
 	fmt.Fprintf(&b, "add set inet %s asn4 { type ipv4_addr; flags interval; }\n", table)
 	fmt.Fprintf(&b, "add set inet %s bypass4 { type ipv4_addr; flags interval; }\n", table)
+	if len(skip) > 0 {
+		fmt.Fprintf(&b, "add set inet %s skip4 { type ipv4_addr; flags interval; }\n", table)
+	}
 	fmt.Fprintf(&b, "add chain inet %s mark_pre { type filter hook prerouting priority 0; policy accept; }\n", table)
-	fmt.Fprintf(&b, "add rule inet %s mark_pre meta mark 0 ip daddr != @bypass4 ip daddr @asn4 meta mark set %d\n", table, mark)
-	fmt.Fprintf(&b, "add chain inet %s mark_out { type route hook output priority 0; policy accept; }\n", table)
-	fmt.Fprintf(&b, "add rule inet %s mark_out meta mark 0 ip daddr != @bypass4 ip daddr @asn4 meta mark set %d\n", table, mark)
+	preMatch := ""
+	if mirrorDev != "" {
+		preMatch = fmt.Sprintf("iifname %q ", mirrorDev)
+	}
+	skipMatch := ""
+	if len(skip) > 0 {
+		skipMatch = "ip daddr != @skip4 "
+	}
+	fmt.Fprintf(&b, "add rule inet %s mark_pre %smeta mark 0 ip daddr != @bypass4 %sip daddr @asn4 meta mark set %d\n", table, preMatch, skipMatch, mark)
+	// A mirror/SPAN interface feeds ingress only. The output chain would mark
+	// locally generated traffic as well, which is not part of the mirrored
+	// stream, so it is installed only in the global (all-interface) mode.
+	if mirrorDev == "" {
+		fmt.Fprintf(&b, "add chain inet %s mark_out { type route hook output priority 0; policy accept; }\n", table)
+		fmt.Fprintf(&b, "add rule inet %s mark_out meta mark 0 ip daddr != @bypass4 %sip daddr @asn4 meta mark set %d\n", table, skipMatch, mark)
+	}
 
 	for _, chunk := range prefixChunks(prefixes, 100) {
 		fmt.Fprintf(&b, "add element inet %s asn4 { %s }\n", table, joinPrefixes(chunk))
+	}
+	if len(skip) > 0 {
+		for _, chunk := range prefixChunks(skip, 100) {
+			fmt.Fprintf(&b, "add element inet %s skip4 { %s }\n", table, joinPrefixes(chunk))
+		}
 	}
 	if len(bypass) > 0 {
 		parts := make([]string, 0, len(bypass))
@@ -87,7 +108,7 @@ func joinPrefixes(prefixes []netip.Prefix) string {
 }
 
 func (p *ASNTunPlugin) installNft(ctx context.Context) error {
-	content := nftFile(p.args.NftTable, p.mark, p.prefixes, p.bypass)
+	content := nftFile(p.args.NftTable, p.mark, p.prefixes, p.bypass, p.skipPrefixes, p.mirrorDev)
 	f, err := os.CreateTemp("", "asn_tun-*.nft")
 	if err != nil {
 		return err
@@ -105,7 +126,7 @@ func (p *ASNTunPlugin) installNft(ctx context.Context) error {
 	// with the table that is still present during a refresh, and applying a
 	// failed check must never remove a working mark set.
 	checkPath := path + ".check"
-	checkContent := nftFile(p.args.NftTable+"_check", p.mark, p.prefixes, p.bypass)
+	checkContent := nftFile(p.args.NftTable+"_check", p.mark, p.prefixes, p.bypass, p.skipPrefixes, p.mirrorDev)
 	if err := os.WriteFile(checkPath, []byte(checkContent), 0o600); err != nil {
 		return err
 	}
@@ -121,6 +142,8 @@ func (p *ASNTunPlugin) installNft(ctx context.Context) error {
 	}
 	p.L().Info("asn_tun: nft set installed",
 		zap.String("table", p.args.NftTable),
+		zap.String("mirror_dev", p.mirrorDev),
+		zap.Int("skip_prefix_count", len(p.skipPrefixes)),
 		zap.Uint32("mark", p.mark),
 		zap.Int("prefix_count", len(p.prefixes)),
 		zap.Int("bypass_count", len(p.bypass)))

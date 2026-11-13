@@ -23,27 +23,42 @@ prefix set, mark rules and TUN routing.
 ASN list
   -> IPv4 prefix list (ipverse)
   -> nftables interval set
-  -> nft mark on prerouting + output (only unmarked packets)
+  -> destination filter (skip_ip matches stop here; unmatched continue)
+  -> nft mark on prerouting (all interfaces, or only mirror_dev when set)
+  -> nft mark on output (global mode only)
   -> ip rule fwmark <mark> lookup <route_table>
   -> default dev <tun_dev>
   -> gVisor TCP/UDP stack
   -> proxy (real target IP) or direct outlet (real target IP)
 ```
 
-The first packet is already marked because the prefix set is loaded before the
-plugin starts serving; no packet capture or learning pass is involved.
+The cached prefix set is loaded synchronously at startup and written to nft, so
+the first packet after a restart is still marked. A background thread then
+fetches all ASNs, runs `cidr_merge.py`, and replaces the nft set only when the
+result changes. With no cache, the plugin starts with an empty set and begins
+marking after the first async refresh completes.
 
 ## Arguments
 
 | Key | Default | Meaning |
 |---|---|---|
 | `asn` | required | ASN numbers to load, for example `[4134, 4837]`. |
-| `source` | `ipverse` | Prefix provider. Only `ipverse` is implemented. |
-| `refresh` | `12h` | Prefix refresh interval; `0` disables refresh. |
-| `cache` | `/config/mosdns/asn_tun_prefixes.json` | Last successful prefix list; used when the refresh fails. |
+| `source` | `ipverse` | Prefix provider. `ipverse` fetches from GitHub; `bgpq3` runs local `fetch_script` and `merge_script`. |
+| `refresh` | `12h` | Periodic refresh interval; `0` disables the ticker, but one async refresh still runs at startup. |
+| `cache` | `/config/mosdns/asn_tun_prefixes.json` | Last successfully merged prefix list. It is loaded synchronously at startup to build the nft set; failed async refreshes keep using it. |
+| `fetch_script` | `/etc/mosdns/bgpq3_fetch_asn.py` | ASN prefix fetch script used when `source: bgpq3`. |
+| `merge_script` | `/etc/mosdns/cidr_merge.py` | CIDR merge script run after all ASNs are fetched. |
+| `python` | `python3` | Interpreter used for the scripts. |
+
+The two scripts are kept under `etc/mosdns/scripts/` in this repository; point
+`fetch_script` and `merge_script` at their real paths on the target host. They
+do not need an executable bit because the plugin runs them through the
+configured `python` interpreter.
 | `tun_dev` | `asn0` | TUN device name, at most 15 characters. |
 | `tun_addr` | `192.0.2.1/32` | Device-local IPv4 address. It is not a client-facing virtual IP and is never returned by DNS. |
 | `tun_mtu` | `0` | `0`: 1500 direct, 1400 proxy. Range 576..1500. |
+| `mirror_dev` | empty | Ingress interface carrying mirrored/SPAN traffic. When set, the prerouting rule is limited with `iifname` and the local output mark chain is not installed; empty = global mode over all interfaces and local output. |
+| `skip_ip` | empty | Destination-address skip list. Accepts the same forms as `response_matcher`'s `ip` field: CIDRs, `provider:<tag>`, and `provider:<tag>:<category>`. Matched destinations never get the ASN mark; only unmatched destinations enter the ASN/TUN path. |
 | `nft_table` | `asn_tun` | nftables table name; letters, digits and `_` only. |
 | `mark` | `123` | fwmark for marked destinations. |
 | `route_table` | `123` | Dedicated table with `default dev <tun_dev>`. Must not be `main`. |
@@ -70,6 +85,15 @@ startup; a failed probe aborts startup instead of silently switching to direct.
 
 - `tun_addr` is a device endpoint only. It does not appear in DNS, and no
   fake-IP mapping table exists.
+- `mirror_dev` is for a switch mirror/SPAN feed. When set, only packets entering
+  that interface are matched and the local output chain is omitted; empty means
+  global mode over every interface and local output. It does not copy packets:
+  it diverts the mirrored copies received on that interface into the TUN, so
+  the interface must be a dedicated mirror port, not a production ingress.
+- `skip_ip` filters destinations at the nft layer: matched packets are not
+  marked and never enter the TUN; unmatched packets continue through the ASN
+  path. Unlike the internal `bypass` set, which only protects the proxy
+  server/`next_hop`, this is a user-configurable business skip list.
 - The proxy server and `next_hop` addresses are added to the nft `bypass4`
   set. Traffic to them is not marked, so a proxy endpoint inside a selected
   ASN cannot be routed back into the TUN.
@@ -93,13 +117,19 @@ plugins:
     type: asn_tun
     args:
       asn: [4134, 4837]
-      source: ipverse
+      source: bgpq3
       refresh: 12h
       cache: /config/mosdns/asn_tun_prefixes.json
+      fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
+      merge_script: /etc/mosdns/cidr_merge.py
+      python: python3
 
       tun_dev: asn0
       tun_addr: 192.0.2.1/32
       tun_mtu: 1400
+      mirror_dev: ""             # e.g. eth1; empty = global
+      skip_ip:                   # destination CIDRs/providers excluded from ASN marking
+        - "provider:geoip:cn"
 
       nft_table: asn_tun
       mark: 123

@@ -1,6 +1,7 @@
 package asn_tun
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/ersonw/mosdns-v4/coremain"
+	"github.com/ersonw/mosdns-v4/pkg/data_provider"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
+	"github.com/ersonw/mosdns-v4/pkg/matcher/netlist"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/ersonw/mosdns-v4/plugin/executable/fakeip_nat"
 	"go.uber.org/zap"
@@ -29,12 +32,17 @@ const (
 	defaultTunMTU      = 1500
 	defaultProxyTunMTU = 1400
 	defaultRulePrio    = 1000
+	defaultFetchScript = "/etc/mosdns/bgpq3_fetch_asn.py"
+	defaultMergeScript = "/etc/mosdns/cidr_merge.py"
+	defaultPython      = "python3"
+	refreshTimeout     = 5 * time.Minute
 )
 
 var (
 	validTableName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 	validRouteName = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 	validTunName   = regexp.MustCompile(`^[a-zA-Z0-9_]{1,15}$`)
+	validMirrorDev = regexp.MustCompile(`^[a-zA-Z0-9_.:-]{1,15}$`)
 )
 
 func init() {
@@ -45,17 +53,36 @@ type Args struct {
 	// ASN is the list whose announced IPv4 prefixes are routed into the device.
 	ASN []uint32 `yaml:"asn"`
 
-	// Source is the prefix provider. The first version supports "ipverse".
+	// Source is the prefix provider: "ipverse" or "bgpq3".
 	Source string `yaml:"source"`
-	// Refresh reloads the prefixes on this interval. Zero disables refresh.
+	// Refresh reloads the prefixes on this interval. Zero disables periodic
+	// refresh; the plugin still performs one asynchronous refresh at startup.
 	Refresh string `yaml:"refresh"`
-	// Cache stores the last successfully fetched prefix list. A failed refresh
-	// falls back to it instead of leaving the mark set empty.
+	// Cache stores the last successfully fetched prefix list. It is loaded
+	// synchronously at startup, so a slow fetch or merge does not block the
+	// data plane. A failed refresh keeps using the cached list.
 	Cache string `yaml:"cache"`
+
+	// These are used when source is "bgpq3". The fetch script writes one IPv4
+	// prefix per line; the merge script aggregates all ASNs into one list.
+	FetchScript string `yaml:"fetch_script"`
+	MergeScript string `yaml:"merge_script"`
+	Python      string `yaml:"python"`
 
 	TunDev  string `yaml:"tun_dev"`
 	TunAddr string `yaml:"tun_addr"`
 	TunMTU  int    `yaml:"tun_mtu"`
+
+	// MirrorDev restricts the prerouting mark rule to packets entering this
+	// interface, for traffic copied from a switch mirror/SPAN port. Empty means
+	// all interfaces, including the local output chain.
+	MirrorDev string `yaml:"mirror_dev"`
+
+	// SkipIP is an optional destination-address filter. Entries accept the
+	// same forms as response_matcher's "ip" field, including "provider:<tag>"
+	// and "provider:<tag>:<category>". Destinations matched here are skipped;
+	// only unmatched destinations enter the ASN/TUN path.
+	SkipIP []string `yaml:"skip_ip"`
 
 	NftTable          string `yaml:"nft_table"`
 	Mark              uint32 `yaml:"mark"`
@@ -87,10 +114,16 @@ type ASNTunPlugin struct {
 	prefixes []netip.Prefix
 	bypass   []netip.Addr
 
+	// skipPrefixes is generated from SkipIP. It is rendered into nft's skip4
+	// set so matching destinations never get the ASN mark.
+	skipPrefixes []netip.Prefix
+
 	tunDev  string
 	tunAddr netip.Addr
 	tunFile *os.File
 	stack   *tunStack
+
+	mirrorDev string
 
 	mark        uint32
 	routeTable  string
@@ -107,6 +140,7 @@ type ASNTunPlugin struct {
 	runCtx        context.Context
 	runCancel     context.CancelFunc
 	wg            sync.WaitGroup
+	refreshMu     sync.Mutex
 	closeOnce     sync.Once
 	nftInstalled  bool
 	routesStarted bool
@@ -145,11 +179,29 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	}
 
 	source := strings.ToLower(strings.TrimSpace(cfg.Source))
-	if source == "" {
+	switch source {
+	case "":
 		source = "ipverse"
+	case "ipverse", "bgpq3":
+	default:
+		return nil, fmt.Errorf("unsupported source %q: use ipverse or bgpq3", cfg.Source)
 	}
-	if source != "ipverse" {
-		return nil, fmt.Errorf("unsupported source %q: only ipverse is implemented", cfg.Source)
+
+	fetchScript := strings.TrimSpace(cfg.FetchScript)
+	if fetchScript == "" {
+		fetchScript = defaultFetchScript
+	}
+	mergeScript := strings.TrimSpace(cfg.MergeScript)
+	if mergeScript == "" {
+		mergeScript = defaultMergeScript
+	}
+	python := strings.TrimSpace(cfg.Python)
+	if python == "" {
+		python = defaultPython
+	}
+	cachePath := strings.TrimSpace(cfg.Cache)
+	if cachePath == "" {
+		cachePath = defaultCache
 	}
 
 	refresh := defaultRefresh
@@ -172,6 +224,16 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	tunAddr, err := parseTunAddr(cfg.TunAddr)
 	if err != nil {
 		return nil, err
+	}
+
+	mirrorDev := strings.TrimSpace(cfg.MirrorDev)
+	if mirrorDev != "" && !validMirrorDev.MatchString(mirrorDev) {
+		return nil, fmt.Errorf("invalid mirror_dev %q", mirrorDev)
+	}
+
+	skipPrefixes, err := loadSkipPrefixes(bp, cfg.SkipIP)
+	if err != nil {
+		return nil, fmt.Errorf("load skip_ip: %w", err)
 	}
 
 	nftTable := strings.TrimSpace(cfg.NftTable)
@@ -248,32 +310,126 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	}
 
 	p := &ASNTunPlugin{
-		BP:          bp,
-		args:        *cfg,
-		runner:      execRunner{},
-		asns:        append([]uint32(nil), cfg.ASN...),
-		tunDev:      tunDev,
-		tunAddr:     tunAddr,
-		mark:        mark,
-		routeTable:  routeTable,
-		egressMark:  egressMark,
-		egressTable: egressTable,
-		rulePrio:    prio,
-		nextHop:     nextHop,
-		nextHopDev:  nextHopDev,
+		BP:           bp,
+		args:         *cfg,
+		runner:       execRunner{},
+		asns:         append([]uint32(nil), cfg.ASN...),
+		tunDev:       tunDev,
+		tunAddr:      tunAddr,
+		mirrorDev:    mirrorDev,
+		skipPrefixes: skipPrefixes,
+		mark:         mark,
+		routeTable:   routeTable,
+		egressMark:   egressMark,
+		egressTable:  egressTable,
+		rulePrio:     prio,
+		nextHop:      nextHop,
+		nextHopDev:   nextHopDev,
 	}
 	p.args.TunMTU = mtu
 	p.args.Refresh = refresh.String()
 	p.args.Source = source
+	p.args.Cache = cachePath
+	p.args.FetchScript = fetchScript
+	p.args.MergeScript = mergeScript
+	p.args.Python = python
 	p.args.NftTable = nftTable
 	p.args.TunDev = tunDev
 	p.args.TunAddr = tunAddr.String()
+	p.args.MirrorDev = mirrorDev
 	p.args.Mark = mark
 	p.args.RouteTable = routeTable
 	p.args.EgressMark = egressMark
 	p.args.EgressTable = egressTable
 	p.args.RouteRulePriority = prio
 	return p, nil
+}
+
+func loadSkipPrefixes(bp *coremain.BP, entries []string) ([]netip.Prefix, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	m := bp.M()
+	var dm *data_provider.DataManager
+	if m != nil {
+		dm = m.GetDataManager()
+	}
+	return loadSkipPrefixesWithManager(dm, entries)
+}
+
+func loadSkipPrefixesWithManager(dm *data_provider.DataManager, entries []string) ([]netip.Prefix, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[netip.Prefix]struct{})
+	var out []netip.Prefix
+	add := func(list *netlist.List) {
+		list.Sort()
+		for _, prefix := range list.Prefixes() {
+			if prefix.Addr().Is4In6() {
+				prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+			}
+			if !prefix.Addr().Is4() {
+				continue
+			}
+			prefix = prefix.Masked()
+			if _, ok := seen[prefix]; ok {
+				continue
+			}
+			seen[prefix] = struct{}{}
+			out = append(out, prefix)
+		}
+	}
+
+	for _, raw := range entries {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		list := netlist.NewList()
+		if strings.HasPrefix(raw, "provider:") {
+			if dm == nil {
+				return nil, fmt.Errorf("provider %s requires a data manager", raw)
+			}
+			name := strings.TrimPrefix(raw, "provider:")
+			name, suffix, _ := strings.Cut(name, ":")
+			provider := dm.GetDataProvider(name)
+			if provider == nil {
+				return nil, fmt.Errorf("cannot find provider %s", name)
+			}
+			data, err := provider.GetData()
+			if err != nil {
+				return nil, fmt.Errorf("read provider %s: %w", name, err)
+			}
+			if suffix != "" {
+				list, err = netlist.ParseV2rayIPDat(data, suffix)
+				if err != nil {
+					return nil, fmt.Errorf("parse provider %s:%s: %w", name, suffix, err)
+				}
+			} else {
+				if err := netlist.LoadFromReader(list, bytes.NewReader(data)); err != nil {
+					return nil, fmt.Errorf("parse provider %s: %w", name, err)
+				}
+			}
+		} else {
+			if err := netlist.LoadFromText(list, raw); err != nil {
+				return nil, fmt.Errorf("parse skip_ip %s: %w", raw, err)
+			}
+		}
+		add(list)
+	}
+	final := netlist.NewList()
+	final.Append(out...)
+	final.Sort()
+	out = out[:0]
+	for _, prefix := range final.Prefixes() {
+		if prefix.Addr().Is4In6() {
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		out = append(out, prefix)
+	}
+	return out, nil
 }
 
 func parseTunAddr(raw string) (netip.Addr, error) {
@@ -302,13 +458,16 @@ func (p *ASNTunPlugin) start() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	prefixes, err := loadPrefixes(ctx, p.asns, p.args.Cache)
-	if err != nil {
-		return fmt.Errorf("load ASN prefixes: %w", err)
+	prefixes, cacheErr := readPrefixCache(p.args.Cache, p.asns)
+	if cacheErr != nil {
+		p.L().Warn("asn_tun: no usable prefix cache; starting with an empty mark set until the async refresh completes",
+			zap.String("cache", p.args.Cache), zap.Error(cacheErr))
+		prefixes = nil
+	} else {
+		p.L().Info("asn_tun: prefix cache loaded",
+			zap.Int("asn_count", len(p.asns)), zap.Int("prefix_count", len(prefixes)))
 	}
 	p.prefixes = prefixes
-	p.L().Info("asn_tun: prefixes loaded",
-		zap.Int("asn_count", len(p.asns)), zap.Int("prefix_count", len(prefixes)))
 
 	if err := p.setupEgress(ctx); err != nil {
 		return err
@@ -331,10 +490,14 @@ func (p *ASNTunPlugin) start() error {
 	}
 
 	p.runCtx, p.runCancel = context.WithCancel(context.Background())
+	initialPrefixCount := len(p.prefixes)
+	initialSkipCount := len(p.skipPrefixes)
 	p.wg.Add(1)
 	go p.runTunDevice()
 	p.wg.Add(1)
 	go p.runStackWriter()
+	p.wg.Add(1)
+	go p.runStartupRefresh()
 
 	if refresh := p.refreshInterval(); refresh > 0 {
 		p.wg.Add(1)
@@ -343,9 +506,11 @@ func (p *ASNTunPlugin) start() error {
 
 	p.L().Info("asn_tun initialized",
 		zap.Uint32s("asn", p.asns),
-		zap.Int("prefix_count", len(prefixes)),
+		zap.Int("prefix_count", initialPrefixCount),
 		zap.String("tun_dev", p.tunDev),
 		zap.String("tun_addr", p.tunAddr.String()),
+		zap.String("mirror_dev", p.mirrorDev),
+		zap.Int("skip_prefix_count", initialSkipCount),
 		zap.Uint32("mark", p.mark),
 		zap.String("route_table", p.routeTable),
 		zap.Uint32("egress_mark", p.egressMark),
@@ -420,6 +585,15 @@ func (p *ASNTunPlugin) bypassAddresses() []netip.Addr {
 	return uniqueAddrs(out)
 }
 
+func (p *ASNTunPlugin) runStartupRefresh() {
+	defer p.wg.Done()
+	ctx, cancel := context.WithTimeout(p.runCtx, refreshTimeout)
+	defer cancel()
+	if err := p.refreshPrefixes(ctx); err != nil {
+		p.L().Warn("asn_tun: startup prefix refresh failed, keeping the cached set", zap.Error(err))
+	}
+}
+
 func (p *ASNTunPlugin) runRefresh(interval time.Duration) {
 	defer p.wg.Done()
 	ticker := time.NewTicker(interval)
@@ -429,21 +603,66 @@ func (p *ASNTunPlugin) runRefresh(interval time.Duration) {
 		case <-p.runCtx.Done():
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-			prefixes, err := loadPrefixes(ctx, p.asns, p.args.Cache)
+			ctx, cancel := context.WithTimeout(p.runCtx, refreshTimeout)
+			err := p.refreshPrefixes(ctx)
 			cancel()
 			if err != nil {
-				p.L().Warn("asn_tun: refresh failed, keeping the current set", zap.Error(err))
-				continue
-			}
-			p.prefixes = prefixes
-			if err := p.installNft(context.Background()); err == nil {
-				p.L().Info("asn_tun: prefix set refreshed", zap.Int("prefix_count", len(prefixes)))
-			} else {
-				p.L().Warn("asn_tun: refreshing nft set failed", zap.Error(err))
+				p.L().Warn("asn_tun: periodic refresh failed, keeping the current set", zap.Error(err))
 			}
 		}
 	}
+}
+
+func (p *ASNTunPlugin) refreshPrefixes(ctx context.Context) error {
+	p.refreshMu.Lock()
+	defer p.refreshMu.Unlock()
+
+	var prefixes []netip.Prefix
+	var err error
+	switch p.args.Source {
+	case "bgpq3":
+		prefixes, err = p.fetchPrefixesBGpq3(ctx)
+	default:
+		prefixes, err = fetchPrefixes(ctx, p.asns)
+	}
+	if err != nil {
+		return fmt.Errorf("fetch ASN prefixes: %w", err)
+	}
+	if len(prefixes) == 0 {
+		return fmt.Errorf("no IPv4 prefixes returned for ASN list")
+	}
+
+	skip, skipErr := loadSkipPrefixes(p.BP, p.args.SkipIP)
+	if skipErr != nil {
+		p.L().Warn("asn_tun: reloading skip_ip failed, keeping the current skip set", zap.Error(skipErr))
+		skip = p.skipPrefixes
+	}
+
+	prefixChanged := !prefixesEqual(p.prefixes, prefixes)
+	skipChanged := !prefixesEqual(p.skipPrefixes, skip)
+	if !prefixChanged && !skipChanged {
+		p.L().Info("asn_tun: prefix set unchanged",
+			zap.String("source", p.args.Source),
+			zap.Int("prefix_count", len(prefixes)),
+			zap.Int("skip_prefix_count", len(skip)))
+		return nil
+	}
+
+	oldPrefixes, oldSkip := p.prefixes, p.skipPrefixes
+	p.prefixes = prefixes
+	p.skipPrefixes = skip
+	if err := p.installNft(ctx); err != nil {
+		p.prefixes, p.skipPrefixes = oldPrefixes, oldSkip
+		return fmt.Errorf("install refreshed nft set: %w", err)
+	}
+	if err := writePrefixCache(p.args.Cache, p.asns, prefixes); err != nil {
+		p.L().Warn("asn_tun: writing prefix cache failed", zap.String("cache", p.args.Cache), zap.Error(err))
+	}
+	p.L().Info("asn_tun: prefix set updated",
+		zap.String("source", p.args.Source),
+		zap.Int("prefix_count", len(prefixes)),
+		zap.Int("skip_prefix_count", len(skip)))
+	return nil
 }
 
 func (p *ASNTunPlugin) runTunDevice() {

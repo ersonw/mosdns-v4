@@ -191,6 +191,38 @@ plugins:
   #        - "test.lan. 60 IN AAAA fd00::10"
   #        - "*.wild.lan. 60 IN A 10.0.0.11"
   #
+  ## ---- asn_tun: ASN IPv4 prefixes -> TUN (Linux only) -----------------------
+  ## Active test instance. AS112 is used because it announces only two small
+  ## IPv4 prefixes; replace it with the ASN(s) you actually want to route.
+  ## On macOS this still fails at setupTun with "only supported on linux".
+  ## Set next_hop / next_hop_dev for a direct Linux outlet, or set proxy and
+  ## leave both empty. A configured proxy is probed at startup.
+  - tag: test_asn_tun
+    type: asn_tun
+    args:
+      asn: [112]                    # test ASN; replace with your target ASN(s)
+      source: bgpq3               # ipverse or bgpq3 (bgpq3 uses fetch_script + merge_script)
+      refresh: 0                  # 0 = no periodic refresh; startup still refreshes async
+      cache: etc/mosdns/asn_tun_prefixes.json
+      fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
+      merge_script: /etc/mosdns/cidr_merge.py
+      python: python3
+      tun_dev: asn0               # at most 15 characters
+      tun_addr: 192.0.2.1/32      # device endpoint, never a client fake IP
+      tun_mtu: 1400               # 0 = auto: 1500 direct, 1400 via proxy; 576..1500
+      mirror_dev: ""              # dedicated SPAN ingress only; empty = all interfaces + local output
+      skip_ip: []                 # destination CIDRs / providers to skip before ASN marking
+      nft_table: asn_tun          # letters, digits and underscore, <= 32 chars
+      mark: 123                   # fwmark for packets entering the TUN
+      route_table: "123"          # dedicated table, must not be "main"
+      route_rule_priority: 1000   # 1..32765
+      next_hop: 192.168.1.1       # direct outlet; can be empty with next_hop_dev
+      next_hop_dev: eth0          # direct outlet device, also SO_BINDTODEVICE
+      egress_mark: 124            # default: mark + 1; must differ from mark
+      egress_table: "124"         # must differ from route_table
+      proxy: ""                   # e.g. socks5://user:pass@host:1080
+      proxy_insecure: false       # skip TLS verification for https/trojan
+  #
   ## ---- blackhole: fixed answer or rcode -------------------------------------
   #  - tag: test_blackhole
   #    type: blackhole
@@ -688,6 +720,120 @@ servers:
 #         - "nas.lan. 60 IN A 192.168.1.10"
 #         - "nas.lan. 60 IN AAAA fd00::10"
 #         - "*.lab.lan. 60 IN A 192.168.1.20"
+
+# -----------------------------------------------------------------------------
+# type: asn_tun - route the IPv4 prefixes announced by an ASN list into a TUN
+# stack and terminate TCP/UDP there (Linux only).
+# Use it: when traffic must be selected by the destination's ASN rather than by
+# domain. It loads the cached prefix list at startup, installs an nft interval
+# set, marks matching packets, and routes the marked packets into a TUN device.
+# A background refresh fetches all configured ASNs, merges them with
+# cidr_merge.py, writes the cache, and replaces the nft set only when the
+# prefix list or skip list actually changed.
+# The gVisor stack sees the real destination IPv4 (there is no fake IP and no
+# DNS rewriting), then dials the real target IP:port either directly or through
+# a proxy. It is a standalone data plane and does not need a sequence entry; if
+# placed in a sequence, Exec passes the query through unchanged.
+# Requirements: Linux, root or CAP_NET_ADMIN, /dev/net/tun, and the nft, ip and
+# sysctl commands. On macOS startup fails with
+# "asn_tun is only supported on linux".
+# Args:
+#   asn - required. ASN numbers whose IPv4 prefixes are routed into the device,
+#         e.g. [4134, 4837]. IPv6 announcements are ignored in this version.
+#   source - prefix provider. "ipverse" fetches from GitHub; "bgpq3" runs the
+#            local fetch_script and merge_script. Default: ipverse
+#   refresh - periodic refresh interval, e.g. 12h. "0" disables the periodic
+#             ticker, but one async refresh still runs at startup.
+#             Default: 12h
+#   cache - JSON file holding the last successful merged prefix list. It is
+#           loaded synchronously at startup, so the TUN/nft path is ready
+#           immediately; a slow or failed fetch keeps using this cache.
+#           Default: /config/mosdns/asn_tun_prefixes.json
+#   fetch_script - bgpq3 fetch script used when source is "bgpq3".
+#                  Default: /etc/mosdns/bgpq3_fetch_asn.py
+#   merge_script - CIDR merge script used after all ASNs are fetched.
+#                  Default: /etc/mosdns/cidr_merge.py
+#   python - interpreter used to run the scripts. Default: python3
+#   tun_dev - TUN device name, at most 15 characters. Default: asn0
+#   tun_addr - local IPv4 /32 endpoint of the TUN device. It is not a client
+#              fake IP and does not appear in DNS answers.
+#              Default: 192.0.2.1/32
+#   tun_mtu - device MTU, 576..1500. 0 = automatic: 1500 for a direct outlet,
+#             1400 when a proxy is configured. Default: 0
+#   mirror_dev - optional ingress interface carrying mirrored/SPAN traffic.
+#                When set, the prerouting rule is limited with
+#                "iifname <mirror_dev>" and the local output mark chain is not
+#                installed, so only that mirrored ingress is handled. The
+#                interface must be a dedicated mirror port: this diverts the
+#                received copies into the TUN, it does not copy them again.
+#                Empty = global: all interfaces and local output. Default: empty
+#   skip_ip - optional destination-address skip list. Entries accept the same
+#             forms as response_matcher's "ip" field: literal IPv4/IPv6 CIDR,
+#             "provider:<tag>" for a plain-text IP list, and
+#             "provider:<tag>:<category>" for a v2dat geoip file. Destinations
+#             matched here never get the ASN mark; only unmatched destinations
+#             enter the ASN/TUN path. IPv6 entries are ignored because the TUN
+#             data plane is IPv4-only. Default: empty
+#   nft_table - nftables table name; letters, digits and underscore only,
+#               at most 32 characters. Default: asn_tun
+#   mark - fwmark applied to packets whose destination is in the ASN set.
+#          Default: 123
+#   route_table - dedicated routing table containing "default dev <tun_dev>".
+#                 It must not be "main". Default: "123"
+#   route_rule_priority - priority of the "fwmark <mark> lookup <route_table>"
+#                 rule, 1..32765. Default: 1000
+#   next_hop - gateway for the plugin's own direct outlet sockets. Marked
+#              packets themselves always enter the TUN; this gateway is only
+#              used by egress_table. It may be empty when next_hop_dev is set.
+#   next_hop_dev - direct outlet interface, also used as SO_BINDTODEVICE.
+#                  At least one of next_hop / next_hop_dev is required unless a
+#                  proxy is configured.
+#   egress_mark - fwmark for the plugin's direct sockets. Default: mark + 1;
+#                 must differ from mark.
+#   egress_table - routing table for the direct sockets. It contains
+#                  "default via <next_hop> dev <next_hop_dev>" and must differ
+#                  from route_table. Default: "124"
+#   proxy - outbound proxy URL for TCP, same syntax as fakeip_nat:
+#           socks5://user:pass@host:1080, socks5h://host:1080,
+#           http://host:8080, https://host:8443, trojan://pass@host:443?sni=host,
+#           or gost://... . Empty = direct outlet. The proxy is probed at
+#           startup and a failed probe aborts startup instead of leaking direct.
+#   proxy_insecure - skip TLS certificate verification for https/trojan
+#                    proxies. Default: false
+# Notes:
+#   - Only packets with "meta mark 0" are marked; an earlier policy that already
+#     set a mark wins. Adjust route_rule_priority or remove that policy.
+#   - The proxy server address and next_hop are added to the nft bypass set so
+#     they are not marked back into the TUN.
+#   - ICMP is not handled in this version; marked ICMP is dropped. HTTP/HTTPS/
+#     Trojan proxies do not carry UDP; SOCKS5 may.
+# -----------------------------------------------------------------------------
+#   - tag: asn_tun
+#     type: asn_tun
+#     args:
+#       asn: [4134, 4837]
+#       source: bgpq3
+#       refresh: 12h
+#       cache: /config/mosdns/asn_tun_prefixes.json
+#       fetch_script: /etc/mosdns/bgpq3_fetch_asn.py
+#       merge_script: /etc/mosdns/cidr_merge.py
+#       python: python3
+#       tun_dev: asn0
+#       tun_addr: 192.0.2.1/32
+#       tun_mtu: 0                      # 0 = auto: 1500 direct, 1400 via proxy
+#       mirror_dev: ""                   # e.g. eth1; empty = all interfaces + local output
+#       skip_ip:                        # destination CIDRs/providers excluded from ASN marking
+#         - "provider:geoip:cn"
+#       nft_table: asn_tun
+#       mark: 123
+#       route_table: "123"
+#       route_rule_priority: 1000
+#       next_hop: 192.168.1.1
+#       next_hop_dev: eth0
+#       egress_mark: 124
+#       egress_table: "124"
+#       proxy: ""                       # or socks5://user:pass@host:1080
+#       proxy_insecure: false
 
 # -----------------------------------------------------------------------------
 # type: blackhole - block queries by answering a fixed IP or a fixed rcode.

@@ -106,6 +106,13 @@ func (list *List) Len() int {
 	return len(list.e)
 }
 
+// Prefixes returns the normalized prefixes currently in the list. Callers that
+// need a stable snapshot (for example, to build an nft set) should call Sort
+// first. The returned slice must not be modified by the caller.
+func (list *List) Prefixes() []netip.Prefix {
+	return list.e
+}
+
 // Less implements sort Interface.
 func (list *List) Less(i, j int) bool {
 	return list.e[i].Addr().Less(list.e[j].Addr())
