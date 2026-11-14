@@ -136,3 +136,13 @@ func (c *MemCache) cleanFunc() func(_ string, v *elem) bool {
 func (c *MemCache) Len() int {
 	return c.lru.Len()
 }
+
+// Purge removes every entry whose key satisfies match and returns how many were
+// dropped. It is the backend half of a per-domain purge: the front end decides
+// which keys belong to a domain, the backend only removes them.
+func (c *MemCache) Purge(match func(key string) bool) int {
+	if c.isClosed() {
+		return 0
+	}
+	return c.lru.Clean(func(key string, _ *elem) bool { return match(key) })
+}

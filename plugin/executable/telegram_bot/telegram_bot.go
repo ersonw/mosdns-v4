@@ -213,6 +213,17 @@ type mappingAdmin = fakeipadmin.Admin
 // watchAdmin is the optional live traffic capability of a fakeip plugin.
 type watchAdmin = fakeipadmin.WatchAdmin
 
+// domainPurgeAdmin is the optional "delete everything about a domain"
+// capability of a fakeip plugin. A stub that only lists mappings does not
+// implement it, and the bot then falls back to the plain mapping delete.
+type domainPurgeAdmin = fakeipadmin.PurgeAdmin
+
+// cachePurgeAdmin is the optional per-domain flush of a cache plugin. The bot
+// discovers it at runtime, so no cache tag has to be configured.
+type cachePurgeAdmin interface {
+	AdminPurgeDomain(ctx context.Context, domain string) (int, error)
+}
+
 // telegramSender is the small part of the Telegram client the watch uses. A
 // test can substitute it without a live bot token.
 type telegramSender interface {
@@ -644,15 +655,29 @@ func (p *telegramBot) handleFip(ctx context.Context, args []string, langs ...lan
 		if len(args) < 2 {
 			return l.t("usage: /fip del <domain>", "用法：/fip del <domain>"), nil
 		}
-		ok, err := admin.AdminDeleteDomain(ctx, args[1])
-		if err != nil {
-			return "", err
+		// A mapping alone is not what a client reads: the learned real ips, the
+		// access rows and the answers a cache plugin still holds outlive it, so
+		// the whole record set of the domain is dropped here.
+		res := p.purgeDomainData(ctx, args[1])
+		found := res.removed()
+		if res.FakeIP == 0 {
+			// No plugin in this set offers the full purge. Fall back to the
+			// mapping delete so a plugin built before the capability existed
+			// still answers this command.
+			ok, err := admin.AdminDeleteDomain(ctx, args[1])
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				found = true
+			}
 		}
-		if !ok {
+		if !found {
 			return l.t(fmt.Sprintf("%s: no mapping", args[1]), fmt.Sprintf("%s：无映射", args[1])), nil
 		}
-		return l.t(fmt.Sprintf("deleted %s, the next query allocates a new fake ip", args[1]),
-			fmt.Sprintf("已删除 %s，下次查询会分配新的 fake IP", args[1])), nil
+		msg := l.t(fmt.Sprintf("deleted %s, the next query allocates a new fake ip", args[1]),
+			fmt.Sprintf("已删除 %s，下次查询会分配新的 fake IP", args[1]))
+		return msg + "\n" + purgeSummary(res, l), nil
 
 	case "clear":
 		if len(args) < 2 || strings.ToLower(args[1]) != "confirm" {
@@ -963,7 +988,7 @@ var helpGroups = []helpGroup{
 		{"/fip [tag] list [n]          recent mappings (default 20)", PermFakeIP},
 		{"/fip get <domain|fake_ip>    look up one mapping", PermFakeIP},
 		{"/fip add <domain> <fake_ip>  create or replace a mapping", PermFakeIP},
-		{"/fip del <domain>            drop a mapping", PermFakeIP},
+		{"/fip del <domain>            drop a domain with its real ips, access rows and cached answers", PermFakeIP},
 		{"/fip stats                   mapping counters", PermFakeIP},
 		{"/fip clear confirm           drop every mapping", PermFakeIP},
 	}},
@@ -1085,7 +1110,7 @@ const fipHelp = `fakeip commands (optional tag first, e.g. /fip fakeip2 list)
 /fip list [n]                recent mappings
 /fip get <domain|fake_ip>    look up one mapping
 /fip add <domain> <fake_ip>  create or replace a mapping
-/fip del <domain>            drop a mapping
+/fip del <domain>            drop the domain and its subdomains, with the learned real ips, the access rows and the cached answers
 /fip stats                   mapping counters
 /fip clear confirm           drop every mapping`
 
@@ -1117,7 +1142,7 @@ const fipHelpZH = `fakeip 命令（可选 tag 放在最前，例如 /fip fakeip2
 /fip list [n]                最近的映射
 /fip get <domain|fake_ip>    查询一条映射
 /fip add <domain> <fake_ip>  新增或替换映射
-/fip del <domain>            删除一条映射
+/fip del <domain>            删除该域名及其子域名，连同学到的真实 IP、访问记录和缓存应答
 /fip stats                   映射计数
 /fip clear confirm           删除全部映射`
 
@@ -1152,7 +1177,7 @@ var helpGroupsZH = []helpGroup{
 		{"/fip [tag] list [n]          最近映射（默认 20 条）", PermFakeIP},
 		{"/fip get <domain|fake_ip>    查询一条映射", PermFakeIP},
 		{"/fip add <domain> <fake_ip>  新增或替换映射", PermFakeIP},
-		{"/fip del <domain>             删除一条映射", PermFakeIP},
+		{"/fip del <domain>             删除域名及其子域名，连同真实 IP、访问记录和缓存应答", PermFakeIP},
 		{"/fip stats                    映射计数", PermFakeIP},
 		{"/fip clear confirm            删除全部映射", PermFakeIP},
 	}},

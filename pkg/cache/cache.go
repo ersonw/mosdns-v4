@@ -44,3 +44,14 @@ type Backend interface {
 	// Closer closes the cache backend. Get and Store should become noop calls.
 	io.Closer
 }
+
+// Purger is implemented by backends that can drop individual keys. A cache
+// front end uses it to honour "this domain is gone": without it the only way to
+// drop a stale answer is to flush the whole backend, which would also discard
+// unrelated entries. Backends that cannot enumerate their keys, such as a
+// remote store, simply do not implement it.
+type Purger interface {
+	// Purge removes every entry whose key satisfies match and returns the
+	// number of entries dropped.
+	Purge(match func(key string) bool) int
+}

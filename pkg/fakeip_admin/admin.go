@@ -96,6 +96,28 @@ type Admin interface {
 	AdminAccessRecords(ctx context.Context, clientIPs []string, since int64, limit int) ([]AccessRecord, error)
 }
 
+// PurgeReport counts what a domain purge removed. Domains lists every name that
+// was cleaned, the deleted domain and its subdomains included, so a control
+// surface can show the blast radius instead of a bare number.
+type PurgeReport struct {
+	Mappings int      // rows dropped from the domain -> fake ip table
+	RealIPs  int      // rows dropped from the real ip table
+	Access   int      // rows dropped from the access log
+	Domains  []string // domains the purge touched (own domain and subdomains)
+}
+
+// PurgeAdmin is the optional "delete everything about a domain" capability.
+// Dropping a mapping alone leaves the learned real ips, the visit records and
+// the answers another front end cached, and every one of them keeps influencing
+// the next resolution. It is separate from Admin so a stub that only lists
+// mappings keeps compiling unchanged.
+type PurgeAdmin interface {
+	// AdminPurgeDomain removes the mapping, the real ips and the access rows of
+	// domain and of every subdomain of it, in SQLite and in memory. It is
+	// idempotent: a domain with no row returns a zero report and no error.
+	AdminPurgeDomain(ctx context.Context, domain string) (PurgeReport, error)
+}
+
 // Plane is what the data plane has installed on the machine right now, next to
 // the state the plugin recorded for a later cleanup. It exists so a control
 // surface can answer "what is actually running" without shell access: every

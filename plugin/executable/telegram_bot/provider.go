@@ -708,7 +708,14 @@ func (p *telegramBot) providerText(ctx context.Context, prov domainProvider, act
 			fmt.Sprintf("script did not apply the expected %s to %s", action, prov.Tag),
 			fmt.Sprintf("脚本没有按预期对 %s 执行 %s", prov.Tag, action))))
 	}
-	return providerResult(l, prov, action, "", out, backup), nil
+	res := providerResult(l, prov, action, "", out, backup)
+	// The list entry is the only thing kept: every cached answer and every
+	// stored record of the deleted name goes, so the next query follows the new
+	// rule set instead of an answer learned under the old one.
+	if extra := p.providerPurge(ctx, action, values, l); extra != "" {
+		res += "\n" + extra
+	}
+	return res, nil
 }
 
 func (p *telegramBot) clearTextProvider(prov domainProvider, l lang) (string, error) {

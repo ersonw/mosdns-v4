@@ -21,7 +21,10 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/cache"
 	"github.com/ersonw/mosdns-v4/pkg/cache/mem_cache"
@@ -30,10 +33,10 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/pool"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
-	"github.com/redis/go-redis/v9"
 	"github.com/golang/snappy"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 	"time"
@@ -57,6 +60,12 @@ const (
 )
 
 var _ coremain.ExecutablePlugin = (*cachePlugin)(nil)
+
+// The per-domain purge is what the Telegram bot calls after a rule is deleted;
+// keep the method set checked at build time so a rename cannot silence it.
+var _ interface {
+	AdminPurgeDomain(ctx context.Context, domain string) (int, error)
+} = (*cachePlugin)(nil)
 
 type Args struct {
 	Size              int    `yaml:"size"`
@@ -323,4 +332,37 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 
 func (c *cachePlugin) Shutdown() error {
 	return c.backend.Close()
+}
+
+// AdminPurgeDomain drops every cached answer of domain and of its subdomains,
+// all query types included. Deleting a rule only changes what the next query
+// would do; the answer already cached under the old rule keeps being served
+// until its TTL runs out, so a control surface has to remove it explicitly.
+// It is idempotent: a domain with no entry returns zero.
+func (c *cachePlugin) AdminPurgeDomain(_ context.Context, domain string) (int, error) {
+	domain = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(domain, ".")))
+	if domain == "" {
+		return 0, errors.New("empty domain")
+	}
+	purger, ok := c.backend.(cache.Purger)
+	if !ok {
+		return 0, fmt.Errorf("cache backend %T cannot purge by domain", c.backend)
+	}
+	n := purger.Purge(func(key string) bool { return msgKeyIsDomain(key, domain) })
+	if n > 0 {
+		c.L().Info("cache purged by admin", zap.String("domain", domain), zap.Int("entries", n))
+	}
+	return n, nil
+}
+
+// msgKeyIsDomain reports whether a cache key was built from a query for domain
+// or for one of its subdomains. Keys are the packed query message with the id
+// zeroed, so the question has to be unpacked to read the name back.
+func msgKeyIsDomain(key, domain string) bool {
+	m := new(dns.Msg)
+	if err := m.Unpack([]byte(key)); err != nil || len(m.Question) != 1 {
+		return false
+	}
+	name := strings.ToLower(strings.TrimSuffix(m.Question[0].Name, "."))
+	return name == domain || strings.HasSuffix(name, "."+domain)
 }

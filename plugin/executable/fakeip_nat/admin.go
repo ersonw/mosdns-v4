@@ -28,6 +28,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/netip"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,11 +36,19 @@ import (
 	"go.uber.org/zap"
 )
 
-// MappingEntry and MappingStats are aliases of the shared admin types, so
-// callers can use either the concrete plugin or pkg/fakeip_admin.
+// MappingEntry, MappingStats and PurgeReport are aliases of the shared admin
+// types, so callers can use either the concrete plugin or pkg/fakeip_admin.
 type (
 	MappingEntry = fakeipadmin.Entry
 	MappingStats = fakeipadmin.Stats
+	PurgeReport  = fakeipadmin.PurgeReport
+)
+
+// The plugin is the reference implementation of both admin contracts; a build
+// failure here means a control surface lost a capability it relies on.
+var (
+	_ fakeipadmin.Admin      = (*FakeIPNatPlugin)(nil)
+	_ fakeipadmin.PurgeAdmin = (*FakeIPNatPlugin)(nil)
 )
 
 const adminListLimit = 500
@@ -125,6 +134,141 @@ func (p *FakeIPNatPlugin) AdminDeleteDomain(ctx context.Context, domain string) 
 	return true, nil
 }
 
+// AdminPurgeDomain removes every row that could still influence how the domain
+// resolves: its own mapping, the mappings of its subdomains, the real ips the
+// plane learned for all of them and the access log rows that reference them.
+// The in-memory table and the nft dnat elements go with the mappings, so the
+// next query starts from a clean state instead of reusing a stale fake ip or a
+// stale real destination.
+//
+// Subdomains are included because a provider rule matches by suffix: deleting
+// "example.com" has to take "a.example.com" with it, otherwise a name that no
+// longer has a rule keeps the answer learned under the old one.
+func (p *FakeIPNatPlugin) AdminPurgeDomain(ctx context.Context, domain string) (fakeipadmin.PurgeReport, error) {
+	var rep fakeipadmin.PurgeReport
+	domain = normalizePurgeDomain(domain)
+	if domain == "" {
+		return rep, fmt.Errorf("empty domain")
+	}
+	like := "%." + domain
+
+	// Collect the fake ips before deleting the rows: the nft elements are keyed
+	// by fake ip, and after the delete there is nothing left to read them from.
+	fakeIPs, domains, err := p.purgeCandidates(ctx, domain, like)
+	if err != nil {
+		return rep, err
+	}
+
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return rep, fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	mappings, err := deleteByDomain(ctx, tx, p.mapTable, domain, like)
+	if err != nil {
+		return rep, fmt.Errorf("delete mappings: %w", err)
+	}
+	realIPs, err := deleteByDomain(ctx, tx, p.ipTable, domain, like)
+	if err != nil {
+		return rep, fmt.Errorf("delete real ips: %w", err)
+	}
+	access, err := deleteByDomain(ctx, tx, p.accessTable, domain, like)
+	if err != nil {
+		return rep, fmt.Errorf("delete access rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return rep, fmt.Errorf("commit: %w", err)
+	}
+
+	for _, name := range domains {
+		p.removeRuntimeMapping(name)
+	}
+	for _, fakeIP := range fakeIPs {
+		p.removeNFTMapping(ctx, fakeIP)
+	}
+
+	rep.Mappings = int(mappings)
+	rep.RealIPs = int(realIPs)
+	rep.Access = int(access)
+	rep.Domains = domains
+	p.L().Info("domain purged by admin",
+		zap.String("domain", domain),
+		zap.Int64("mappings", mappings),
+		zap.Int64("real_ips", realIPs),
+		zap.Int64("access_rows", access),
+		zap.Strings("domains", domains))
+	return rep, nil
+}
+
+// purgeCandidates returns the fake ips and the domain names the purge will drop.
+func (p *FakeIPNatPlugin) purgeCandidates(ctx context.Context, domain, like string) ([]string, []string, error) {
+	rows, err := p.db.QueryContext(ctx,
+		`SELECT domain, fake_ip FROM `+p.mapTable+` WHERE `+purgeWhere, domain, like)
+	if err != nil {
+		return nil, nil, fmt.Errorf("select mappings: %w", err)
+	}
+	defer rows.Close()
+
+	var fakeIPs []string
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var name, fakeIP string
+		if err := rows.Scan(&name, &fakeIP); err != nil {
+			return nil, nil, fmt.Errorf("scan mapping: %w", err)
+		}
+		if fakeIP != "" && fakeIP != pendingFakeIP {
+			fakeIPs = append(fakeIPs, fakeIP)
+		}
+		seen[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate mappings: %w", err)
+	}
+
+	// A realip-mode run records addresses without a mapping of its own, and a
+	// domain can outlive its mapping row, so the real ip table is scanned too.
+	realRows, err := p.db.QueryContext(ctx,
+		`SELECT DISTINCT domain FROM `+p.ipTable+` WHERE `+purgeWhere, domain, like)
+	if err != nil {
+		return nil, nil, fmt.Errorf("select real ip domains: %w", err)
+	}
+	defer realRows.Close()
+	for realRows.Next() {
+		var name string
+		if err := realRows.Scan(&name); err != nil {
+			return nil, nil, fmt.Errorf("scan real ip domain: %w", err)
+		}
+		seen[name] = true
+	}
+	if err := realRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("iterate real ip domains: %w", err)
+	}
+
+	domains := make([]string, 0, len(seen))
+	for name := range seen {
+		domains = append(domains, name)
+	}
+	sort.Strings(domains)
+	return fakeIPs, domains, nil
+}
+
+// purgeWhere matches the domain itself and every subdomain of it, case
+// insensitively: the mapping table stores whatever name the query carried.
+const purgeWhere = `LOWER(domain) = ? OR LOWER(domain) LIKE ?`
+
+func deleteByDomain(ctx context.Context, tx *sql.Tx, table, domain, like string) (int64, error) {
+	res, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE `+purgeWhere, domain, like)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func normalizePurgeDomain(domain string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimSuffix(domain, ".")))
+}
+
 // AdminClearMappings drops every mapping. It is meant for a deliberate reset:
 // in-flight DNS answers keep working until the client re-resolves.
 func (p *FakeIPNatPlugin) AdminClearMappings(ctx context.Context) (int64, error) {
@@ -133,6 +277,15 @@ func (p *FakeIPNatPlugin) AdminClearMappings(ctx context.Context) (int64, error)
 		return 0, fmt.Errorf("clear mappings: %w", err)
 	}
 	n, _ := res.RowsAffected()
+
+	// A reset has to leave nothing that could steer the next resolution: the
+	// learned addresses and the visit records go with the mappings.
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM `+p.ipTable); err != nil {
+		return n, fmt.Errorf("clear real ips: %w", err)
+	}
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM `+p.accessTable); err != nil {
+		return n, fmt.Errorf("clear access rows: %w", err)
+	}
 
 	if p.runtime != nil {
 		p.runtime.clear()
