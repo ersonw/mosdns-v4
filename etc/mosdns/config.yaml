@@ -136,6 +136,12 @@ plugins:
       proxy: "trojan://admin:admin@11.10.10.13:443?sni=localhost"
       proxy_insecure: true
 #      hop_name_suffix: "mth-remote"   # one DNS label; empty = table_prefix
+      # IPv6-only names (no A record, only AAAA) get a fake IPv4 in direct tun
+      # mode only while the host itself can reach IPv6. auto probes at startup
+      # and re-checks on the interval below; off keeps the old empty answer.
+      ipv6_egress: auto               # auto | off
+      ipv6_probe: "[2606:4700:4700::1111]:443"   # address literal: no DNS needed
+      ipv6_probe_interval: "5m"       # "0" = probe once at startup
 #      record_ttl: "168h"              # drop mappings idle this long; empty = 7d, "0" = off
       access_log: true                # record which client resolved which domain
       access_ttl: "168h"              # keep access rows this long; empty = 7d, "0" = off

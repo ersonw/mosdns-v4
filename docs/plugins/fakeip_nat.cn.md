@@ -106,9 +106,16 @@ Windows 用 Wintun（需要随程序附带 `wintun.dll` 并以管理员身份运
 并依赖 `github.com/metacubex/gvisor`。
 
 DNS 层全局优先 IPv4：AAAA 查询直接返回空答复；A 查询有 A 记录时分配 fake IPv4。
-在 `use_tun: true` 且代理生效时，如果 A 查询没有 A 记录、但域名存在 AAAA（纯 IPv6），
-插件仍会分配一个 fake IPv4 并返回合成的 A 记录；代理按域名拨号，由代理侧用 IPv6 完成出站。
-该行为只用于代理模式：直连 NAT/TUN 没有真实 IPv4 可拨号，不会为纯 IPv6 域名伪造 A。
+纯 IPv6 域名（A 为空、只有 AAAA）在两种出口下仍可通过 fake IPv4 访问：
+
+- **代理出口**（`use_tun: true` 且 `proxy` 探测通过）：插件返回合成的 A 记录，把 **域名** 交给
+  代理，由代理侧用 IPv6 完成出站。
+- **直连 tun 出口**（`use_tun: true`、未配代理或代理不可用）：插件先探测本机 IPv6 出口
+  （`ipv6_egress`，见下），拨通才返回合成的 A 记录，并把探测到的 **AAAA 地址**记进 real IP 表；
+  用户态栈随后直连该地址。探测不通时保持原行为：A 是空答复、不分配、也不记录。
+
+直连路径的前提是主机自己有一条可用的 IPv6 出路（原生 v6、NAT66 或 NPTv6 均可）。链路没打通时
+探测会一直失败，插件不会伪造 A——否则客户端拿到一个永远拨不通的地址，只能超时。
 ```yaml
   - tag: fakeip_tun
     type: fakeip_nat
@@ -124,6 +131,10 @@ DNS 层全局优先 IPv4：AAAA 查询直接返回空答复；A 查询有 A 记�
       next_hop: "192.168.1.1"            # 留空则用系统默认路由的网关
       next_hop_dev: "en0"                # 留空则由路由查找决定；填了则同时绑定该网卡
       tun_route_table: 100               # 专用路由表号，仅 Linux 建表
+      # 直连出口的 IPv6 能力探测：通了才给纯 IPv6 域名分配 fake IPv4
+      ipv6_egress: auto                  # auto（默认，探测）| off（关闭，纯 IPv6 域名一律空答复）
+      ipv6_probe: "[2606:4700:4700::1111]:443"   # 探测目标，用地址字面量以免依赖 DNS
+      ipv6_probe_interval: "5m"          # 复查间隔；"0" = 只在启动时探测一次
       record_ttl: "168h"                 # 记录保留期；留空 = 7 天，"0" = 不清理
       access_log: true                    # 记录每个源 IP 解析了哪些域名，默认 true
       access_ttl: "168h"                  # 访问记录保留期；留空 = 7 天，"0" = 不清理

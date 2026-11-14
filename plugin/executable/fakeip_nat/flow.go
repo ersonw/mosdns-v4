@@ -243,11 +243,45 @@ func (p *FakeIPNatPlugin) domainForRealIP(ctx context.Context, realIP string) (s
 	return domain, nil
 }
 
-// primaryRealIP picks the most recently observed real ip of a domain. Rows
+// primaryRealIP picks the most recently observed real IPv4 of a domain. Rows
 // inside the plugin's own range are skipped: an upstream that answered with a
 // fake address, or a row written before this guard existed, would otherwise
 // become the destination every outlet is told to reach.
+//
+// IPv6 rows are ignored here on purpose: the kernel DNAT path and the traffic
+// watch are IPv4-only, and the two places that may legitimately dial IPv6 go
+// through outletRealIP.
 func (p *FakeIPNatPlugin) primaryRealIP(ctx context.Context, domain string) (netip.Addr, error) {
+	return p.realIPOfFamily(ctx, domain, false)
+}
+
+// outletRealIP is primaryRealIP for the direct outlet of the tun data path. IPv4
+// always wins, because a dual-stack name must keep leaving through the path it
+// used before. An IPv6 address is only considered when the host really can
+// reach one: without that egress the DNS half never records one, so the fallback
+// costs nothing on the normal path.
+func (p *FakeIPNatPlugin) outletRealIP(ctx context.Context, domain string) (netip.Addr, error) {
+	addr, err := p.realIPOfFamily(ctx, domain, false)
+	if err == nil {
+		return addr, nil
+	}
+	if !p.ipv6DirectReady() {
+		return netip.Addr{}, err
+	}
+	addr6, err6 := p.realIPOfFamily(ctx, domain, true)
+	if err6 != nil {
+		// Report the IPv4 miss: it is the reason the flow has no destination,
+		// and the IPv6 miss would say the same thing.
+		return netip.Addr{}, err
+	}
+	p.L().Debug("fakeip nat: outlet dials the recorded ipv6 address",
+		zap.String("domain", domain), zap.String("real_ip", addr6.String()))
+	return addr6, nil
+}
+
+// realIPOfFamily scans the in-memory then the stored real ips, and returns the
+// newest one of the requested family.
+func (p *FakeIPNatPlugin) realIPOfFamily(ctx context.Context, domain string, want6 bool) (netip.Addr, error) {
 	// The startup load keeps the newest few real ips of every domain in memory,
 	// and every answer that records ips updates it, so the normal path never
 	// reaches SQLite.
@@ -257,7 +291,7 @@ func (p *FakeIPNatPlugin) primaryRealIP(ctx context.Context, domain string) (net
 				continue
 			}
 			addr, err := netip.ParseAddr(raw)
-			if err != nil || !addr.Is4() {
+			if err != nil || (want6 && !addr.Is6()) || (!want6 && !addr.Is4()) {
 				continue
 			}
 			p.L().Debug("fakeip nat: real ip selected from the memory table",
@@ -288,9 +322,12 @@ func (p *FakeIPNatPlugin) primaryRealIP(ctx context.Context, domain string) (net
 			continue
 		}
 		addr, err := netip.ParseAddr(raw)
-		if err != nil || !addr.Is4() {
+		if err != nil {
 			p.L().Debug("fakeip nat: stored real ip is invalid",
 				zap.String("domain", domain), zap.String("real_ip", raw))
+			continue
+		}
+		if (want6 && !addr.Is6()) || (!want6 && !addr.Is4()) {
 			continue
 		}
 		if p.runtime != nil {
@@ -367,4 +404,24 @@ func (p *FakeIPNatPlugin) reversePacket(pkt *packetView) (bool, error) {
 	pkt.setDstPort(target.port)
 	pkt.recomputeChecksums()
 	return true, nil
+}
+
+// ipv6DirectReady reports whether a direct outlet may dial IPv6. Probing turned
+// off and a failed probe both answer false, which is exactly the pre-existing
+// behaviour: an IPv6-only name keeps getting an empty A response.
+func (p *FakeIPNatPlugin) ipv6DirectReady() bool {
+	return p.v6egress.Ready()
+}
+
+// onlyIPv4 drops IPv6 entries. The nft sets this plugin writes are typed `ip`,
+// so an IPv6 element would be rejected, and the mark path only ever steers the
+// IPv4 dials that actually leave from the fake range.
+func onlyIPv4(ips []string) []string {
+	var out []string
+	for _, raw := range ips {
+		if addr, err := netip.ParseAddr(raw); err == nil && addr.Is4() {
+			out = append(out, raw)
+		}
+	}
+	return out
 }

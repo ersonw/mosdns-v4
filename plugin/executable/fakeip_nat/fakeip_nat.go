@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -115,6 +116,20 @@ type Args struct {
 	Proxy string `yaml:"proxy"`
 	// ProxyInsecure 跳过 https / trojan 代理的证书校验，供自签证书使用。
 	ProxyInsecure bool `yaml:"proxy_insecure"`
+
+	// IPv6Egress 控制直连 tun 出口的 IPv6 能力探测，默认 "auto"：
+	// auto：启动时拨一次 ipv6_probe，之后按 ipv6_probe_interval 复查。拨通才给
+	// 纯 IPv6 域名（A 为空、只有 AAAA）分配虚拟 IPv4，让客户端用假 IPv4 进来、
+	// 插件再直连真实 IPv6 地址出去；拨不通则维持原行为，A 仍是空应答。
+	// off：关闭探测，纯 IPv6 域名一律不分配虚拟 IP。
+	// 只在 use_tun 且 realip=false 时生效；配了可用 proxy 时仍按代理路径处理。
+	IPv6Egress string `yaml:"ipv6_egress"`
+	// IPv6Probe 是探测目标（host:port），默认 "[2606:4700:4700::1111]:443"。
+	// 用地址字面量，避免探测本身依赖本插件的 DNS 答复。
+	IPv6Probe string `yaml:"ipv6_probe"`
+	// IPv6ProbeInterval 是重复探测间隔，默认 "5m"；"0" 表示只在启动时探测一次。
+	// 链路（NAT66 / NPTv6）后来才打通时靠它自动接上，不必重启。
+	IPv6ProbeInterval string `yaml:"ipv6_probe_interval"`
 
 	// HopNameSuffix 是路由探测时给每一跳分配的反向解析后缀，默认复用 table_prefix
 	// （下划线换成连字符）：
@@ -248,6 +263,10 @@ type FakeIPNatPlugin struct {
 	// answered: a proxy cannot carry ICMP, so a proxied outlet answers it
 	// locally and a direct one forwards it to the real host.
 	proxyActive bool
+	// v6egress answers whether a direct outlet can reach an IPv6 destination.
+	// Nil means probing is off, and then an IPv6-only name keeps getting the
+	// empty answer it always got.
+	v6egress *v6EgressProbe
 
 	// Tun outlet routing: a dedicated table keeps the fake range out of the
 	// host default route, so only the new sockets opened for a flow leave
@@ -408,7 +427,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		zap.String("next_hop_dev", cfg.NextHopDev),
 		zap.Bool("realip", cfg.RealIP),
 		zap.Int("mss_clamp", cfg.MSSClamp),
-		zap.Bool("proxy_configured", strings.TrimSpace(cfg.Proxy) != ""))
+		zap.Bool("proxy_configured", strings.TrimSpace(cfg.Proxy) != ""),
+		zap.String("ipv6_egress", strings.TrimSpace(cfg.IPv6Egress)),
+		zap.String("ipv6_probe", strings.TrimSpace(cfg.IPv6Probe)))
 
 	if !validTableName.MatchString(cfg.TablePrefix) {
 		return nil, fmt.Errorf("invalid table_prefix %q: only alphanumeric and underscore allowed", cfg.TablePrefix)
@@ -442,6 +463,24 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if cfg.MSSClamp > 0 && (cfg.UseTun || cfg.RealIP) {
 		bp.L().Warn("mss_clamp only applies to the fake-ip nft table",
 			zap.Int("mss_clamp", cfg.MSSClamp), zap.Bool("use_tun", cfg.UseTun), zap.Bool("realip", cfg.RealIP))
+	}
+
+	// IPv6 egress detection: a direct outlet can only answer a fake IPv4 for an
+	// IPv6-only name when the host itself can reach IPv6. The probe target and
+	// the mode are fixed at startup; only the result is refreshed.
+	switch strings.ToLower(strings.TrimSpace(cfg.IPv6Egress)) {
+	case "", "auto", "off", "disable", "disabled":
+	default:
+		return nil, fmt.Errorf("invalid ipv6_egress %q: must be auto or off", cfg.IPv6Egress)
+	}
+	ipv6ProbeInterval, err := parseIPv6ProbeInterval(cfg.IPv6ProbeInterval)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.IPv6Probe != "" {
+		if _, _, splitErr := net.SplitHostPort(cfg.IPv6Probe); splitErr != nil {
+			return nil, fmt.Errorf("invalid ipv6_probe %q: want host:port, e.g. [2606:4700:4700::1111]:443", cfg.IPv6Probe)
+		}
 	}
 
 	db, err := sql.Open("sqlite", cfg.DBPath+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
@@ -666,6 +705,20 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			}
 			probeCancel()
 			p.logStep("proxy-probe", probeStarted)
+		}
+	}
+
+	// IPv6 egress is the one input the DNS half cannot see: a fake IPv4 for an
+	// IPv6-only name is useless unless the outlet can dial the address behind
+	// it. The probe runs before the first answer so a restart decides with the
+	// state of the link now, not with one from hours ago. A proxied outlet
+	// needs no probe: it is told the domain and resolves it on the proxy side.
+	if p.useTun && !p.realIP && !p.proxyActive {
+		p.v6egress = newIPv6EgressProbe(cfg, ipv6ProbeInterval, p.L())
+		if p.v6egress != nil {
+			probeStarted := time.Now()
+			p.v6egress.Start(context.Background(), p.L())
+			p.logStep("ipv6-egress-probe", probeStarted)
 		}
 	}
 
@@ -989,6 +1042,7 @@ func (p *FakeIPNatPlugin) Close() error {
 	p.stopTunDataPath()
 	p.stopTunEgress()
 	p.stopTrafficWatch()
+	p.v6egress.Stop()
 	if p.db != nil {
 		if err := p.db.Close(); err != nil {
 			p.L().Warn("fakeip nat: close sqlite failed", zap.String("db_path", p.dbPath), zap.Error(err))
@@ -1054,46 +1108,77 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	resp := qCtx.R()
 	if resp != nil && question.Qtype == dns.TypeA {
 		var realIPs []string
-		hasAAAA := false
+		// Addresses carried inside an A answer. Unusual, but some upstreams
+		// leave an AAAA there, and it is free proof the name is usable over
+		// IPv6.
+		var answerV6 []string
 		for _, ans := range resp.Answer {
 			switch rr := ans.(type) {
 			case *dns.A:
 				realIPs = append(realIPs, rr.A.String())
 			case *dns.AAAA:
-				// Some upstreams put an AAAA in an A response. Treat it as
-				// proof that the name is usable over IPv6 without a second
-				// lookup.
-				hasAAAA = true
+				answerV6 = append(answerV6, rr.AAAA.String())
 			}
 		}
+		hasAAAA := len(answerV6) > 0
 
-		// A proxied outlet dials the domain, not a real IPv4, so an
-		// IPv6-only name is still usable through it. Give the client a fake
-		// IPv4 instead of leaving it with an empty A answer; otherwise a
-		// client that asks A first can never reach the name through the
-		// proxy. This is limited to proxy mode: the direct NAT/TUN path
-		// needs a real IPv4 to dial.
+		// An IPv6-only name needs a fake IPv4 before any client can reach it.
+		// Two outlets can carry it: a proxy dials the domain and does not need
+		// an address, while a direct tun outlet dials the address itself and
+		// therefore needs a working IPv6 egress. The direct case is decided by
+		// the egress probe rather than by the query: with no IPv6 path the
+		// answer stays empty, which is what a host without IPv6 always produced.
 		ipv6Only := false
-		if len(realIPs) == 0 && p.proxyActive && !p.realIP && resp.Rcode == dns.RcodeSuccess {
+		// dialIPs holds the addresses a direct outlet may dial. The proxy path
+		// leaves it empty on purpose: it is told the domain, not the address.
+		var dialIPs []string
+		if len(realIPs) == 0 && !p.realIP && resp.Rcode == dns.RcodeSuccess {
 			domain := strings.TrimSuffix(question.Name, ".")
-			if p.runtime != nil {
-				if _, ok := p.runtime.fakeOf(domain); ok {
+			switch {
+			case p.proxyActive:
+				if p.runtime != nil {
+					if _, ok := p.runtime.fakeOf(domain); ok {
+						ipv6Only = true
+					}
+				}
+				if !ipv6Only && (hasAAAA || len(p.domainAAAAs(ctx, qCtx, next)) > 0) {
 					ipv6Only = true
 				}
+			case p.ipv6DirectReady():
+				dialIPs = answerV6
+				if len(dialIPs) == 0 && p.runtime != nil {
+					// A mapping answered earlier already recorded the addresses,
+					// so the common repeat query costs no extra upstream lookup.
+					dialIPs = p.runtime.v6Of(domain)
+				}
+				if len(dialIPs) == 0 {
+					dialIPs = p.domainAAAAs(ctx, qCtx, next)
+				}
+				ipv6Only = len(dialIPs) > 0
 			}
-			if !ipv6Only && (hasAAAA || p.domainHasAAAA(ctx, qCtx, next)) {
-				ipv6Only = true
-				p.L().Debug("fakeip nat: ipv6-only domain allocated for proxy",
-					zap.String("domain", domain))
+			if ipv6Only {
+				p.L().Debug("fakeip nat: ipv6-only domain allocated",
+					zap.String("domain", domain),
+					zap.Bool("proxy_outlet", p.proxyActive),
+					zap.Int("dial_addresses", len(dialIPs)))
 			}
 		}
 
 		if len(realIPs) > 0 || ipv6Only {
 			domain := strings.TrimSuffix(question.Name, ".")
-			if len(realIPs) > 0 {
+			// recorded is what goes into the real-ip table and the data path.
+			// The proxy path stores nothing for these names: its mapping is the
+			// domain, and a fake row would only be mistaken for a dialable one.
+			recorded := realIPs
+			if len(realIPs) == 0 && len(dialIPs) > 0 {
+				recorded = dialIPs
+				p.L().Debug("fakeip nat: ipv6 destinations recorded",
+					zap.String("domain", domain), zap.Strings("real_ips", dialIPs))
+			}
+			if len(recorded) > 0 {
 				p.L().Debug("fakeip nat: real ips collected",
-					zap.String("domain", domain), zap.Int("count", len(realIPs)), zap.Strings("real_ips", realIPs))
-				p.learnWatchRealIPs(domain, realIPs)
+					zap.String("domain", domain), zap.Int("count", len(recorded)), zap.Strings("real_ips", recorded))
+				p.learnWatchRealIPs(domain, recorded)
 			}
 			if p.realIP {
 				// Pure routing mode: the answer keeps the real IPs and the
@@ -1102,7 +1187,7 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 					zap.String("domain", domain), zap.Strings("real_ips", realIPs))
 				go p.syncRealRoutes(context.Background(), realIPs)
 			} else {
-				fakeIP, err := p.recordAndAllocate(ctx, domain, realIPs)
+				fakeIP, err := p.recordAndAllocate(ctx, domain, recorded)
 				if err != nil {
 					p.L().Error("sqlite record fakeip failed", zap.String("domain", domain), zap.Error(err))
 				} else if fakeAddr, err := netip.ParseAddr(fakeIP); err != nil {
@@ -1113,15 +1198,17 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 					// tun + fakeip learns its real destinations from the answer
 					// rather than from a DNAT write, so this is where the mark
 					// set is fed. The write is not on the answer path: the client
-					// may not connect for another few milliseconds.
+					// may not connect for another few milliseconds. The set is
+					// typed `ip`, so an IPv6 address would be rejected there and
+					// is never needed: the mark path only steers IPv4 dials.
 					if p.useTun && p.markActiveNow() {
-						p.markAnsweredIPs(realIPs)
+						p.markAnsweredIPs(onlyIPv4(recorded))
 					}
 					// Wait for the data plane before answering: a client that
 					// receives a fake IP while the DNAT entry is still missing
 					// can only fail, which is what "the mapping exists but the
 					// client got a real IP" looked like from the outside.
-					ready := p.dispatchNAT(ctx, fakeIP, domain, strings.Join(realIPs, ","))
+					ready := p.dispatchNAT(ctx, fakeIP, domain, strings.Join(recorded, ","))
 					if !ready {
 						p.L().Warn("nat mapping not ready, answering fake ip anyway",
 							zap.String("domain", domain), zap.String("fake_ip", fakeIP))
@@ -1159,18 +1246,21 @@ func (p *FakeIPNatPlugin) Exec(ctx context.Context, qCtx *query_context.Context,
 	return nil
 }
 
-// domainHasAAAA asks the rest of the chain whether the name has an AAAA
-// record. It is only used in proxy mode when an A answer came back empty:
-// the proxy carries the domain, so an IPv6-only name can still get a fake
-// IPv4 for the client to connect to. The query goes through the same chain
-// as the original A query, so cache and upstream selection stay consistent.
-func (p *FakeIPNatPlugin) domainHasAAAA(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) bool {
+// domainAAAAs asks the rest of the chain for the AAAA records of the name. It
+// runs when an A answer came back empty and the outlet can still carry an
+// IPv6-only name. The query goes through the same chain as the original A
+// query, so cache and upstream selection stay consistent, and it produces the
+// addresses a direct outlet dials rather than a boolean.
+//
+// next must be a node that can answer a query: when this plugin sits at the end
+// of its sequence there is nothing to ask, and the caller keeps the empty answer.
+func (p *FakeIPNatPlugin) domainAAAAs(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) []string {
 	if next == nil {
-		return false
+		return nil
 	}
 	q := qCtx.Q()
 	if len(q.Question) == 0 {
-		return false
+		return nil
 	}
 	aaaaQ := q.Copy()
 	aaaaQ.Question[0].Qtype = dns.TypeAAAA
@@ -1178,18 +1268,21 @@ func (p *FakeIPNatPlugin) domainHasAAAA(ctx context.Context, qCtx *query_context
 	if err := executable_seq.ExecChainNode(ctx, aaaaCtx, next); err != nil {
 		p.L().Debug("fakeip nat: aaaa lookup for ipv6-only domain failed",
 			zap.String("name", q.Question[0].Name), zap.Error(err))
-		return false
+		return nil
 	}
 	resp := aaaaCtx.R()
 	if resp == nil || resp.Rcode != dns.RcodeSuccess {
-		return false
+		return nil
 	}
+	var addrs []string
 	for _, ans := range resp.Answer {
-		if _, ok := ans.(*dns.AAAA); ok {
-			return true
+		if rr, ok := ans.(*dns.AAAA); ok {
+			if addr, err := netip.ParseAddr(rr.AAAA.String()); err == nil && addr.Is6() {
+				addrs = append(addrs, addr.String())
+			}
 		}
 	}
-	return false
+	return addrs
 }
 
 // recordAndAllocate returns a stable fake ip for domain and records the

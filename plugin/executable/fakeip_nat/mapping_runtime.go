@@ -108,6 +108,26 @@ func (m *runtimeMap) realsOf(domain string) []string {
 	return out
 }
 
+// v6Of returns the IPv6 addresses recorded for a domain, newest first. A
+// direct outlet needs the address itself, not just the proof that one exists,
+// so unlike the proxy path it cannot work from a boolean.
+func (m *runtimeMap) v6Of(domain string) []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var out []string
+	for _, raw := range m.realByDomain[domain] {
+		addr, err := netip.ParseAddr(raw)
+		if err != nil || !addr.Is6() {
+			continue
+		}
+		out = append(out, raw)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func (m *runtimeMap) domainOfReal(realIP string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

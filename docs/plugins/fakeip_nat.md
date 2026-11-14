@@ -115,11 +115,39 @@ as `domain:port` and the proxy resolves the name. Without a proxy, the plugin
 looks up the most recent real IP for the domain and dials it directly.
 
 DNS answers prefer IPv4 globally: AAAA queries get an empty answer, and A
-queries with an A record get a fake IPv4. With `use_tun: true` and a working
-proxy, a name that has only AAAA records still receives a fake IPv4 and a
-synthesized A answer; the proxy dials the domain and resolves it over IPv6 on
-its side. This path is proxy-only: direct NAT/TUN has no real IPv4 to dial and
-does not synthesize an A for an IPv6-only name.
+queries with an A record get a fake IPv4. An IPv6-only name (no A record, only
+AAAA) can still be reached through a fake IPv4 in two cases:
+
+- **Proxied outlet** (`use_tun: true` with a working `proxy`): the plugin
+  returns a synthesized A answer and dials the *domain*, leaving IPv6 resolution
+  to the proxy.
+- **Direct tun outlet** (`use_tun: true`, no proxy or an unusable proxy): the
+  plugin probes the host's own IPv6 egress first (`ipv6_egress`, below). When
+  the probe succeeds it returns the synthesized A answer and records the probed
+  **AAAA addresses** in the real-IP table, so the userspace stack can dial them.
+  When the probe fails the old behaviour is kept exactly: empty A answer, no
+  allocation, nothing recorded.
+
+The direct path requires a working IPv6 uplink on the box itself (native IPv6,
+NAT66 or NPTv6 all qualify). Without one the probe keeps failing and no fake A
+is handed out — a client that received one could only time out.
+
+```yaml
+  - tag: fakeip_tun
+    type: fakeip_nat
+    args:
+      use_tun: true
+      proxy: "socks5h://user:pass@10.0.0.9:1080"
+      proxy_insecure: false
+      next_hop: "192.168.1.1"
+      next_hop_dev: "en0"
+      tun_route_table: 100
+      # Direct-outlet IPv6 detection: a fake IPv4 for an IPv6-only name is
+      # only handed out while this probe succeeds.
+      ipv6_egress: auto                 # auto (default, probe) | off (never allocate)
+      ipv6_probe: "[2606:4700:4700::1111]:443"   # address literal, so the probe never needs DNS
+      ipv6_probe_interval: "5m"         # re-check period; "0" probes once at startup
+```
 
 ### Direct egress and SNAT
 

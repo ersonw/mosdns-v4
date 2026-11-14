@@ -47,7 +47,10 @@ type directEgress struct {
 
 func (e *directEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	d := e.dialer
-	if e.local.IsValid() {
+	// local is the fake range address, i.e. IPv4. Binding it to an IPv6 target
+	// fails before a packet is sent ("address family not supported"), so an
+	// IPv6-only name leaves with the host's own source address instead.
+	if e.local.IsValid() && !isIPv6Target(addr) {
 		ip := net.IP(e.local.AsSlice())
 		if strings.HasPrefix(network, "udp") {
 			d.LocalAddr = &net.UDPAddr{IP: ip}
@@ -59,6 +62,18 @@ func (e *directEgress) DialContext(ctx context.Context, network, addr string) (n
 		bindToDevice(&d, e.dev)
 	}
 	return d.DialContext(ctx, network, addr)
+}
+
+// isIPv6Target reports whether addr is an IPv6 host:port. A bare address is
+// accepted too, because a caller that already split the port passes it back.
+func isIPv6Target(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	parsed, err := netip.ParseAddr(host)
+	return err == nil && parsed.Is6()
 }
 
 // newEgress builds the outlet described by a proxy link. An empty link means

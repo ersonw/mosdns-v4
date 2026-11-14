@@ -477,7 +477,7 @@ func (p *FakeIPNatPlugin) dialTarget(localAddr string, port uint16) (string, err
 			zap.String("fake_ip", fake.String()), zap.String("domain", domain), zap.String("target", target))
 		return target, nil
 	}
-	real, err := p.primaryRealIP(ctx, domain)
+	real, err := p.outletRealIP(ctx, domain)
 	if err != nil {
 		return "", err
 	}
@@ -684,7 +684,7 @@ func (p *FakeIPNatPlugin) realTarget(localAddr string, port uint16) (string, err
 	if err != nil {
 		return "", err
 	}
-	real, err := p.primaryRealIP(ctx, domain)
+	real, err := p.outletRealIP(ctx, domain)
 	if err != nil {
 		return "", err
 	}
