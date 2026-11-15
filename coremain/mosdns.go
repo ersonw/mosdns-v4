@@ -154,6 +154,16 @@ func RunMosdns(cfg *Config) error {
 	done := registerActive(m)
 	defer clearActive(m, done)
 
+	// The runtime limits come first: every plugin below allocates with them in
+	// place, and a router must not be allowed to grow past its memory ceiling.
+	if err := applyRuntimeConfig(cfg.Runtime); err != nil {
+		return err
+	}
+	logRuntimeSettings(lg, cfg.Runtime)
+	if err := startMemoryGovernor(lg, cfg.Runtime, m.sc); err != nil {
+		return err
+	}
+
 	m.httpAPIMux.Handle("/metrics", promhttp.HandlerFor(m.metricsReg, promhttp.HandlerOpts{}))
 	m.httpAPIMux.HandleFunc("/debug/pprof/", pprof.Index)
 	m.httpAPIMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)

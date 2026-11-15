@@ -127,7 +127,12 @@ func (p *FakeIPNatPlugin) sweepRecords(ctx context.Context) {
 		p.L().Warn("fakeip nat: retention scan failed", zap.Error(err))
 		return
 	}
-	var all []mappingRow
+	// Only the rows this pass will act on are kept: the previous version copied
+	// every row into one slice first, which doubled the memory of a table that
+	// exists precisely because it grew large, and the copy was freed only after
+	// the transaction committed.
+	scanned := 0
+	var expired, refreshed []mappingRow
 	for rows.Next() {
 		var r mappingRow
 		if err := rows.Scan(&r.domain, &r.fakeIP, &r.stored, &r.newest); err != nil {
@@ -135,23 +140,13 @@ func (p *FakeIPNatPlugin) sweepRecords(ctx context.Context) {
 			p.L().Warn("fakeip nat: retention scan failed", zap.Error(err))
 			return
 		}
+		scanned++
 		if mem := p.runtime.lastSeenOf(r.domain); mem > r.newest {
 			r.newest = mem
 		}
 		if r.stored > r.newest {
 			r.newest = r.stored
 		}
-		all = append(all, r)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		p.L().Warn("fakeip nat: retention scan failed", zap.Error(err))
-		return
-	}
-	rows.Close()
-
-	var expired, refreshed []mappingRow
-	for _, r := range all {
 		if isPendingFakeIP(r.fakeIP) {
 			continue // an allocation in progress is never expired
 		}
@@ -163,6 +158,12 @@ func (p *FakeIPNatPlugin) sweepRecords(ctx context.Context) {
 			refreshed = append(refreshed, r)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		p.L().Warn("fakeip nat: retention scan failed", zap.Error(err))
+		return
+	}
+	rows.Close()
 
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -208,7 +209,7 @@ func (p *FakeIPNatPlugin) sweepRecords(ctx context.Context) {
 		p.runtime.remove(r.domain)
 	}
 	p.L().Debug("fakeip nat: retention sweep done",
-		zap.Int("scanned", len(all)), zap.Int("expired", removed),
+		zap.Int("scanned", scanned), zap.Int("expired", removed),
 		zap.Int("refreshed", len(refreshed)), zap.Int64("real_ips_dropped", realRemoved),
 		zap.Int64("cutoff", cutoff))
 }

@@ -42,6 +42,12 @@ func isPendingFakeIP(fakeIP string) bool {
 // defaultTaskConcurrency caps how many NAT tasks run at the same time.
 const defaultTaskConcurrency = 8
 
+// realIPWriteInterval throttles the durable copy of a domain's real ips. The
+// database is the restart fallback, not the read path: the memory table answers
+// lookups, and syncNAT gets the freshest candidates from the answer itself. One
+// row write per answer per domain was pure overhead on a busy resolver.
+const realIPWriteInterval = 5 * time.Minute
+
 var validTableName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 // route tables are either a name (main, oversea) or an iproute2 id.
@@ -179,8 +185,15 @@ type FakeIPNatPlugin struct {
 	accessTable   string
 	retentionStop chan struct{}
 	retentionOnce sync.Once
-	nextHop       string
-	nextHopDev    string
+	// accessBuf batches the per-client rows so the answer path never writes
+	// SQLite: a router answers hundreds of queries per second and every upsert
+	// was a separate serialized round trip on the single connection.
+	accessMu        sync.Mutex
+	accessBuf       map[accessKey]accessRow
+	accessFlushStop chan struct{}
+	accessFlushDone chan struct{}
+	nextHop         string
+	nextHopDev      string
 	// realIP mirrors Args.RealIP: when set the plugin answers real IPs and only
 	// maintains the host routes that steer them out of the chosen gateway.
 	realIP  bool
@@ -246,6 +259,18 @@ type FakeIPNatPlugin struct {
 	natMu    sync.Mutex // serializes nft / ip command sequences
 	runner   cmdRunner
 	probe    func(ctx context.Context, ip string) bool
+	// nftMirror is the in-memory copy of the DNAT map (fake ip -> real ip).
+	// The plugin writes every element itself, so reading the kernel map is
+	// only needed at startup; the answer path must not pay a dump per domain.
+	nftMu       sync.Mutex
+	nftMirror   map[string]string
+	nftLoaded   bool // a full read happened; the mirror is authoritative
+	nftVerified bool // the table was validated for this run
+	// ownedCache memoizes the set of prefixes the ledger owns, for one ledger
+	// version (see ownedPrefixSet).
+	ownedMu       sync.Mutex
+	ownedCache    map[string]struct{}
+	ownedCacheVer uint64
 
 	// Traffic watch: the tun reader feeds trafficWatch directly; the non-tun
 	// fakeip path polls conntrack because the kernel DNAT never exposes the
@@ -597,6 +622,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		realRoutes:          make(map[string]struct{}),
 		taskSem:             make(chan struct{}, defaultTaskConcurrency),
 		taskInFlight:        make(map[string]struct{}),
+		nftMirror:           make(map[string]string),
 
 		hopSuffix:         cfg.HopNameSuffix,
 		routeTable:        cfg.RouteTable,
@@ -645,6 +671,10 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// Stale mappings are dropped in the background, so a database that has been
 	// growing for months does not need a manual vacuum.
 	p.startRecordRetention()
+
+	// Per-client rows are buffered and written in batches, so no SQLite call
+	// sits on the answer path any more.
+	p.startAccessFlusher()
 
 	// Everything the data path needs is now in memory: the maintenance loop only
 	// keeps the durable copies fresh.
@@ -1050,6 +1080,7 @@ func (p *FakeIPNatPlugin) Close() error {
 	p.startupWG.Wait()
 	p.cleanupDataPath()
 	p.stopRecordRetention()
+	p.stopAccessFlusher()
 	p.stopTunDataPath()
 	p.stopTunEgress()
 	p.stopTrafficWatch()
@@ -1302,6 +1333,23 @@ func (p *FakeIPNatPlugin) domainAAAAs(ctx context.Context, qCtx *query_context.C
 func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, realIPs []string) (string, error) {
 	now := time.Now().Unix()
 
+	// Fast path: a domain that already owns an address is answered straight
+	// from the memory mirror. The row is written once, when the address is
+	// allocated, so a re-resolution - which happens once per cache TTL - must
+	// not pay an INSERT, a SELECT and a real-ip upsert again. All three are
+	// serialized on the single SQLite connection, and the mirror is restored
+	// from the database at startup and updated by every allocation and admin
+	// write, so it always agrees with the durable copy.
+	if p.runtime != nil {
+		if fakeIP, ok := p.runtime.fakeOf(domain); ok && !isPendingFakeIP(fakeIP) {
+			if err := p.upsertRealIPs(ctx, domain, realIPs, now); err != nil {
+				p.L().Warn("upsert real ips failed", zap.String("domain", domain), zap.Int("ip_count", len(realIPs)), zap.Error(err))
+			}
+			p.runtime.touch(domain, now)
+			return fakeIP, nil
+		}
+	}
+
 	// Real ips are idempotent upserts, so they do not need the allocation lock.
 	if err := p.upsertRealIPs(ctx, domain, realIPs, now); err != nil {
 		p.L().Warn("upsert real ips failed", zap.String("domain", domain), zap.Int("ip_count", len(realIPs)), zap.Error(err))
@@ -1443,16 +1491,28 @@ func (p *FakeIPNatPlugin) allocateFakeIP(id uint64) (string, error) {
 	return addr.String(), nil
 }
 
-// upsertRealIPs stores all real ips of domain in one round trip.
-func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, realIPs []string, now int64) error {
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(p.ipTable)
-	b.WriteString(" (domain, real_ip, last_seen) VALUES ")
+// sameIPList reports whether two address lists carry the same addresses in the
+// same order, which is what an unchanged answer produces.
+func sameIPList(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
-	args := make([]interface{}, 0, len(realIPs)*3)
+// upsertRealIPs stores all real ips of domain in one round trip. The memory
+// table is refreshed on every answer because it is what a lookup reads, while
+// the durable copy is written at most once per realIPWriteInterval: the
+// database is only the restart fallback, and a write per answer was the largest
+// remaining piece of work on the answer path.
+func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, realIPs []string, now int64) error {
+	kept := make([]string, 0, len(realIPs))
 	seen := make(map[string]struct{}, len(realIPs))
-	n := 0
 	for _, ip := range realIPs {
 		if _, ok := seen[ip]; ok {
 			continue
@@ -1466,30 +1526,50 @@ func (p *FakeIPNatPlugin) upsertRealIPs(ctx context.Context, domain string, real
 				zap.String("domain", domain), zap.String("real_ip", ip))
 			continue
 		}
-		if n > 0 {
+		kept = append(kept, ip)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	// The memory table takes the same rows, so the next lookup is answered
+	// without asking SQLite again. Only a write that would repeat exactly what
+	// is already stored is throttled: when the answer changed the address list
+	// the durable copy is stale and has to be refreshed now, whatever the
+	// interval says.
+	write := true
+	if p.runtime != nil {
+		changed := !sameIPList(p.runtime.realsOf(domain), kept)
+		p.runtime.putReal(domain, kept)
+		if changed {
+			p.runtime.markWritten(domain, now)
+		} else {
+			write = p.runtime.dueForWrite(domain, now, realIPWriteInterval)
+		}
+	}
+	if !write {
+		return nil
+	}
+
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(p.ipTable)
+	b.WriteString(" (domain, real_ip, last_seen) VALUES ")
+	args := make([]interface{}, 0, len(kept)*3)
+	for i, ip := range kept {
+		if i > 0 {
 			b.WriteString(",")
 		}
 		b.WriteString("(?,?,?)")
 		args = append(args, domain, ip, now)
-		n++
-	}
-	if n == 0 {
-		return nil
 	}
 	b.WriteString(" ON CONFLICT(domain, real_ip) DO UPDATE SET last_seen = excluded.last_seen")
 	if _, err := p.db.ExecContext(ctx, b.String(), args...); err != nil {
-		return err
-	}
-	// The write went through, so the memory table takes the same rows: the next
-	// lookup is answered without asking SQLite again.
-	if p.runtime != nil {
-		kept := make([]string, 0, len(realIPs))
-		for _, ip := range realIPs {
-			if !p.isFakeAddrString(ip) {
-				kept = append(kept, ip)
-			}
+		// The durable copy is still missing these rows, so the next answer has
+		// to try again instead of waiting out the throttle window.
+		if p.runtime != nil {
+			p.runtime.forgetWrite(domain)
 		}
-		p.runtime.putReal(domain, kept)
+		return err
 	}
 	return nil
 }

@@ -411,4 +411,8 @@ func (p *FakeIPNatPlugin) removeNFTMapping(ctx context.Context, fakeIP string) {
 		p.L().Debug("delete nft mapping failed",
 			zap.String("table", p.nftTableName()), zap.String("fake_ip", fakeIP), zap.Error(err))
 	}
+	// Whatever the kernel said, this plugin no longer treats the mapping as
+	// installed, so the next sync writes it again instead of trusting a stale
+	// mirror entry.
+	p.nftForget(fakeIP)
 }

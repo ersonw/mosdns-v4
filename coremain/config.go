@@ -33,12 +33,35 @@ type Config struct {
 	Servers       []ServerConfig                     `yaml:"servers"`
 	API           APIConfig                          `yaml:"api"`
 
+	// Runtime tunes the Go runtime itself: its thread count, GC target and
+	// memory ceiling. Every field is optional, and an empty block leaves the
+	// values Go was built with, so an existing configuration keeps working
+	// unchanged.
+	Runtime RuntimeConfig `yaml:"runtime"`
+
 	// Experimental
 	Security SecurityConfig `yaml:"security"`
 
 	// configDir is the directory of the loaded main config file. It is filled
 	// by startServer after config loading and is not part of the YAML schema.
 	configDir string
+}
+
+// RuntimeConfig is the optional `runtime:` block. A router has a small,
+// fixed amount of memory and shares its CPU with the packet path, so the
+// runtime has to be told about the ceiling instead of growing until the OOM
+// killer intervenes:
+//
+//	runtime:
+//	  maxprocs: 2               # GOMAXPROCS; 0 keeps the detected core count
+//	  gc_percent: 50            # GOGC; 0 keeps the default 100
+//	  memory_limit: 256MiB      # GOMEMLIMIT style soft ceiling; empty disables
+//	  scavenge_interval: 10m    # return free pages to the OS on this period
+type RuntimeConfig struct {
+	MaxProcs         int    `yaml:"maxprocs"`
+	GCPercent        int    `yaml:"gc_percent"`
+	MemoryLimit      string `yaml:"memory_limit"`
+	ScavengeInterval string `yaml:"scavenge_interval"`
 }
 
 // ConfigDir returns the directory of the loaded main config file.

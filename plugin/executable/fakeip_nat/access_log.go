@@ -60,9 +60,37 @@ func accessTableSQL(accessTable string) string {
 	CREATE INDEX IF NOT EXISTS idx_%s_last_seen ON %s(last_seen);`, accessTable, accessTable, accessTable)
 }
 
+// accessFlushInterval is how often the buffered per-client rows are written in
+// one transaction. accessBufLimit bounds the buffer so a burst cannot grow it
+// without limit; the flusher drains it off the answer path either way.
+const (
+	accessFlushInterval = 10 * time.Second
+	accessBufLimit      = 2048
+)
+
+// accessKey identifies one (client, domain) row. The same pair is one row in
+// the table, so the buffer aggregates exactly like the upsert does.
+type accessKey struct {
+	clientIP string
+	domain   string
+}
+
+type accessRow struct {
+	clientIP            string
+	domain              string
+	fakeIP              string
+	firstSeen, lastSeen int64
+	hits                int
+}
+
+func newAccessBuf() map[accessKey]accessRow {
+	return make(map[accessKey]accessRow)
+}
+
 // recordAccess notes that clientIP resolved domain to fakeIP. It is
 // deliberately best effort: the answer has already been produced and must not
-// be delayed or failed by bookkeeping.
+// be delayed or failed by bookkeeping. With a running flusher the row only
+// enters the buffer, so no SQLite call happens on the answer path.
 func (p *FakeIPNatPlugin) recordAccess(qCtx *query_context.Context, domain, fakeIP string) {
 	if !p.accessLog {
 		return
@@ -76,21 +104,142 @@ func (p *FakeIPNatPlugin) recordAccess(qCtx *query_context.Context, domain, fake
 	clientIP := meta.ClientAddr.Unmap().String()
 	now := time.Now().Unix()
 
-	// The upsert keeps first_seen and increments hits, so one client hitting
-	// the same domain repeatedly stays one row.
+	row := accessRow{
+		clientIP: clientIP, domain: domain, fakeIP: fakeIP,
+		firstSeen: now, lastSeen: now, hits: 1,
+	}
+
+	p.accessMu.Lock()
+	if p.accessFlushStop == nil {
+		// No flusher (the plugin was built by hand, or unit tests): keep the
+		// write synchronous so the row is visible immediately.
+		p.accessMu.Unlock()
+		p.writeAccessRows([]accessRow{row})
+		return
+	}
+	key := accessKey{clientIP: clientIP, domain: domain}
+	if old, ok := p.accessBuf[key]; ok {
+		old.fakeIP = fakeIP
+		if now > old.lastSeen {
+			old.lastSeen = now
+		}
+		old.hits++
+		p.accessBuf[key] = old
+	} else if len(p.accessBuf) >= accessBufLimit {
+		// The buffer is full: flush what is there on this goroutine rather than
+		// dropping the row, then start a fresh buffer.
+		p.accessMu.Unlock()
+		p.flushAccess()
+		p.accessMu.Lock()
+		p.accessBuf[key] = row
+	} else {
+		p.accessBuf[key] = row
+	}
+	p.accessMu.Unlock()
+
+	p.L().Debug("fakeip nat: access recorded",
+		zap.String("client_ip", clientIP), zap.String("domain", domain), zap.String("fake_ip", fakeIP))
+}
+
+// startAccessFlusher drains accessBuf on a timer. The rows go in one
+// transaction, so the per-answer cost disappears and SQLite sees one writer
+// per interval instead of one per query.
+func (p *FakeIPNatPlugin) startAccessFlusher() {
+	if !p.accessLog {
+		return
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	p.accessMu.Lock()
+	p.accessBuf = newAccessBuf()
+	p.accessFlushStop, p.accessFlushDone = stop, done
+	p.accessMu.Unlock()
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(accessFlushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				p.flushAccess()
+				return
+			case <-ticker.C:
+				p.flushAccess()
+			}
+		}
+	}()
+	p.L().Debug("fakeip nat: access log buffered flush started",
+		zap.Duration("interval", accessFlushInterval), zap.Int("buffer_limit", accessBufLimit))
+}
+
+// stopAccessFlusher stops the loop and drains whatever is still buffered, so a
+// clean shutdown does not lose the last interval of records.
+func (p *FakeIPNatPlugin) stopAccessFlusher() {
+	p.accessMu.Lock()
+	stop, done := p.accessFlushStop, p.accessFlushDone
+	p.accessFlushStop, p.accessFlushDone = nil, nil
+	p.accessMu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	<-done
+	p.flushAccess()
+}
+
+// flushAccess swaps the buffer out and writes it. A failed write is logged, not
+// retried forever: the access log is history, not state the data path needs.
+func (p *FakeIPNatPlugin) flushAccess() {
+	p.accessMu.Lock()
+	if len(p.accessBuf) == 0 {
+		p.accessMu.Unlock()
+		return
+	}
+	rows := make([]accessRow, 0, len(p.accessBuf))
+	for _, r := range p.accessBuf {
+		rows = append(rows, r)
+	}
+	p.accessBuf = newAccessBuf()
+	p.accessMu.Unlock()
+	p.writeAccessRows(rows)
+}
+
+// writeAccessRows writes the buffer in one transaction. The upsert keeps
+// first_seen and adds the accumulated hits, so one client hitting the same
+// domain repeatedly stays one row.
+func (p *FakeIPNatPlugin) writeAccessRows(rows []accessRow) {
+	if len(rows) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	stmt := fmt.Sprintf(`INSERT INTO %s (client_ip, domain, fake_ip, first_seen, last_seen, hits)
-		VALUES (?, ?, ?, ?, ?, 1)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(client_ip, domain) DO UPDATE SET
 			fake_ip = excluded.fake_ip,
 			last_seen = excluded.last_seen,
-			hits = hits + 1`, p.accessTable)
-	if _, err := p.db.ExecContext(context.Background(), stmt, clientIP, domain, fakeIP, now, now); err != nil {
-		p.L().Warn("fakeip nat: access record failed",
-			zap.String("client_ip", clientIP), zap.String("domain", domain), zap.Error(err))
+			hits = hits + excluded.hits`, p.accessTable)
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		p.L().Warn("fakeip nat: access buffer flush failed", zap.Int("rows", len(rows)), zap.Error(err))
 		return
 	}
-	p.L().Debug("fakeip nat: access recorded",
-		zap.String("client_ip", clientIP), zap.String("domain", domain), zap.String("fake_ip", fakeIP))
+	for _, r := range rows {
+		if _, err := tx.ExecContext(ctx, stmt, r.clientIP, r.domain, r.fakeIP, r.firstSeen, r.lastSeen, r.hits); err != nil {
+			_ = tx.Rollback()
+			p.L().Warn("fakeip nat: access record failed",
+				zap.String("client_ip", r.clientIP), zap.String("domain", r.domain),
+				zap.Int("rows", len(rows)), zap.Error(err))
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		p.L().Warn("fakeip nat: access buffer commit failed", zap.Int("rows", len(rows)), zap.Error(err))
+		return
+	}
+	p.L().Debug("fakeip nat: access buffer flushed", zap.Int("rows", len(rows)))
 }
 
 // sweepAccess drops access rows nobody has hit within access_ttl. It runs from
@@ -117,6 +266,9 @@ func (p *FakeIPNatPlugin) AdminAccessRecords(ctx context.Context, clientIPs []st
 	if len(clientIPs) == 0 {
 		return nil, nil
 	}
+	// Rows still in the buffer are part of the answer: the operator reading
+	// this must not see a visit disappear for one flush interval.
+	p.flushAccess()
 	if limit <= 0 || limit > 5000 {
 		limit = 2000
 	}

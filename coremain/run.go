@@ -159,6 +159,12 @@ func startServer(sf *serverFlags, handleSignals bool) error {
 
 	cfgPath := v.ConfigFileUsed()
 	cfg.configDir = filepath.Dir(cfgPath)
+	// The command line flag wins over the file: an operator overriding the
+	// thread count for one run must not be silently second-guessed by the
+	// runtime block.
+	if sf.cpu > 0 {
+		cfg.Runtime.MaxProcs = sf.cpu
+	}
 	if err := mergeInclude(cfg, 0, []string{cfgPath}, []string{tryGetAbsPath(cfgPath)}); err != nil {
 		return fmt.Errorf("failed to load sub config file, %w", err)
 	}

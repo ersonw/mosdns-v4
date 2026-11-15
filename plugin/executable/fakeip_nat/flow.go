@@ -24,6 +24,13 @@ const (
 	natPortMax           = 65535
 	// The first allocated port keeps clear of the well known range.
 	natPortStart = 12000
+	// conntrackSweepInterval bounds how often the whole table is walked. A flow
+	// lives defaultConntrackTTL (two minutes), so one walk per second is enough
+	// to keep the table bounded. The old code walked it on every forwarded
+	// packet, which made the per-packet cost grow with the number of open flows:
+	// after a few hours of traffic the table was full and every packet paid for
+	// thousands of expired-entry checks.
+	conntrackSweepInterval = time.Second
 )
 
 var (
@@ -65,6 +72,9 @@ type conntrack struct {
 	nextPort uint16
 	ttl      time.Duration
 	max      int
+	// nextSweep throttles the expiry walk: forward only pays for it when the
+	// interval has passed, so a packet costs O(1) instead of O(open flows).
+	nextSweep time.Time
 }
 
 func newConntrack(max int, ttl time.Duration) *conntrack {
@@ -85,7 +95,10 @@ func (c *conntrack) forward(key forwardKey, server netip.Addr) (uint16, error) {
 	defer c.mu.Unlock()
 
 	now := time.Now()
-	c.sweepLocked(now)
+	if now.After(c.nextSweep) {
+		c.sweepLocked(now)
+		c.nextSweep = now.Add(conntrackSweepInterval)
+	}
 
 	if e, ok := c.fwd[key]; ok {
 		e.lastSeen = now

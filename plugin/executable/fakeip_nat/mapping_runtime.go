@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -34,6 +35,11 @@ type runtimeMap struct {
 	// byReal is the reverse of realByDomain, used by the traffic watch to name
 	// the domain of a real destination in realip / tun mode.
 	byReal map[string]string
+	// lastWrite is the last time a domain's real ips were written to SQLite.
+	// It throttles the durable write-back: the memory table already carries
+	// the answer, and one upsert per answer per domain was the largest
+	// remaining source of database traffic on the answer path.
+	lastWrite map[string]int64
 }
 
 func newRuntimeMap() *runtimeMap {
@@ -43,6 +49,7 @@ func newRuntimeMap() *runtimeMap {
 		lastSeen:     make(map[string]int64),
 		realByDomain: make(map[string][]string),
 		byReal:       make(map[string]string),
+		lastWrite:    make(map[string]int64),
 	}
 }
 
@@ -58,6 +65,7 @@ func (m *runtimeMap) putReal(domain string, ips []string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	previous := m.realByDomain[domain]
 	merged := make([]string, 0, realKeepPerDomain)
 	seen := make(map[string]struct{}, realKeepPerDomain)
 	for _, ip := range ips {
@@ -73,7 +81,7 @@ func (m *runtimeMap) putReal(domain string, ips []string) {
 			break
 		}
 	}
-	for _, ip := range m.realByDomain[domain] {
+	for _, ip := range previous {
 		if _, ok := seen[ip]; ok {
 			continue
 		}
@@ -85,9 +93,12 @@ func (m *runtimeMap) putReal(domain string, ips []string) {
 	}
 	m.realByDomain[domain] = merged
 	// refresh the reverse index for this domain, dropping addresses this
-	// domain no longer owns before installing the merged list.
-	for ip, owner := range m.byReal {
-		if owner == domain {
+	// domain no longer owns before installing the merged list. Only the
+	// previous list of this domain has to be walked: scanning the whole reverse
+	// index here made every answer cost O(all recorded addresses), which is
+	// exactly what grew as more domains were resolved.
+	for _, ip := range previous {
+		if m.byReal[ip] == domain {
 			delete(m.byReal, ip)
 		}
 	}
@@ -175,6 +186,7 @@ func (m *runtimeMap) clear() {
 	m.lastSeen = make(map[string]int64)
 	m.realByDomain = make(map[string][]string)
 	m.byReal = make(map[string]string)
+	m.lastWrite = make(map[string]int64)
 }
 
 func (m *runtimeMap) remove(domain string) {
@@ -185,12 +197,14 @@ func (m *runtimeMap) remove(domain string) {
 	defer m.mu.Unlock()
 	// Realip runs leave no byDomain entry behind, so the newest-ip cache is
 	// dropped on its own: an expired domain must not keep its addresses alive.
-	delete(m.realByDomain, domain)
-	for ip, owner := range m.byReal {
-		if owner == domain {
+	// Only this domain's own list is walked, not the whole reverse index.
+	for _, ip := range m.realByDomain[domain] {
+		if m.byReal[ip] == domain {
 			delete(m.byReal, ip)
 		}
 	}
+	delete(m.realByDomain, domain)
+	delete(m.lastWrite, domain)
 	fakeIP, ok := m.byDomain[domain]
 	if !ok {
 		return
@@ -213,6 +227,43 @@ func (m *runtimeMap) touch(domain string, now int64) {
 	if now > m.lastSeen[domain] {
 		m.lastSeen[domain] = now
 	}
+}
+
+// dueForWrite reports whether the durable copy of this domain's real ips has to
+// be refreshed now, and records the decision. The memory table is updated on
+// every answer, so only the SQLite write is throttled: a domain that is
+// re-resolved once per cache TTL would otherwise write the same rows again and
+// again, and every write is a serialized round trip on the single connection.
+func (m *runtimeMap) dueForWrite(domain string, now int64, interval time.Duration) bool {
+	if domain == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if last, ok := m.lastWrite[domain]; ok && now-last < int64(interval.Seconds()) {
+		return false
+	}
+	m.lastWrite[domain] = now
+	return true
+}
+
+// markWritten records that the durable copy of this domain was just refreshed,
+// which makes the next identical answer wait out the interval.
+func (m *runtimeMap) markWritten(domain string, now int64) {
+	if domain == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.lastWrite[domain] = now
+}
+
+// forgetWrite drops the throttle record of a domain so its next answer writes
+// through, whatever the interval says.
+func (m *runtimeMap) forgetWrite(domain string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.lastWrite, domain)
 }
 
 func (m *runtimeMap) lastSeenOf(domain string) int64 {
@@ -411,6 +462,7 @@ func (p *FakeIPNatPlugin) reconcileFirewallMappings(ctx context.Context) {
 			continue
 		}
 		refilled++
+		p.nftRemember(fakeIP, real.String())
 		p.applyHostRoute(ctx, real.String(), hop, dev)
 		p.L().Debug("fakeip nat: firewall mapping refilled",
 			zap.String("domain", domain), zap.String("fake_ip", fakeIP), zap.String("real_ip", real.String()))

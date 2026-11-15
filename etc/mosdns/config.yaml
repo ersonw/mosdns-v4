@@ -625,6 +625,24 @@ servers:
 #   - /etc/mosdns/rules/local.yaml
 #   - /etc/mosdns/rules/upstreams.yaml
 
+# runtime - limits for the Go runtime itself. Optional: leaving the block out
+# keeps the defaults the binary was built with.
+# On a router the packet path shares the CPU and the RAM with this process, so
+# state the ceiling instead of letting the heap double before every GC and
+# letting freed pages stay mapped to the process.
+# -----------------------------------------------------------------------------
+# runtime:
+#   maxprocs: 2                # GOMAXPROCS. Also set by the -cpu flag; the flag wins.
+#                              #   Keep it at or below the cores the packet path
+#                              #   leaves free. 0 = detected core count.
+#   gc_percent: 50             # GOGC. 0 = default 100. Lower means a smaller heap
+#                              #   and more GC cycles; 40-60 suits a small router.
+#   memory_limit: 384MiB       # Soft heap ceiling (GOMEMLIMIT). Empty = no ceiling.
+#                              #   Accepts 256MiB / 512MB / a plain byte count.
+#   scavenge_interval: 10m     # Return free pages to the OS on this period (min 1m)
+#                              #   and log one "runtime memory" line per pass.
+#                              #   Empty = never; RSS then only shrinks under pressure.
+
 # data_providers - named files that matchers / hosts / redirect reference.
 # Two file families are supported; the file itself must exist at startup.
 #   * plain text  - one domain / keyword / regexp ("domain ip" for hosts)

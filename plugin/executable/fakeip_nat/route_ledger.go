@@ -42,6 +42,11 @@ type routeLedger struct {
 	dirty   map[string]bool        // prefixes written since the last flush
 	removed map[string]bool        // prefixes forgotten since the last flush
 	loaded  bool
+	// ver changes on every mutation. The cleanup memoizes the set of prefixes
+	// this plugin owns per version: without it, asking "is this route mine" for
+	// each scanned route rebuilt the collapse over the whole ledger, which made
+	// one sweep quadratic in the number of routes.
+	ver uint64
 }
 
 func newRouteLedger() *routeLedger {
@@ -61,6 +66,7 @@ func (l *routeLedger) remember(r ledgerRoute) {
 	l.rows[r.prefix] = r
 	l.dirty[r.prefix] = true
 	delete(l.removed, r.prefix)
+	l.ver++
 }
 
 func (l *routeLedger) forget(prefix string) {
@@ -71,6 +77,7 @@ func (l *routeLedger) forget(prefix string) {
 	}
 	delete(l.dirty, prefix)
 	l.removed[prefix] = true
+	l.ver++
 }
 
 func (l *routeLedger) replace(rows []ledgerRoute) {
@@ -83,6 +90,7 @@ func (l *routeLedger) replace(rows []ledgerRoute) {
 	l.dirty = make(map[string]bool)
 	l.removed = make(map[string]bool)
 	l.loaded = true
+	l.ver++
 }
 
 // mergeLoaded adds the rows read from SQLite without dropping anything the
@@ -97,6 +105,7 @@ func (l *routeLedger) mergeLoaded(rows []ledgerRoute) {
 		l.rows[r.prefix] = r
 	}
 	l.loaded = true
+	l.ver++
 }
 
 func (l *routeLedger) snapshot() []ledgerRoute {
@@ -119,6 +128,14 @@ func (l *routeLedger) isLoaded() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.loaded
+}
+
+// version reports the mutation counter, which lets a caller memoize a derived
+// view of the ledger and notice when it went stale.
+func (l *routeLedger) version() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ver
 }
 
 // takePending hands the writes and deletions since the last flush to the
@@ -161,6 +178,7 @@ func (l *routeLedger) reset() {
 	l.rows = make(map[string]ledgerRoute)
 	l.dirty = make(map[string]bool)
 	l.removed = make(map[string]bool)
+	l.ver++
 }
 
 // rememberManagedRoute records a prefix that was just installed. It only
@@ -396,36 +414,56 @@ func (p *FakeIPNatPlugin) sweepLedgerRoutes(ctx context.Context) int {
 //     gateway/device and cover an address this plugin is responsible for. This
 //     catches the routes written by a build that had no ledger.
 //
-// ledgerOwnsPrefix reports whether a route in the kernel came from this plugin:
-// it is either a ledger row verbatim, or exactly the aggregate an earlier
-// collapse pass installed (the union of rows that still point at the same hop).
-// Anything else is the operator's own route and must be left alone.
-func (p *FakeIPNatPlugin) ledgerOwnsPrefix(prefix string) bool {
+// ownedPrefixSet returns every prefix this plugin owns: each ledger row verbatim
+// plus each aggregate an earlier collapse installed. The answer is memoized per
+// ledger version, because a sweep asks it once per route in the kernel table;
+// rebuilding the collapse for every question made one pass quadratic in the
+// number of routes, and that pass runs on a timer.
+func (p *FakeIPNatPlugin) ownedPrefixSet() map[string]struct{} {
 	p.ledgerMu.Lock()
 	ledger := p.ledger
 	p.ledgerMu.Unlock()
 	if ledger == nil {
-		return false
+		return nil
+	}
+	ver := ledger.version()
+
+	p.ownedMu.Lock()
+	defer p.ownedMu.Unlock()
+	if p.ownedCacheVer == ver && p.ownedCache != nil {
+		return p.ownedCache
 	}
 	rows := ledger.snapshot()
 	if len(rows) == 0 {
-		return false
+		p.ownedCache, p.ownedCacheVer = nil, ver
+		return nil
 	}
+	owned := make(map[string]struct{}, len(rows))
 	prefixes := make([]netip.Prefix, 0, len(rows))
 	for _, row := range rows {
-		if row.prefix == prefix {
-			return true
-		}
+		owned[row.prefix] = struct{}{}
 		if pfx, err := netip.ParsePrefix(row.prefix); err == nil {
 			prefixes = append(prefixes, pfx)
 		}
 	}
 	for _, pfx := range collapsePrefixes(prefixes) {
-		if pfx.String() == prefix {
-			return true
-		}
+		owned[pfx.String()] = struct{}{}
 	}
-	return false
+	p.ownedCache, p.ownedCacheVer = owned, ver
+	return owned
+}
+
+// ledgerOwnsPrefix reports whether a route in the kernel came from this plugin:
+// it is either a ledger row verbatim, or exactly the aggregate an earlier
+// collapse pass installed (the union of rows that still point at the same hop).
+// Anything else is the operator's own route and must be left alone.
+func (p *FakeIPNatPlugin) ledgerOwnsPrefix(prefix string) bool {
+	owned := p.ownedPrefixSet()
+	if owned == nil {
+		return false
+	}
+	_, ok := owned[prefix]
+	return ok
 }
 
 // foreignRoute reports whether a scanned prefix has no record in the ledger,

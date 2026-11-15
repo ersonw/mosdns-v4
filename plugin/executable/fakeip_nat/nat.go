@@ -104,8 +104,11 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 	}
 
 	// Fast path: keep an existing mapping that still works, which is what
-	// prevents churn on every re-resolution of the same domain.
-	current := p.nftMappings(ctx, table)[fakeIP]
+	// prevents churn on every re-resolution of the same domain. The lookup is
+	// answered from the memory mirror: running `nft list map` here meant every
+	// new domain paid a subprocess plus a regex scan of the whole map, so the
+	// cost of one answer grew with the number of mappings already installed.
+	current := p.nftLookup(ctx, table, fakeIP)
 	if p.isFakeAddrString(current) {
 		// A mapping that points at a fake ip can only fail: drop it so the
 		// candidate selection below replaces it.
@@ -167,12 +170,17 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 		if _, err := p.runner.Run(ctx, "nft", "delete", "element", "ip", table, nftMapName, "{ "+fakeIP+" }"); err != nil {
 			p.L().Debug("delete stale nat element failed", zap.String("fake_ip", fakeIP), zap.Error(err))
 		}
+		p.nftForget(fakeIP)
 	}
 	if _, err := p.runner.Run(ctx, "nft", "add", "element", "ip", table, nftMapName, "{ "+fakeIP+" : "+selected+" }"); err != nil {
 		p.L().Error("write nat mapping failed",
 			zap.String("fake_ip", fakeIP), zap.String("real_ip", selected), zap.Error(err))
+		// The table or the map may have been removed behind our back: force the
+		// next attempt to validate it again instead of failing silently forever.
+		p.nftInvalidate()
 		return false
 	}
+	p.nftRemember(fakeIP, selected)
 	p.applyHostRoute(ctx, selected, hop, dev)
 
 	// No collapse here: the periodic scan folds every managed host route, so
@@ -186,11 +194,17 @@ func (p *FakeIPNatPlugin) syncNAT(ctx context.Context, fakeIP, domain, latestIPs
 }
 
 // ensureNFTTable creates the table, the dnat map and the three chains the
-// python version used. An existing table is left untouched.
+// python version used. An existing table is left untouched. Once the table has
+// been validated for this run the check is cached: it used to run `nft list
+// table` on every new domain, which is one subprocess per answer.
 func (p *FakeIPNatPlugin) ensureNFTTable(ctx context.Context, table, dev string) error {
+	if p.nftReady() {
+		return nil
+	}
 	if dump, err := p.runner.Run(ctx, "nft", "list", "table", "ip", table); err == nil {
 		if nftTableMatchesConfig(dump, p.cidr, dev, p.mssClamp) {
 			p.L().Debug("fakeip nat: nft table already present", zap.String("nft_table", table))
+			p.nftMarkVerified()
 			return nil
 		}
 		// The table is the one an earlier build left behind: its rules may
@@ -246,6 +260,7 @@ func (p *FakeIPNatPlugin) ensureNFTTable(ctx context.Context, table, dev string)
 		}
 	}
 	p.L().Info("nft table created", zap.String("nft_table", table), zap.String("egress_dev", dev))
+	p.nftMarkVerified()
 	return nil
 }
 
@@ -288,7 +303,9 @@ func nftTableMatchesConfig(dump, cidr, dev string, mssClamp int) bool {
 	return true
 }
 
-// nftMappings reads the whole dnat map: fake ip -> real ip.
+// nftMappings reads the whole dnat map: fake ip -> real ip. It is the only
+// place that pays for a dump; the result also replaces the memory mirror, so
+// the answer path and the sweeps read the copy instead of the kernel.
 func (p *FakeIPNatPlugin) nftMappings(ctx context.Context, table string) map[string]string {
 	out, err := p.runner.Run(ctx, "nft", "list", "map", "ip", table, nftMapName)
 	if err != nil {
@@ -298,9 +315,110 @@ func (p *FakeIPNatPlugin) nftMappings(ctx context.Context, table string) map[str
 		return nil
 	}
 	mappings := parseNFTMappings(out)
+	p.nftReplace(mappings)
 	p.L().Debug("fakeip nat: nft map loaded",
 		zap.String("nft_table", table), zap.Int("entries", len(mappings)))
 	return mappings
+}
+
+// The DNAT map is shared by every domain, and reading it costs one subprocess
+// plus a regex pass over its whole text. The plugin writes every element itself,
+// so it keeps a mirror of it: the fast path of syncNAT, the mark set feed and
+// the sweep read this copy instead of asking the kernel, which makes the cost
+// of one answer independent of how many mappings already exist. Startup
+// reconciliation and admin edits keep the mirror in step.
+
+func (p *FakeIPNatPlugin) nftLookup(ctx context.Context, table, fakeIP string) string {
+	p.nftMu.Lock()
+	loaded, value := p.nftLoaded, p.nftMirror[fakeIP]
+	p.nftMu.Unlock()
+	if loaded {
+		return value
+	}
+	// The mirror was never filled - a plugin built without the startup
+	// reconcile - so read the kernel map once and answer from the copy.
+	p.nftMappings(ctx, table)
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	return p.nftMirror[fakeIP]
+}
+
+func (p *FakeIPNatPlugin) nftRemember(fakeIP, realIP string) {
+	if fakeIP == "" || realIP == "" {
+		return
+	}
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	if p.nftMirror == nil {
+		p.nftMirror = make(map[string]string)
+	}
+	p.nftMirror[fakeIP] = realIP
+	p.nftLoaded = true
+}
+
+func (p *FakeIPNatPlugin) nftForget(fakeIP string) {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	delete(p.nftMirror, fakeIP)
+}
+
+// nftReplace installs a full read of the kernel map, which is what startup
+// reconciliation and an explicit dump produce.
+func (p *FakeIPNatPlugin) nftReplace(mappings map[string]string) {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	if mappings == nil {
+		mappings = make(map[string]string)
+	}
+	p.nftMirror = mappings
+	p.nftLoaded = true
+}
+
+// nftSnapshot copies the reverse values, so a sweep can iterate without holding
+// the lock while it runs commands.
+func (p *FakeIPNatPlugin) nftSnapshot() []string {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	out := make([]string, 0, len(p.nftMirror))
+	for _, realIP := range p.nftMirror {
+		out = append(out, realIP)
+	}
+	return out
+}
+
+func (p *FakeIPNatPlugin) nftLoadedOnce() bool {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	return p.nftLoaded
+}
+
+func (p *FakeIPNatPlugin) nftReady() bool {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	return p.nftVerified
+}
+
+func (p *FakeIPNatPlugin) nftMarkVerified() {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	p.nftVerified = true
+}
+
+// nftInvalidate forces the next mapping write to validate the table again, which
+// is the only way to recover when the table or the map disappeared at runtime.
+func (p *FakeIPNatPlugin) nftInvalidate() {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	p.nftVerified = false
+}
+
+// nftReset drops the mirror together with the table it described.
+func (p *FakeIPNatPlugin) nftReset() {
+	p.nftMu.Lock()
+	defer p.nftMu.Unlock()
+	p.nftMirror = make(map[string]string)
+	p.nftLoaded = true
+	p.nftVerified = false
 }
 
 func parseNFTMappings(out string) map[string]string {
@@ -584,6 +702,9 @@ func (p *FakeIPNatPlugin) cleanupDataPath() {
 	if _, err := p.runner.Run(ctx, "nft", "delete", "table", "ip", p.nftTableName()); err == nil {
 		tableDeleted = true
 	}
+	// The map that mirrors the table goes with it, so a later run cannot think
+	// an element is still installed because the mirror remembers it.
+	p.nftReset()
 
 	p.L().Info("fakeip nat: data path cleaned up",
 		zap.Int("ledger_deleted", ledgerDeleted), zap.Int("routes_deleted", routesDeleted),
@@ -620,7 +741,18 @@ func (p *FakeIPNatPlugin) knownRealIPs(ctx context.Context) []netip.Addr {
 		}
 		p.realMu.Unlock()
 	} else if !p.useTun {
-		for _, real := range p.nftMappings(ctx, p.nftTableName()) {
+		// The sweep runs on a timer, so it must not dump the kernel map every
+		// pass: the mirror carries the elements this plugin wrote. A full read
+		// still happens once, when the mirror has never been loaded.
+		var values []string
+		if p.nftLoadedOnce() {
+			values = p.nftSnapshot()
+		} else {
+			for _, real := range p.nftMappings(ctx, p.nftTableName()) {
+				values = append(values, real)
+			}
+		}
+		for _, real := range values {
 			// Only real targets matter for cleanup: a fake ip stored as the value
 			// must not extend the set of prefixes the cleanup step may remove.
 			if addr, err := netip.ParseAddr(real); err == nil {
