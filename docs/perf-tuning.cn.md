@@ -54,6 +54,52 @@ runtime:
 
 `maxprocs` 别超过转发面实际能分到的核；DNS 是 IO 密集，核多反而增加 GC 和调度开销。
 
+## 三之二、`self_guard`：把"卡到 SSH 进不去"挡在前面
+
+`runtime` 那一组参数管的是"别无限长"，管不了"别把整机吃满"。一旦热路径占满所有核，
+sshd 排在调度队列后面，运维连都连不进来——这和内存涨不涨是两件事。`self_guard` 专门补这一块：
+
+```yaml
+runtime:
+  self_guard: true          # 总开关，默认 false
+  guard_cpu_percent: 90     # 本进程占「整机」CPU 的比例（4 核 = 3.6 核）
+  guard_mem_percent: 90     # RSS 占「系统总内存」的比例
+  guard_interval: 5s        # 采样周期，最小 1s
+  guard_sustain: 15s        # 条件要持续多久才动手
+  guard_cooldown: 5m        # 降档持续的时长
+```
+
+采样：每 `guard_interval` 读一次 `/proc/self/stat`（utime+stime）与 `/proc/self/statm`（RSS）、
+`/proc/meminfo`（MemTotal），算出两个比例。动作只有两类，**都不会让进程退出**：
+
+| 触发 | 动作 | 日志 |
+| --- | --- | --- |
+| RSS ≥ `guard_mem_percent` 且持续 `guard_sustain` | `debug.FreeOSMemory()`（一次完整 GC + 把空闲页还给内核），30s 内不重复触发 | `self guard: memory pressure, returning pages` |
+| CPU ≥ `guard_cpu_percent` 且持续 `guard_sustain` | `GOMAXPROCS` 降到 1，把核让给内核、sshd 和转发面 | `self guard: cpu saturation, downshifting gomaxprocs` |
+| 降档到期但 CPU 仍 ≥ 阈值 | 冷却期顺延 `guard_cooldown`，不恢复 | `self guard: cpu still saturated, cooldown extended` |
+| 降档到期且 CPU < 阈值的一半 | 恢复到配置的 `maxprocs` | `self guard: cpu recovered, gomaxprocs restored` |
+
+关于"回收线程"，必须说明白：**Go 的 goroutine 是协作式的，没有任何外部手段可以 kill 或回收**。
+`self_guard` 能做的是：把不该继续占的页还给内核、把并行度降下来、以及在 goroutine 数超过
+启动基线的 4 倍（且不低于 512）时打 `self guard: goroutine growth` 告警，把泄漏暴露在日志里，
+而不是等它把机器拖死。真要清理泄露的 goroutine，只能靠修代码或重启进程。
+
+同一套参数在 VyOS 上的完整建议：
+
+```yaml
+runtime:
+  maxprocs: 2
+  gc_percent: 50
+  memory_limit: 384MiB
+  scavenge_interval: 10m
+  self_guard: true
+  guard_cpu_percent: 90
+  guard_mem_percent: 90
+```
+
+`self_guard` 只在 Linux 上生效（依赖 `/proc`）；其他平台启动时会打一条
+`self guard disabled: process accounting requires linux /proc`，不影响服务。
+
 ## 四、fakeip_nat 参数建议
 
 | 参数 | 建议 | 说明 |

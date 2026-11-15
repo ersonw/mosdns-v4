@@ -163,6 +163,9 @@ func RunMosdns(cfg *Config) error {
 	if err := startMemoryGovernor(lg, cfg.Runtime, m.sc); err != nil {
 		return err
 	}
+	if err := startSelfGuard(lg, cfg.Runtime, m.sc); err != nil {
+		return err
+	}
 
 	m.httpAPIMux.Handle("/metrics", promhttp.HandlerFor(m.metricsReg, promhttp.HandlerOpts{}))
 	m.httpAPIMux.HandleFunc("/debug/pprof/", pprof.Index)

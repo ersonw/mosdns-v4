@@ -642,6 +642,22 @@ servers:
 #   scavenge_interval: 10m     # Return free pages to the OS on this period (min 1m)
 #                              #   and log one "runtime memory" line per pass.
 #                              #   Empty = never; RSS then only shrinks under pressure.
+#   self_guard: true           # Saturation watchdog. Go cannot kill goroutines from
+#                              #   outside, so when this process eats the box the guard
+#                              #   does what the runtime allows: a forced GC + page return,
+#                              #   and a temporary GOMAXPROCS downshift to 1 so the kernel,
+#                              #   sshd and the packet path keep a share of the CPU.
+#                              #   It never exits the process (a restart drops DNS).
+#                              #   Linux only; false = off.
+#   guard_cpu_percent: 90      # Act when this process uses this share of the WHOLE box
+#                              #   (4 cores -> 3.6 cores) for guard_sustain. 0 = 90.
+#   guard_mem_percent: 90      # Act when RSS reaches this share of total system memory.
+#                              #   0 = 90.
+#   guard_interval: 5s         # Sampling period (min 1s).
+#   guard_sustain: 15s         # How long a condition must hold before acting. Raised
+#                              #   to guard_interval when smaller.
+#   guard_cooldown: 5m         # How long the GOMAXPROCS downshift lasts. Extended, never
+#                              #   cut short, while CPU is still saturated.
 
 # data_providers - named files that matchers / hosts / redirect reference.
 # Two file families are supported; the file itself must exist at startup.

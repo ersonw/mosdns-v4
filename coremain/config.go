@@ -57,11 +57,26 @@ type Config struct {
 //	  gc_percent: 50            # GOGC; 0 keeps the default 100
 //	  memory_limit: 256MiB      # GOMEMLIMIT style soft ceiling; empty disables
 //	  scavenge_interval: 10m    # return free pages to the OS on this period
+//	  self_guard: true          # watchdog for CPU/RSS saturation; false disables
+//	  guard_cpu_percent: 90     # act when this process uses this share of the box
+//	  guard_mem_percent: 90     # act when RSS reaches this share of system memory
 type RuntimeConfig struct {
 	MaxProcs         int    `yaml:"maxprocs"`
 	GCPercent        int    `yaml:"gc_percent"`
 	MemoryLimit      string `yaml:"memory_limit"`
 	ScavengeInterval string `yaml:"scavenge_interval"`
+
+	// SelfGuard enables the saturation watchdog. When the process itself eats
+	// the configured share of the box for the sustain period, the guard returns
+	// free pages to the kernel and temporarily lowers GOMAXPROCS so the kernel,
+	// sshd and the packet path keep a share of the CPU. It never exits the
+	// process: a restart would drop DNS for every client.
+	SelfGuard       bool   `yaml:"self_guard"`
+	GuardCPUPercent int    `yaml:"guard_cpu_percent"`
+	GuardMemPercent int    `yaml:"guard_mem_percent"`
+	GuardInterval   string `yaml:"guard_interval"`
+	GuardSustain    string `yaml:"guard_sustain"`
+	GuardCooldown   string `yaml:"guard_cooldown"`
 }
 
 // ConfigDir returns the directory of the loaded main config file.
