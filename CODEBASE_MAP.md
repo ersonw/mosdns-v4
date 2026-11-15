@@ -23,8 +23,8 @@
 | 版本变量 | `main.go:34` `version = "dev"` |
 | Go 文件 / 总行数 | 173 / 24,178 |
 | `pkg` 下包数 | 35 |
-| 插件目录 | 27（25 executable + 2 matcher） |
-| 可通过 `type` 配置的插件 | 24 |
+| 插件目录 | 32（30 executable + 2 matcher） |
+| 可通过 `type` 配置的插件 | 32 |
 | 预置插件 tag | 21 |
 | CLI 子命令 | `start`、`service`、`version`、`probe`、`v2dat`、`config gen/conv` |
 

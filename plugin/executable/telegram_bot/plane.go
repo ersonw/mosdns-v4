@@ -415,7 +415,7 @@ func yesNo(v bool) string {
 // system objects, or runs a script. Read-only commands are not recorded.
 func isAuditedCommand(cmd string) bool {
 	switch cmd {
-	case "/config", "/proxy", "/sweep", "/provider", "/reload", "/exec", "/fip":
+	case "/config", "/proxy", "/sweep", "/provider", "/alias", "/reload", "/exec", "/fip":
 		return true
 	}
 	return false
@@ -442,7 +442,7 @@ func auditDetail(cmd string, args []string) string {
 	}
 	joined := strings.Join(args, " ")
 	if len(joined) > 160 {
-		joined = joined[:160] + "..."
+		joined = truncateTelegramText(joined, 160, "...")
 	}
 	return joined
 }

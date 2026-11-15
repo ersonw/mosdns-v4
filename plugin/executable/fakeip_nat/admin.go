@@ -217,7 +217,7 @@ func (p *FakeIPNatPlugin) purgeCandidates(ctx context.Context, domain, like stri
 		if err := rows.Scan(&name, &fakeIP); err != nil {
 			return nil, nil, fmt.Errorf("scan mapping: %w", err)
 		}
-		if fakeIP != "" && fakeIP != pendingFakeIP {
+		if fakeIP != "" && !isPendingFakeIP(fakeIP) {
 			fakeIPs = append(fakeIPs, fakeIP)
 		}
 		seen[name] = true
@@ -308,7 +308,7 @@ func (p *FakeIPNatPlugin) AdminStats(ctx context.Context) (MappingStats, error) 
 		return s, fmt.Errorf("count mappings: %w", err)
 	}
 	if err := p.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM `+p.mapTable+` WHERE fake_ip = ?`, pendingFakeIP).Scan(&s.Pending); err != nil {
+		`SELECT COUNT(*) FROM `+p.mapTable+` WHERE fake_ip = ? OR fake_ip LIKE ?`, pendingFakeIP, pendingFakeIPPrefix+"%").Scan(&s.Pending); err != nil {
 		return s, fmt.Errorf("count pending: %w", err)
 	}
 	if err := p.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+p.ipTable).Scan(&s.RealIPs); err != nil {
@@ -402,7 +402,7 @@ func (p *FakeIPNatPlugin) removeRuntimeMapping(domain string) {
 }
 
 func (p *FakeIPNatPlugin) removeNFTMapping(ctx context.Context, fakeIP string) {
-	if p.useTun || fakeIP == "" || fakeIP == pendingFakeIP {
+	if p.useTun || fakeIP == "" || isPendingFakeIP(fakeIP) {
 		return
 	}
 	if _, err := p.runner.Run(ctx, "nft", "delete", "element", "ip", p.nftTableName(), nftMapName, "{ "+fakeIP+" }"); err != nil {

@@ -200,16 +200,18 @@ plugins:
   ## ---- asn_tun: ASN IPv4 prefixes -> TUN (Linux only) -----------------------
   ## Active test instance. AS112 is used because it announces only two small
   ## IPv4 prefixes; replace it with the ASN(s) you actually want to route.
-  ## On macOS this still fails at setupTun with "only supported on linux".
-  ## Set next_hop / next_hop_dev for a direct Linux outlet, or set proxy and
+  ## On macOS the plugin is now disabled with an error log instead of aborting
+  ## the whole mosdns process; fix the host prerequisites and restart to enable
+  ## it. Set next_hop / next_hop_dev for a direct Linux outlet, or set proxy and
   ## leave both empty. A configured proxy is probed at startup.
   - tag: test_asn_tun
     type: asn_tun
     args:
       asn: [112]                    # test ASN; replace with your target ASN(s)
       source: bgpq3               # ipverse or bgpq3 (bgpq3 uses fetch_script + merge_script)
+      fallback_source: ipverse    # used when bgpq3 is missing/fails; use "none" to disable
       refresh: 0                  # 0 = no periodic refresh; startup still refreshes async
-      cache: etc/mosdns/asn_tun_prefixes.json
+      cache: asn_tun_prefixes.json # bare name = next to config.yaml; relative paths also accepted
       fetch_script: scripts/bgpq3_fetch_asn.py
       merge_script: scripts/cidr_merge.py
       python: python3
@@ -744,13 +746,18 @@ servers:
 # a proxy. It is a standalone data plane and does not need a sequence entry; if
 # placed in a sequence, Exec passes the query through unchanged.
 # Requirements: Linux, root or CAP_NET_ADMIN, /dev/net/tun, and the nft, ip and
-# sysctl commands. On macOS startup fails with
-# "asn_tun is only supported on linux".
+# sysctl commands. On macOS or a host without these prerequisites the plugin is
+# disabled with an error log and mosdns continues serving DNS; it does not
+# abort the whole process.
 # Args:
 #   asn - required. ASN numbers whose IPv4 prefixes are routed into the device,
 #         e.g. [4134, 4837]. IPv6 announcements are ignored in this version.
 #   source - prefix provider. "ipverse" fetches from GitHub; "bgpq3" runs the
 #            local fetch_script and merge_script. Default: ipverse
+#   fallback_source - provider used when source fails. Only "ipverse" is
+#            supported; "none" disables the fallback. Empty defaults to
+#            "ipverse" when source is "bgpq3", so a missing bgpq3 binary still
+#            yields a prefix set. Default: ipverse for source bgpq3
 #   refresh - periodic refresh interval, e.g. 12h. "0" disables the periodic
 #             ticker, but one async refresh still runs at startup.
 #             Default: 12h
@@ -807,12 +814,15 @@ servers:
 #           socks5://user:pass@host:1080, socks5h://host:1080,
 #           http://host:8080, https://host:8443, trojan://pass@host:443?sni=host,
 #           or gost://... . Empty = direct outlet. The proxy is probed at
-#           startup and a failed probe aborts startup instead of leaking direct.
+#           startup; on failure the plugin is disabled rather than switched to
+#           direct, so DNS keeps running and no traffic is silently leaked.
 #   proxy_insecure - skip TLS certificate verification for https/trojan
 #                    proxies. Default: false
 # Notes:
-#   - Only packets with "meta mark 0" are marked; an earlier policy that already
-#     set a mark wins. Adjust route_rule_priority or remove that policy.
+#   - The prerouting mark chain runs at priority 10, after VyOS policy routing
+#     (mangle -150) and MosDNS's oversea mark (filter 0). An earlier non-zero
+#     mark is intentionally overridden for destinations in the ASN set; bypass4
+#     destinations are never marked.
 #   - The proxy server address and next_hop are added to the nft bypass set so
 #     they are not marked back into the TUN.
 #   - ICMP is not handled in this version; marked ICMP is dropped. HTTP/HTTPS/

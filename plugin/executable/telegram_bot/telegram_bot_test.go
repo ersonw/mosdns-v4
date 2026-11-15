@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tgbot "github.com/go-telegram/bot"
 
@@ -518,6 +519,32 @@ func TestBotIgnoresUnauthorizedChat(t *testing.T) {
 	case reply := <-fake.sent:
 		t.Fatalf("unauthorized chat got a reply: %q", reply)
 	default:
+	}
+}
+
+func TestTruncateTelegramTextKeepsValidUTF8(t *testing.T) {
+	// 2000 three-byte runes; a plain 4000-byte slice cuts the last rune.
+	got := truncateTelegramText(strings.Repeat("测", 2000), 4000, "")
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncated text is not valid UTF-8: %q", got)
+	}
+	if len(got) > 4000 {
+		t.Fatalf("truncated text exceeds byte budget: %d", len(got))
+	}
+
+	marker := "\n...(已截断)"
+	got = truncateTelegramText(strings.Repeat("测", 2000), 4000, marker)
+	if !utf8.ValidString(got) || !strings.HasSuffix(got, marker) {
+		t.Fatalf("localized truncation is invalid: %q", got)
+	}
+	if len(got) > 4000 {
+		t.Fatalf("localized truncation exceeds byte budget: %d", len(got))
+	}
+
+	bad := "前" + string([]byte{0xff}) + "后"
+	got = truncateTelegramText(bad, 4000, "")
+	if !utf8.ValidString(got) || !strings.Contains(got, "\uFFFD") {
+		t.Fatalf("invalid UTF-8 was not sanitized: %q", got)
 	}
 }
 

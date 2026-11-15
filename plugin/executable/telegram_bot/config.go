@@ -378,7 +378,7 @@ func (p *telegramBot) handleConfig(args []string, langs ...lang) (string, error)
 		}
 		text := maskSecrets(n)
 		if len(text) > 3500 {
-			text = text[:3500] + l.t("\n...(truncated)", "\n...(已截断)")
+			text = truncateTelegramText(text, 3500, l.t("\n...(truncated)", "\n...(已截断)"))
 		}
 		return text, nil
 

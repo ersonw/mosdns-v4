@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	tgbot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -445,13 +446,36 @@ func (p *telegramBot) onUpdate(ctx context.Context, b *tgbot.Bot, update *models
 	if reply == "" {
 		return
 	}
-	// Telegram caps a message at 4096 characters.
+	// Telegram caps a message at 4096 characters. Keep a byte budget that
+	// leaves room for the truncation marker, but never split a UTF-8 rune:
+	// Telegram rejects text containing a partial multi-byte character with
+	// "Bad Request: strings must be encoded in UTF-8".
 	if len(reply) > 4000 {
-		reply = reply[:4000] + l.t("\n...(truncated)", "\n...(已截断)")
+		reply = truncateTelegramText(reply, 4000, l.t("\n...(truncated)", "\n...(已截断)"))
 	}
 	if _, err := b.SendMessage(ctx, &tgbot.SendMessageParams{ChatID: chatID, Text: reply}); err != nil {
 		p.L().Warn("telegram sendMessage failed", zap.Error(err))
 	}
+}
+
+// truncateTelegramText sanitizes invalid UTF-8, then truncates text on a rune
+// boundary within limit bytes. Telegram rejects strings that contain half of a
+// multi-byte UTF-8 character, so byte slicing alone is not safe here.
+func truncateTelegramText(text string, limit int, marker string) string {
+	text = strings.ToValidUTF8(text, "\uFFFD")
+	marker = strings.ToValidUTF8(marker, "\uFFFD")
+	if limit <= 0 || len(text) <= limit {
+		return text
+	}
+	headLimit := limit - len(marker)
+	if headLimit < 0 {
+		headLimit = 0
+	}
+	head := text[:headLimit]
+	for len(head) > 0 && !utf8.ValidString(head) {
+		head = head[:len(head)-1]
+	}
+	return head + marker
 }
 
 // handleText parses one command and returns the reply text.
@@ -507,6 +531,8 @@ func (p *telegramBot) handleText(ctx context.Context, chatID int64, text string,
 		return p.handleConfig(fields[1:], l)
 	case "/provider":
 		return p.handleProvider(ctx, fields[1:], l)
+	case "/alias":
+		return p.handleAlias(ctx, chatID, fields[1:], l)
 	case "/watch":
 		return p.handleWatch(ctx, chatID, fields[1:], l)
 	case "/stop":
@@ -1044,6 +1070,18 @@ var helpGroups = []helpGroup{
 		{"/provider <tag> del <d>      delete a domain", PermProvider},
 		{"/provider <tag> clear        empty a text provider or one v2dat category", PermProvider},
 	}},
+	{title: "alias names", items: []helpItem{
+		{"/alias                        alias plugins and their served names", PermAlias},
+		{"/alias <tag>                  file, suffix form, range and proxy state", PermAlias},
+		{"/alias <tag> list             served entries and their alias host", PermAlias},
+		{"/alias <tag> add [scheme://]d add a domain; scheme optional, http by default", PermAlias},
+		{"/alias <tag> del <d>          delete a domain and purge its state", PermAlias},
+		{"/alias <tag> mod <old> <new>  replace a domain", PermAlias},
+		{"/alias <tag> clear            empty the served list", PermAlias},
+		{"/alias <tag> suffix <s>       change the suffix form (config permission)", PermConfig},
+		{"/alias <tag> range <cidr>     write a new virtual range (restart needed)", PermConfig},
+		{"/alias <tag> reload           re-read the list file from disk", PermAlias},
+	}},
 	{title: "config", items: []helpItem{
 		{"/config                      config file summary", PermConfig},
 		{"/config show <section>       dump log/data_providers/plugins/servers", PermConfig},
@@ -1232,6 +1270,18 @@ var helpGroupsZH = []helpGroup{
 		{"/provider <tag> mod <old> <new>  替换域名", PermProvider},
 		{"/provider <tag> del <d>      删除域名", PermProvider},
 		{"/provider <tag> clear        清空文本数据源或一个 v2dat 分类", PermProvider},
+	}},
+	{title: "alias 域名", items: []helpItem{
+		{"/alias                        已加载的 alias 插件及其服务名", PermAlias},
+		{"/alias <tag>                  文件、后缀形式、网段和代理状态", PermAlias},
+		{"/alias <tag> list             已服务的条目及对应 alias 域名", PermAlias},
+		{"/alias <tag> add [scheme://]d 添加域名；协议可选，默认 http", PermAlias},
+		{"/alias <tag> del <d>          删除域名并清理其状态", PermAlias},
+		{"/alias <tag> mod <old> <new>  替换域名", PermAlias},
+		{"/alias <tag> clear            清空服务列表", PermAlias},
+		{"/alias <tag> suffix <s>       修改后缀形式（需要配置权限）", PermConfig},
+		{"/alias <tag> range <cidr>     写入新虚拟网段（需重启生效）", PermConfig},
+		{"/alias <tag> reload           从磁盘重新载入列表文件", PermAlias},
 	}},
 	{title: "配置", items: []helpItem{
 		{"/config                      配置文件摘要", PermConfig},

@@ -6,6 +6,7 @@ import sys
 import os
 import argparse
 import re
+import shutil
 import time
 from multiprocessing import Pool, cpu_count
 
@@ -36,6 +37,10 @@ def run_bgpq3_single(asn, af_list=("4", "6")):
         except subprocess.CalledProcessError as e:
             print("\n[WARN] bgpq3 %s af%s failed: %s" % (asn, af, e.output), file=sys.stderr)
             continue
+        except FileNotFoundError:
+            print("\n[ERROR] bgpq3 executable not found in PATH; install bgpq3 or use source: ipverse",
+                  file=sys.stderr)
+            return asn, v4_set, v6_set
 
         for line in out.splitlines():
             line = line.strip()
@@ -130,6 +135,13 @@ def main():
     total_asn = len(raw_asns)
     if total_asn == 0:
         print("[ERROR] No valid ASN loaded", file=sys.stderr)
+        sys.exit(1)
+
+    # Fail once, with a clean message, instead of starting worker processes that
+    # each spill a Python traceback when bgpq3 is not installed.
+    if shutil.which("bgpq3") is None:
+        print("[ERROR] bgpq3 executable not found in PATH; install bgpq3 or use source: ipverse",
+              file=sys.stderr)
         sys.exit(1)
 
     v4_set = set()

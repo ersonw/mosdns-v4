@@ -1,6 +1,6 @@
 # mosdns-v4 插件功能索引
 
-> 覆盖 `plugin/` 下 **29 个插件目录**（27 executable + 2 matcher）、**26 个可配置 type**、**21 个预置 tag**。
+> 覆盖 `plugin/` 下 **32 个插件目录**（30 executable + 2 matcher）、**32 个可配置 type**、**21 个预置 tag**。
 > 行号对应当前工作树；「是否可配置」= 是否能在 `plugins[].type` 里写。
 > 配套文档：`CODEBASE_MAP.md`（框架与链路）。
 > 配套配置模板：`etc/mosdns/config.yaml`（顶部为最小可运行段，其下为 26 个可配置 type + 21 个预置 tag + 全部顶层字段的英文注释清单）。
@@ -33,6 +33,7 @@
 | `reverse_lookup` | ✅ | `plugin/executable/reverse_lookup` | 记录 域名↔IP 映射，可应答 PTR，并提供 HTTP 查询接口 | — |
 | `asn_tun` | ✅ | `plugin/executable/asn_tun` | **定制**：按 ASN 的 IPv4 前缀用 nftables 打标，把标记流量送到 TUN；gVisor 处理真实目的 IP 的 TCP/UDP，再按有代理/无代理出站。不做 fake IP，不支持 ICMP/IPv6 | — |
 | `fakeip_nat` | ✅ | `plugin/executable/fakeip_nat` | **定制**：A 记录改写成假 IP，落 SQLite；默认用内置 NAT（nftables DNAT + host route + CIDR 聚合），`use_tun` 可切到 TUN 数据面（TCP/UDP/ICMP 统一 SNAT，逐跳探测把 traceroute 全路径送回 tun） | — |
+| `alias` | ✅ | `plugin/executable/alias` | **定制**：自有域名文件命中即分配虚拟 IP（不查上游），TUN 收包后反查域名；有代理直接按域名交给代理，无代理现场解析并按 `next_hop`/`next_hop_dev` 出站；TCP 80 走 HTTP 网关（明文进、改写 Host 回源） | — |
 | `ocserv_ctl` | ✅ | `plugin/executable/ocserv_ctl` | **定制**：把 DNS 请求的源地址映射到 ocserv 登录用户（`occtl show users`），命中时给查询打标记 | — |
 | `telegram_bot` | ✅ | `plugin/executable/telegram_bot` | **定制**：Telegram 长轮询管理 fakeip / ocserv / RADIUS 账号 / 配置 / 脚本，按角色下发权限 | — |
 | `radius` | ✅ | `plugin/executable/radius` | **定制**：给 ocserv 当 RADIUS 服务端（PAP 认证 + RFC 2866 记账），账号存本机 SQLite，由 bot 的 `/user` 增删改 | — |
@@ -299,6 +300,15 @@
   - `_pad_query`：查询补到 128 字节；回包时若原查询没有 EDNS0 就删响应 EDNS0、没有 padding 就删响应 padding（`:58-79`）
   - `_enable_conditional_response_padding`：仅在客户端先 pad 时才回 pad（`:89-105`）
   - `_enable_response_padding`：无条件按 468 字节回 pad（预置里 `Always: true`，`:40`；执行分支 `:95-97`）
+
+### 2.31 `alias`（定制）
+- **文件**：`plugin/executable/alias/alias.go`（注册 `PluginType = "alias"`、`Args`/`Init`/`lookup`/`Match`/`Exec`/`Close`）、`store.go`（自有域名文件：`[scheme://]domain` 解析/校验/去重/最长后缀匹配/原子写/`reload`）、`alloc.go`（虚拟地址分配器：段首 offset 1 留设备、从 2 起分配、`byDomain`/`byAddr` 双表、`PurgeDomain`/`Prune`/`PurgeAll`）、`admin.go`（`aliasadmin.Admin` + `fakeipadmin.PurgeAdmin`）、`egress.go`（直连/代理拨号 + `resolver` 缓存）、`stack.go`（gVisor netstack、TCP/UDP forwarder、80 端口分流到网关）、`gateway.go`（HTTP 网关：Host/URI 改写、hop-by-hop 清理、Location/Set-Cookie 反向改写、502 文本）、`tun_linux.go`（设备创建/地址/MTU/出口表+`ip rule`/读写泵）、`tun_other.go`（非 Linux 报错桩）、`bind_linux.go`/`bind_other.go`（`SO_BINDTODEVICE`）
+- **参数**（`alias.go:39-86`）：`domain_file`（必填，插件自有）、`suffix`(`local`)、`replace_suffix`(false=追加 / true=替换末级标签)、`dot_replacement`(`.`=不改；`-`=把源域名压成单标签如 `ip138-com`，配合 `*.dyize.com`；不可与 `replace_suffix` 同开)、`ipv4_range`（必填，IPv4）、`ttl`(60)、`upstream_scheme`(`http`/`https`/`auto`，条目自带 scheme 优先)、`add_forwarded_headers`(false)、`redirect_to_alias`(false：真实域名同 IP，且 302 到 alias 名并保留 path/query)、`tls_cert_file`/`tls_key_file`(空：443 透传；配置后终止 TLS、HTTPS 也走网关且跳转用 https，证书须覆盖所有 443 Host)、`tun_dev`（空=自动 `lga0..`）、`tun_mtu`（0=自动：直连 1500 / 代理 1400，范围 576..1500）、`proxy`/`proxy_insecure`、`next_hop`/`next_hop_dev`、`route_table`(100)、`rule_priority`(1200)、`resolver`
+- **DNS**：命中 A 立即应答虚拟地址（不等上游）；AAAA 空应答；其它 qtype 与未命中走 `next`；分配耗尽回 SERVFAIL。`lookup` 两种模式：追加取 `<别名>.<后缀>` 去掉后缀得真实域名；替换模式用列表末级标签集合拼 `<主干>.<标签>` 再回表匹配，子域同样生效
+- **数据面**：ICMP echo 由插件本地应答（交换地址、改类型、重算校验和后直接写回设备，不发往真实主机，其它 ICMP 类型丢弃；启动时检查 `net.ipv4.ip_forward` 并告警）；TCP 在 netstack 终止，80 端口进网关、其它端口字节透传；代理出口 SOCKS5/HTTP CONNECT/HTTPS（均为域名 CONNECT，`socks5h` 语义）；直连出口连接时刻解析（`resolver` 未配则系统解析），以设备地址 `SO_BINDTODEVICE` 出站，`next_hop`/`next_hop_dev` 用专用表 + 源地址 `ip rule` 固定；有代理时 UDP 故意丢弃促使回落 TCP，无代理则直连 UDP relay
+- **网关**：`Upgrade` + `Connection: upgrade`（WebSocket）按隧道处理：保留握手头、转发 101 与 `Sec-WebSocket-Accept`、双向透传字节；拒绝升级时按普通响应回传；每连接最多 100 请求、请求头 90s 超时；改写 `Host`/URI 为真实域名、删 hop-by-hop（先取 `Connection` token 再删头）、`Connection: close`；可选 `X-Forwarded-For/-Host/-Proto: http`；响应 `Location` 按匹配前缀改写回 alias 域名并保留端口，`Set-Cookie` 命中时去掉 `Domain=` 属性；失败回 502 文本
+- **Bot**：`pkg/alias_admin.Admin` 接口 + `/alias` 命令（overview/详情/`list`/`add`/`del`/`mod`/`clear`/`suffix`/`range`/`reload`）；普通 admin 只有 `alias` 权限（增删改清），`suffix` 与 `range` 需 `config`；`add` 去重（同名换协议更新协议）、非法域名/协议被拒绝、无协议默认 http；变更后清理该域名（含子域）的虚拟地址、反查、解析缓存与其它插件缓存；`reload` 丢弃文件里已删除域名的映射；`range` 校验后写回配置文件并提示重启（设备地址/分配器/出口规则需重建）；`suffix` 运行时生效并写回配置
+- **测试**：`alias_test.go`（store 增删改去重/scheme 更新/非法输入/子域匹配/持久化重载/容错解析(BOM+CRLF+行内注释)/按 scheme 删除/allocator 稳定分配与 Purge/Prune/两种 lookup/`AdminAliasReload` 丢弃已删域名）、`gateway_test.go`（两种别名形式、Location 改写、Set-Cookie 去 Domain、hop-by-hop、请求 URI 保持）；`telegram_bot/alias_test.go`（`pluginIndexByTag`、`persistAliasArg` 写回配置、`aliasRuleDomain`、无插件时提示）
 
 ---
 

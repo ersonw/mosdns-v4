@@ -324,7 +324,7 @@ func (p *telegramBot) formatWatchText(l lang, tag, source string, events []fakei
 	}
 	text := b.String()
 	if len(text) > watchMessageMaxLen {
-		text = text[:watchMessageMaxLen] + l.t("\n...(truncated)", "\n...(已截断)")
+		text = truncateTelegramText(text, watchMessageMaxLen, l.t("\n...(truncated)", "\n...(已截断)"))
 	}
 	return text
 }

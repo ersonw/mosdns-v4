@@ -21,6 +21,7 @@ package plugin
 
 // import all plugins
 import (
+	_ "github.com/ersonw/mosdns-v4/plugin/executable/alias"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/arbitrary"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/asn_tun"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/blackhole"

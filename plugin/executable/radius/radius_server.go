@@ -1,6 +1,7 @@
 package radius
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -58,7 +59,11 @@ func listenUDP(addr string) (*net.UDPConn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return net.ListenUDP("udp", a)
+	c, err := net.ListenUDP("udp", a)
+	if err != nil {
+		return nil, fmt.Errorf("listen udp %s: %w; the port is already held by another process (check ss -lunp, port %d), stop it before starting mosdns", addr, err, a.Port)
+	}
+	return c, nil
 }
 
 func (s *server) start() {

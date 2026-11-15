@@ -89,11 +89,11 @@ func (p *ASNTunPlugin) startStack() error {
 	}
 	st.dev = p.tunFile
 	tcpFwd := tcp.NewForwarder(st.stk, 0, tunTCPMaxInFlight, func(r *tcp.ForwarderRequest) {
-		go p.relayTCP(r)
+		go p.safeGo("tcp-relay", func() { p.relayTCP(r) })
 	})
 	st.stk.SetTransportProtocolHandler(tcp.ProtocolNumber, tcpFwd.HandlePacket)
 	udpFwd := udp.NewForwarder(st.stk, func(r *udp.ForwarderRequest) bool {
-		go p.relayUDP(r)
+		go p.safeGo("udp-relay", func() { p.relayUDP(r) })
 		return true
 	})
 	st.stk.SetTransportProtocolHandler(udp.ProtocolNumber, udpFwd.HandlePacket)
@@ -101,6 +101,29 @@ func (p *ASNTunPlugin) startStack() error {
 	p.L().Info("asn_tun: userspace TCP/IP stack started",
 		zap.Int("nic_id", int(st.nicID)), zap.Uint32("mtu", st.mtu))
 	return nil
+}
+
+// safeGo contains a panic in a per-flow or background worker. A malformed
+// packet must not take the whole DNS process down with it.
+func (p *ASNTunPlugin) safeGo(worker string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.L().Error("asn_tun: worker panic, continuing",
+				zap.String("worker", worker), zap.Any("panic", r))
+		}
+	}()
+	fn()
+}
+
+func (p *ASNTunPlugin) safeInject(pkt []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.L().Error("asn_tun: packet injection panic, dropping packet", zap.Any("panic", r))
+		}
+	}()
+	if p.stack != nil {
+		p.stack.inject(pkt)
+	}
 }
 
 func (t *tunStack) inject(pkt []byte) {

@@ -152,7 +152,7 @@ func (p *FakeIPNatPlugin) sweepRecords(ctx context.Context) {
 
 	var expired, refreshed []mappingRow
 	for _, r := range all {
-		if r.fakeIP == pendingFakeIP {
+		if isPendingFakeIP(r.fakeIP) {
 			continue // an allocation in progress is never expired
 		}
 		if r.newest < cutoff {

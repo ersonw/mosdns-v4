@@ -26,7 +26,18 @@ const PluginType = "fakeip_nat"
 // pendingFakeIP marks a mapping row that has an id but no allocated address yet.
 // It is only visible between the INSERT and the UPDATE inside recordAndAllocate,
 // or after a crash in that window.
+//
+// The placeholder is per-domain: fake_ip is globally UNIQUE, so a single shared
+// "pending" value would make every new domain collide with the row a crash left
+// behind. The bare "pending" form is kept for databases written before this fix.
 const pendingFakeIP = "pending"
+const pendingFakeIPPrefix = pendingFakeIP + ":"
+
+func pendingFakeIPFor(domain string) string { return pendingFakeIPPrefix + domain }
+
+func isPendingFakeIP(fakeIP string) bool {
+	return fakeIP == pendingFakeIP || strings.HasPrefix(fakeIP, pendingFakeIPPrefix)
+}
 
 // defaultTaskConcurrency caps how many NAT tasks run at the same time.
 const defaultTaskConcurrency = 8
@@ -1300,7 +1311,7 @@ func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, 
 	defer p.mu.Unlock()
 
 	insertSQL := fmt.Sprintf("INSERT INTO %s (domain, fake_ip, created_at, last_seen) VALUES (?, ?, ?, ?) ON CONFLICT(domain) DO NOTHING", p.mapTable)
-	if _, err := p.db.ExecContext(ctx, insertSQL, domain, pendingFakeIP, now, now); err != nil {
+	if _, err := p.db.ExecContext(ctx, insertSQL, domain, pendingFakeIPFor(domain), now, now); err != nil {
 		return "", fmt.Errorf("insert mapping: %w", err)
 	}
 
@@ -1312,7 +1323,7 @@ func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, 
 	if err := p.db.QueryRowContext(ctx, querySQL, domain).Scan(&id, &fakeIP); err != nil {
 		return "", fmt.Errorf("query mapping: %w", err)
 	}
-	if fakeIP != pendingFakeIP {
+	if !isPendingFakeIP(fakeIP) {
 		// Keep the runtime table in step with what was just allocated.
 		if p.runtime != nil {
 			p.runtime.put(domain, fakeIP)
@@ -1332,7 +1343,7 @@ func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, 
 		if err != nil {
 			return "", err
 		}
-		res, err := p.db.ExecContext(ctx, updateSQL, allocated, now, id, pendingFakeIP)
+		res, err := p.db.ExecContext(ctx, updateSQL, allocated, now, id, fakeIP)
 		if err != nil {
 			// Another process took this offset between the scan and the write.
 			if isUniqueViolation(err) {
@@ -1346,7 +1357,7 @@ func (p *FakeIPNatPlugin) recordAndAllocate(ctx context.Context, domain string, 
 			if err := p.db.QueryRowContext(ctx, querySQL, domain).Scan(&id, &fakeIP); err != nil {
 				return "", fmt.Errorf("query mapping: %w", err)
 			}
-			if fakeIP != pendingFakeIP {
+			if !isPendingFakeIP(fakeIP) {
 				if p.runtime != nil {
 					p.runtime.put(domain, fakeIP)
 					p.runtime.touch(domain, now)

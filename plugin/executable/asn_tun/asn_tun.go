@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -56,6 +57,11 @@ type Args struct {
 
 	// Source is the prefix provider: "ipverse" or "bgpq3".
 	Source string `yaml:"source"`
+	// FallbackSource is used when the primary provider fails. The only
+	// supported fallback is "ipverse"; "none" disables it. It defaults to
+	// "ipverse" for source "bgpq3", so a missing bgpq3 binary does not leave
+	// the plugin with an empty prefix set.
+	FallbackSource string `yaml:"fallback_source"`
 	// Refresh reloads the prefixes on this interval. Zero disables periodic
 	// refresh; the plugin still performs one asynchronous refresh at startup.
 	Refresh string `yaml:"refresh"`
@@ -158,8 +164,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		return nil, err
 	}
 	if err := p.start(); err != nil {
+		// asn_tun is an optional data-plane add-on: its nft/TUN/route setup
+		// depends on host privileges and commands that the DNS service itself
+		// does not need. A failure here must disable ASN marking, not abort
+		// mosdns. Configuration errors still fail in newPlugin above.
+		p.L().Error("asn_tun: data plane setup failed, plugin disabled; DNS service continues",
+			zap.Error(err))
 		_ = p.Close()
-		return nil, err
+		return p, nil
 	}
 	if m := bp.M(); m != nil {
 		if sc := m.GetSafeClose(); sc != nil {
@@ -171,6 +183,36 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		}
 	}
 	return p, nil
+}
+
+// resolveCachePath keeps the historical repo-relative form working, while making
+// a bare file name live next to the config file. script paths already use that
+// convention; the cache used to be evaluated against the process working
+// directory, which changed meaning when mosdns was started from the config
+// directory instead of the repository root.
+func resolveCachePath(configDir, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || filepath.IsAbs(raw) {
+		return raw
+	}
+	if !strings.ContainsAny(raw, `/\`) {
+		return filepath.Join(configDir, raw)
+	}
+	if _, err := os.Stat(raw); err == nil {
+		return raw
+	}
+	if joined := filepath.Join(configDir, raw); fileExists(joined) {
+		return joined
+	}
+	if base := filepath.Join(configDir, filepath.Base(raw)); fileExists(base) {
+		return base
+	}
+	return raw
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
@@ -191,6 +233,19 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	default:
 		return nil, fmt.Errorf("unsupported source %q: use ipverse or bgpq3", cfg.Source)
 	}
+	fallbackSource := strings.ToLower(strings.TrimSpace(cfg.FallbackSource))
+	fallbackDisabled := fallbackSource == "none"
+	if fallbackDisabled {
+		fallbackSource = ""
+	}
+	if fallbackSource == "" && source == "bgpq3" && !fallbackDisabled {
+		fallbackSource = "ipverse"
+	}
+	switch fallbackSource {
+	case "", "ipverse":
+	default:
+		return nil, fmt.Errorf("unsupported fallback_source %q: use ipverse, none, or leave it empty", cfg.FallbackSource)
+	}
 
 	configDir := ""
 	if bp != nil && bp.M() != nil {
@@ -209,6 +264,8 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	cachePath := strings.TrimSpace(cfg.Cache)
 	if cachePath == "" {
 		cachePath = defaultCache
+	} else {
+		cachePath = resolveCachePath(configDir, cachePath)
 	}
 
 	refresh := defaultRefresh
@@ -338,6 +395,7 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	p.args.TunMTU = mtu
 	p.args.Refresh = refresh.String()
 	p.args.Source = source
+	p.args.FallbackSource = fallbackSource
 	p.args.Cache = cachePath
 	p.args.FetchScript = fetchScript
 	p.args.MergeScript = mergeScript
@@ -477,6 +535,15 @@ func (p *ASNTunPlugin) start() error {
 			zap.Int("asn_count", len(p.asns)), zap.Int("prefix_count", len(prefixes)))
 	}
 	p.prefixes = prefixes
+	if len(prefixes) == 0 {
+		// An empty nft set is valid, but the mark rule can never match. Say so
+		// explicitly: otherwise the service looks healthy while no ASN traffic
+		// is handled at all.
+		p.L().Warn("asn_tun: prefix set is empty; ASN marking is inactive until the async refresh succeeds",
+			zap.Uint32s("asn", p.asns),
+			zap.String("source", p.args.Source),
+			zap.String("cache", p.args.Cache))
+	}
 
 	// A previous process may have been killed before Close ran. Reclaim the
 	// dedicated table/rule/route/TUN before creating the new instance, otherwise
@@ -508,15 +575,15 @@ func (p *ASNTunPlugin) start() error {
 	initialPrefixCount := len(p.prefixes)
 	initialSkipCount := len(p.skipPrefixes)
 	p.wg.Add(1)
-	go p.runTunDevice()
+	go p.safeGo("tun-reader", p.runTunDevice)
 	p.wg.Add(1)
-	go p.runStackWriter()
+	go p.safeGo("stack-writer", p.runStackWriter)
 	p.wg.Add(1)
-	go p.runStartupRefresh()
+	go p.safeGo("startup-refresh", p.runStartupRefresh)
 
 	if refresh := p.refreshInterval(); refresh > 0 {
 		p.wg.Add(1)
-		go p.runRefresh(refresh)
+		go p.safeGo("periodic-refresh", func() { p.runRefresh(refresh) })
 	}
 
 	p.L().Info("asn_tun initialized",
@@ -602,11 +669,43 @@ func (p *ASNTunPlugin) bypassAddresses() []netip.Addr {
 
 func (p *ASNTunPlugin) runStartupRefresh() {
 	defer p.wg.Done()
-	ctx, cancel := context.WithTimeout(p.runCtx, refreshTimeout)
-	defer cancel()
-	if err := p.refreshPrefixes(ctx); err != nil {
-		p.L().Warn("asn_tun: startup prefix refresh failed, keeping the cached set", zap.Error(err))
+	// A single startup attempt is not enough when the provider is temporarily
+	// unreachable, or when bgpq3 is missing and the fallback also needs a
+	// moment. Retry a few times even when Refresh is 0 (then there is no
+	// periodic ticker to recover later). The cache is kept on every failure.
+	delays := []time.Duration{0, 10 * time.Second, 30 * time.Second}
+	for attempt, delay := range delays {
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-p.runCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		if p.runCtx.Err() != nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(p.runCtx, refreshTimeout)
+		err := p.refreshPrefixes(ctx)
+		cancel()
+		if err == nil {
+			if attempt > 0 {
+				p.L().Info("asn_tun: startup prefix refresh recovered",
+					zap.Int("attempt", attempt+1))
+			}
+			return
+		}
+		p.L().Warn("asn_tun: startup prefix refresh failed, keeping the cached set",
+			zap.Int("attempt", attempt+1),
+			zap.Int("attempts", len(delays)),
+			zap.Error(err))
 	}
+	p.L().Error("asn_tun: startup prefix refresh exhausted retries; marking stays at the cached or empty set",
+		zap.Uint32s("asn", p.asns),
+		zap.String("source", p.args.Source),
+		zap.String("fallback_source", p.args.FallbackSource))
 }
 
 func (p *ASNTunPlugin) runRefresh(interval time.Duration) {
@@ -696,7 +795,7 @@ func (p *ASNTunPlugin) runTunDevice() {
 		if n == 0 {
 			continue
 		}
-		p.stack.inject(buf[:n])
+		p.safeInject(buf[:n])
 	}
 }
 

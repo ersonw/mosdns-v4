@@ -83,6 +83,28 @@ func (p *ASNTunPlugin) parseAndAggregate(data []byte, reason string) ([]netip.Pr
 }
 
 func (p *ASNTunPlugin) fetchPrefixesBGpq3(ctx context.Context) ([]netip.Prefix, error) {
+	prefixes, err := p.fetchPrefixesBGpq3Once(ctx)
+	if err == nil {
+		return prefixes, nil
+	}
+	if p.args.FallbackSource != "ipverse" {
+		return nil, err
+	}
+	// bgpq3 is an external binary. A host that has the plugin configured but not
+	// the binary would otherwise keep an empty prefix set forever. Fall back to
+	// the same ASN list on ipverse, and make the switch visible in the log.
+	p.L().Warn("asn_tun: bgpq3 fetch failed, falling back to ipverse",
+		zap.Error(err))
+	fallback, fallbackErr := p.fetchPrefixesIPVerse(ctx)
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("%w; ipverse fallback: %v", err, fallbackErr)
+	}
+	p.L().Info("asn_tun: ipverse fallback supplied the prefix set",
+		zap.Int("prefix_count", len(fallback)))
+	return fallback, nil
+}
+
+func (p *ASNTunPlugin) fetchPrefixesBGpq3Once(ctx context.Context) ([]netip.Prefix, error) {
 	fetchScript, fetchDownloaded, err := helperscript.Resolve(ctx, p.configDir, p.args.FetchScript, defaultFetchScript)
 	if err != nil {
 		return nil, err

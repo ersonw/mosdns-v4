@@ -171,6 +171,7 @@ type Plugin struct {
 	quotaStop chan struct{}
 	quotaOnce sync.Once
 	quotaWG   sync.WaitGroup
+	closeOnce sync.Once
 }
 
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
@@ -195,6 +196,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	p := &Plugin{BP: bp, args: a, store: st, srv: srv, pool: a.pool, loc: a.loc, quotaStop: make(chan struct{})}
 	srv.start()
 	p.startQuotaLoop()
+	p.attachClose()
 
 	users, _ := st.listUsers()
 	poolInfo := ""
@@ -253,20 +255,45 @@ func (p *Plugin) Exec(ctx context.Context, qCtx *query_context.Context, next exe
 }
 
 func (p *Plugin) Close() error {
-	if p.quotaStop != nil {
-		p.quotaOnce.Do(func() { close(p.quotaStop) })
-		p.quotaWG.Wait()
-	}
-	if p.srv != nil {
-		p.srv.close()
-	}
-	if p.store != nil {
-		if err := p.store.close(); err != nil {
-			p.L().Warn("radius: close database failed", zap.Error(err))
+	p.closeOnce.Do(func() {
+		if p.quotaStop != nil {
+			p.quotaOnce.Do(func() { close(p.quotaStop) })
+			p.quotaWG.Wait()
 		}
-	}
-	p.L().Info("radius: plugin closed")
+		if p.srv != nil {
+			p.srv.close()
+		}
+		if p.store != nil {
+			if err := p.store.close(); err != nil {
+				p.L().Warn("radius: close database failed", zap.Error(err))
+			}
+		}
+		p.L().Info("radius: plugin closed")
+	})
 	return nil
+}
+
+// attachClose releases the UDP sockets and the SQLite handle during the
+// graceful shutdown pass. Without it the process exit closes them implicitly,
+// but the store is never flushed and the port stays occupied until the whole
+// process is gone.
+func (p *Plugin) attachClose() {
+	if p.BP == nil {
+		return
+	}
+	m := p.M()
+	if m == nil {
+		return
+	}
+	sc := m.GetSafeClose()
+	if sc == nil {
+		return
+	}
+	sc.Attach(func(done func(), closeSignal <-chan struct{}) {
+		defer done()
+		<-closeSignal
+		_ = p.Close()
+	})
 }
 
 // Users lists every account, ordered by name.

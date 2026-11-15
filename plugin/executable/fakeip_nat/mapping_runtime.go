@@ -304,7 +304,7 @@ func (p *FakeIPNatPlugin) restoreRuntimeMappings(ctx context.Context) error {
 		if err := rows.Scan(&domain, &fakeIP); err != nil {
 			return fmt.Errorf("scan mapping: %w", err)
 		}
-		if fakeIP == pendingFakeIP {
+		if isPendingFakeIP(fakeIP) {
 			pending++
 			continue
 		}

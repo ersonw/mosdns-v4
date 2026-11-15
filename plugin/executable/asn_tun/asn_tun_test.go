@@ -386,3 +386,71 @@ func TestCloseCleansRoutesAndNft(t *testing.T) {
 		t.Fatalf("second Close issued more calls: %v", runner.calls)
 	}
 }
+
+func TestNewPluginDefaultsBGpq3Fallback(t *testing.T) {
+	bp := coremain.NewBP("asn", PluginType, zap.NewNop(), nil)
+	p, err := newPlugin(bp, &Args{
+		ASN:    []uint32{112},
+		Source: "bgpq3",
+		Proxy:  "socks5://127.0.0.1:1080",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.args.FallbackSource != "ipverse" {
+		t.Fatalf("fallback_source = %q, want ipverse", p.args.FallbackSource)
+	}
+}
+
+func TestNewPluginRejectsUnknownFallback(t *testing.T) {
+	bp := coremain.NewBP("asn", PluginType, zap.NewNop(), nil)
+	if _, err := newPlugin(bp, &Args{
+		ASN:            []uint32{112},
+		Source:         "bgpq3",
+		FallbackSource: "ftp",
+		Proxy:          "socks5://127.0.0.1:1080",
+	}); err == nil {
+		t.Fatal("unknown fallback_source must be rejected")
+	}
+}
+
+func TestSafeGoContainsPanic(t *testing.T) {
+	bp := coremain.NewBP("asn", PluginType, zap.NewNop(), nil)
+	p := &ASNTunPlugin{BP: bp}
+	p.safeGo("test", func() { panic("boom") })
+}
+
+func TestNewPluginAllowsDisablingFallback(t *testing.T) {
+	bp := coremain.NewBP("asn", PluginType, zap.NewNop(), nil)
+	p, err := newPlugin(bp, &Args{
+		ASN:            []uint32{112},
+		Source:         "bgpq3",
+		FallbackSource: "none",
+		Proxy:          "socks5://127.0.0.1:1080",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.args.FallbackSource != "" {
+		t.Fatalf("fallback_source = %q, want disabled", p.args.FallbackSource)
+	}
+}
+
+func TestResolveCachePath(t *testing.T) {
+	dir := t.TempDir()
+	if got := resolveCachePath(dir, "prefixes.json"); got != filepath.Join(dir, "prefixes.json") {
+		t.Fatalf("bare cache = %q", got)
+	}
+	abs := filepath.Join(dir, "abs.json")
+	if got := resolveCachePath(dir, abs); got != abs {
+		t.Fatalf("absolute cache = %q", got)
+	}
+	legacy := filepath.Join(dir, "legacy.json")
+	if err := os.WriteFile(legacy, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	raw := "legacy.json"
+	if got := resolveCachePath(dir, raw); got != filepath.Join(dir, raw) {
+		t.Fatalf("bare existing cache = %q", got)
+	}
+}

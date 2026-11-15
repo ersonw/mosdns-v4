@@ -163,6 +163,15 @@ func startServer(sf *serverFlags, handleSignals bool) error {
 		return fmt.Errorf("failed to load sub config file, %w", err)
 	}
 
+	// Refuse a second instance before any plugin opens a listener. Without
+	// this guard a manual "mosdns start" races the service and fails deep in
+	// radius with a misleading "address already in use" error.
+	releaseLock, err := acquireInstanceLock(cfg.configDir)
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
+
 	if handleSignals {
 		stopWatching := watchShutdownSignals()
 		defer stopWatching()

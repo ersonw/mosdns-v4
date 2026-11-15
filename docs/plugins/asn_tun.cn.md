@@ -39,6 +39,7 @@ ASN 列表
 |---|---|---|
 | `asn` | 必填 | 需要加载的 ASN 编号，例如 `[4134, 4837]`。 |
 | `source` | `ipverse` | 前缀来源。`ipverse` 从 GitHub 拉取；`bgpq3` 调用本地 `fetch_script` 和 `merge_script`。 |
+| `fallback_source` | `bgpq3` 时默认 `ipverse` | 主来源失败时的备用来源。目前只支持 `ipverse`；`none` 表示关闭备用来源。 |
 | `refresh` | `12h` | 周期性刷新间隔；`0` 表示关闭周期刷新，但启动时仍会异步刷新一次。 |
 | `cache` | `/config/mosdns/asn_tun_prefixes.json` | 最近一次成功合并后的前缀列表。启动时同步读取并立即建立 nft 集合；异步刷新失败时继续使用缓存。 |
 | `fetch_script` | `<配置目录>/scripts/bgpq3_fetch_asn.py` | `source: bgpq3` 时使用的 ASN 前缀抓取脚本；缺失时自动从仓库 raw 链接下载。 |
@@ -67,7 +68,11 @@ ASN 列表
 
 没有配置 `proxy` 时，必须提供 `next_hop` 或 `next_hop_dev`，否则插件不知道
 自己的直连 socket 从哪里出站。配置了 `proxy` 时会在启动阶段探测；探测失败会
-直接报错，不会静默改成直连。
+禁用插件而不是静默改成直连，DNS 服务继续运行，也不会造成流量泄漏。
+
+数据面安装失败时（缺少 TUN/nft/ip、权限不足、代理探测失败、旧对象无法回收），
+`Init` 会记录错误并禁用 ASN 打标，DNS 服务继续运行。`newPlugin` 中的配置错误
+仍会导致启动失败。
 
 ## 运行要求
 
@@ -105,6 +110,7 @@ plugins:
     args:
       asn: [4134, 4837]
       source: bgpq3
+      fallback_source: ipverse
       refresh: 12h
       cache: /config/mosdns/asn_tun_prefixes.json
       fetch_script: scripts/bgpq3_fetch_asn.py

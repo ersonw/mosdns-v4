@@ -39,6 +39,7 @@ const (
 	PermRadius     = "radius"      // /user
 	PermConfig     = "config"      // /config read and write
 	PermProvider   = "provider"    // /provider data source management
+	PermAlias      = "alias"       // /alias served name list management
 	PermReload     = "reload"      // /reload confirm
 	PermExecScript = "exec_script" // /exec <tag> <ip> <domain>
 	PermAccess     = "access"      // /access <user> [days]: export visit records
@@ -68,6 +69,7 @@ var allPermissions = []string{
 	PermRadius,
 	PermConfig,
 	PermProvider,
+	PermAlias,
 	PermReload,
 	PermExecScript,
 	PermAccess,
@@ -83,6 +85,7 @@ var adminPermissions = []string{
 	PermRadius,
 	PermAccess,
 	PermProvider,
+	PermAlias,
 	PermWatch,
 }
 
@@ -297,6 +300,8 @@ func requiredPermission(cmd string) string {
 		return PermConfig
 	case "/provider":
 		return PermProvider
+	case "/alias":
+		return PermAlias
 	case "/diag":
 		return PermFakeIP
 	case "/reload":

@@ -115,6 +115,27 @@ func TestRecordAndAllocateStable(t *testing.T) {
 	}
 }
 
+func TestPendingRowDoesNotBlockOtherDomains(t *testing.T) {
+	p := newTestPlugin(t, "198.18.0.0/16")
+	ctx := context.Background()
+
+	// A crash leaves one row with the shared placeholder. Every other new
+	// domain must still be able to insert its own row.
+	if _, err := p.db.ExecContext(ctx,
+		"INSERT INTO test_mapping (domain, fake_ip, created_at) VALUES (?, ?, ?)",
+		"crash.example", pendingFakeIP, 0); err != nil {
+		t.Fatalf("seed pending row failed: %v", err)
+	}
+
+	got, err := p.recordAndAllocate(ctx, "other.example", []string{"1.1.1.1"})
+	if err != nil {
+		t.Fatalf("second domain allocation failed: %v", err)
+	}
+	if addr, err := netip.ParseAddr(got); err != nil || !p.prefix.Contains(addr) {
+		t.Fatalf("second domain got unusable ip %q: %v", got, err)
+	}
+}
+
 func TestPendingRowIsRecovered(t *testing.T) {
 	p := newTestPlugin(t, "198.18.0.0/16")
 	ctx := context.Background()

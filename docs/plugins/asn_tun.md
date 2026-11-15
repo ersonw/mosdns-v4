@@ -44,6 +44,7 @@ marking after the first async refresh completes.
 |---|---|---|
 | `asn` | required | ASN numbers to load, for example `[4134, 4837]`. |
 | `source` | `ipverse` | Prefix provider. `ipverse` fetches from GitHub; `bgpq3` runs local `fetch_script` and `merge_script`. |
+| `fallback_source` | `ipverse` for `bgpq3` | Provider used when the primary source fails. Only `ipverse` is supported; `none` disables fallback. |
 | `refresh` | `12h` | Periodic refresh interval; `0` disables the ticker, but one async refresh still runs at startup. |
 | `cache` | `/config/mosdns/asn_tun_prefixes.json` | Last successfully merged prefix list. It is loaded synchronously at startup to build the nft set; failed async refreshes keep using it. |
 | `fetch_script` | `<config dir>/scripts/bgpq3_fetch_asn.py` | ASN prefix fetch script used when `source: bgpq3`; downloaded automatically when missing. |
@@ -73,7 +74,13 @@ plugin runs them through the configured `python` interpreter.
 
 Without `proxy`, `next_hop` or `next_hop_dev` must be set: the plugin has to
 know where its own direct sockets leave. A configured proxy is probed at
-startup; a failed probe aborts startup instead of silently switching to direct.
+startup; a failed probe disables the plugin instead of switching to direct,
+so DNS keeps running and traffic is not silently leaked.
+
+If the data plane cannot be installed (missing TUN/nft/ip, insufficient
+privileges, a failed proxy probe, or a stale object that cannot be reclaimed),
+`Init` logs an error and disables ASN marking. The DNS service continues.
+Configuration errors in `newPlugin` still fail startup.
 
 ## Requirements
 
@@ -119,6 +126,7 @@ plugins:
     args:
       asn: [4134, 4837]
       source: bgpq3
+      fallback_source: ipverse
       refresh: 12h
       cache: /config/mosdns/asn_tun_prefixes.json
       fetch_script: scripts/bgpq3_fetch_asn.py

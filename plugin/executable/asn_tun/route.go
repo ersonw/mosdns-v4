@@ -44,7 +44,8 @@ func (p *ASNTunPlugin) installRoutes(ctx context.Context) error {
 	}
 	args = append(args, "table", p.egressTable)
 	if _, err := p.runner.Run(ctx, "ip", args...); err != nil {
-		return fmt.Errorf("install egress route: %w", err)
+		return fmt.Errorf("install egress route (next_hop %q dev %q): %w; next_hop must be on-link for next_hop_dev, or configure proxy",
+			p.nextHop, p.nextHopDev, err)
 	}
 	if _, err := p.runner.Run(ctx, "ip", p.egressRuleArgs("del")...); err != nil {
 		p.L().Debug("asn_tun: old egress rule absent", zap.Error(err))
