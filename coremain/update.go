@@ -2,6 +2,7 @@ package coremain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/mlog"
 	"github.com/ersonw/mosdns-v4/pkg/configmigrate"
 	"github.com/ersonw/mosdns-v4/pkg/selfupdate"
 	"go.uber.org/zap"
@@ -104,6 +106,8 @@ type updater struct {
 	cfg     UpdateConfig
 	cfgPath string
 	l       *zap.Logger
+	// status is the one line the manual command prints; the loop ignores it.
+	status string
 }
 
 // startUpdateLoop spawns the polling loop. It waits one interval before the
@@ -166,6 +170,7 @@ func (u *updater) checkOnce(ctx context.Context) {
 		return
 	}
 	if !selfupdate.Newer(BuildVersion(), rel.TagName) {
+		u.status = fmt.Sprintf("already current: running %s, latest %s", BuildVersion(), rel.TagName)
 		u.l.Debug("update: already current", zap.String("running", BuildVersion()), zap.String("latest", rel.TagName))
 		return
 	}
@@ -228,6 +233,7 @@ func (u *updater) checkOnce(ctx context.Context) {
 	}
 
 	if u.cfg.DryRun {
+		u.status = fmt.Sprintf("dry run: %s downloaded, migrated and validated, not installed", rel.TagName)
 		u.l.Info("update: dry run, the release is valid but will not be installed",
 			zap.String("tag", rel.TagName), zap.String("dir", dir))
 		return
@@ -244,6 +250,7 @@ func (u *updater) checkOnce(ctx context.Context) {
 		_ = os.RemoveAll(dir)
 		return
 	}
+	u.status = fmt.Sprintf("install scheduled: %s replaces the running binary after a service restart", rel.TagName)
 	u.l.Info("update: install scheduled, the service restarts with the new release",
 		zap.String("tag", rel.TagName), zap.String("script", script))
 }
@@ -354,4 +361,26 @@ else
 fi
 `, tag, stay, u.cfgPath, newBin, newCfg, ts, log, dir, svc, svc, tag, svc, tag)
 	return b.String()
+}
+
+// UpdateNow runs a single update check for the manual command. It reuses the
+// update block from the operator's own config, so the command and the loop can
+// never disagree about the repository or the asset.
+func UpdateNow(dir, cfgPath string, dryRun bool) error {
+	cfg, err := LoadConfigFile(dir, cfgPath)
+	if err != nil {
+		return err
+	}
+	if cfg.Update.Repo == "" {
+		return errors.New("update.repo is missing in the config")
+	}
+	if dryRun {
+		cfg.Update.DryRun = true
+	}
+	u := &updater{cfg: cfg.Update, cfgPath: cfg.configPath, l: mlog.L().Named("update")}
+	u.checkOnce(context.Background())
+	if u.status != "" {
+		fmt.Println(u.status)
+	}
+	return nil
 }

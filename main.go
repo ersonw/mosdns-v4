@@ -52,6 +52,25 @@ func init() {
 	check.Flags().StringVarP(&checkCfg, "config", "c", "config.yaml", "config file")
 	coremain.AddSubCmd(check)
 
+	// update runs the same check the loop runs, once, in the foreground: the
+	// operator sees the decision, the checksum, the config validation and the
+	// scheduled swap instead of waiting for a log line.
+	var (
+		updDir, updCfg string
+		updDryRun      bool
+	)
+	upd := &cobra.Command{
+		Use:   "update",
+		Short: "Check for a newer release and install it, then exit.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return coremain.UpdateNow(updDir, updCfg, updDryRun)
+		},
+	}
+	upd.Flags().StringVarP(&updDir, "dir", "d", "", "working directory")
+	upd.Flags().StringVarP(&updCfg, "config", "c", "config.yaml", "config file")
+	upd.Flags().BoolVar(&updDryRun, "dry-run", false, "download and validate, do not install")
+	coremain.AddSubCmd(upd)
+
 	coremain.AddSubCmd(&cobra.Command{
 		Use:   "version",
 		Short: "Print out version info and exit.",
