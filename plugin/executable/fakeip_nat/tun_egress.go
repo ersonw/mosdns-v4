@@ -212,6 +212,11 @@ func (p *FakeIPNatPlugin) stopTunEgress() {
 	if fakeRule != nil {
 		fakeRule()
 	}
+	captureRule := p.captureRuleCleanup
+	p.captureRuleCleanup = nil
+	if captureRule != nil {
+		captureRule()
+	}
 	// The objects are gone, so the record that named them is too. A crash before
 	// this point leaves the record in place, which is exactly what the next run
 	// needs to remove them.

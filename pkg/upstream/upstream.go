@@ -39,6 +39,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -346,17 +347,89 @@ func tryRemovePort(s string) string {
 type udpWithFallback struct {
 	u *transport.Transport
 	t *transport.Transport
+
+	// udpQuiet holds the unix time until which UDP is skipped. A relayed path
+	// (socks5 UDP association, tunnel) can lose every datagram while TCP keeps
+	// working; remembering that for a short while keeps every query from paying
+	// the UDP timeout again and again.
+	udpQuiet atomic.Int64
 }
 
+// udpQuietPeriod is how long a failed UDP attempt makes this upstream prefer
+// TCP directly.
+const udpQuietPeriod = time.Second * 60
+
+// udpUsable reports whether the UDP path is worth trying right now.
+func (u *udpWithFallback) udpUsable() bool {
+	return time.Now().UnixNano() >= u.udpQuiet.Load()
+}
+
+func (u *udpWithFallback) markUDPFailed() {
+	u.udpQuiet.Store(time.Now().Add(udpQuietPeriod).UnixNano())
+}
+
+func (u *udpWithFallback) clearUDPFailed() {
+	u.udpQuiet.Store(0)
+}
+
+// udpAttemptWindow bounds one UDP attempt so that a lost datagram still leaves
+// budget for the TCP fallback below. A query that carries a shorter deadline
+// keeps its own.
+const udpAttemptWindow = time.Second * 3
+
 func (u *udpWithFallback) ExchangeContext(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
-	m, err := u.u.ExchangeContext(ctx, q)
-	if err != nil {
+	if !u.udpUsable() {
+		m, err := u.t.ExchangeContext(ctx, q)
+		if err == nil {
+			return m, nil
+		}
+		// The quiet window may outlive the outage; let UDP try again.
+		u.clearUDPFailed()
 		return nil, err
 	}
-	if m.Truncated {
-		return u.t.ExchangeContext(ctx, q)
+
+	udpCtx := ctx
+	if dl, ok := ctx.Deadline(); ok {
+		// Only split the budget when the caller gave more than one UDP window,
+		// otherwise the fallback would never get to run.
+		if time.Until(dl) > udpAttemptWindow {
+			var cancel context.CancelFunc
+			udpCtx, cancel = context.WithTimeout(ctx, udpAttemptWindow)
+			defer cancel()
+		}
+	} else {
+		var cancel context.CancelFunc
+		udpCtx, cancel = context.WithTimeout(ctx, udpAttemptWindow)
+		defer cancel()
 	}
-	return m, nil
+
+	m, err := u.u.ExchangeContext(udpCtx, q)
+	if err != nil {
+		u.markUDPFailed()
+	} else {
+		u.clearUDPFailed()
+	}
+	if err == nil && !m.Truncated {
+		return m, nil
+	}
+	// A truncated answer is the classic reason to move to TCP, and a lost UDP
+	// datagram - common on a relayed path such as a socks5 UDP association - is
+	// the other one. Both retry the same query over TCP, which is reliable
+	// there, instead of failing the client outright.
+	if ctx.Err() != nil {
+		if err != nil {
+			return nil, err
+		}
+		return m, nil
+	}
+	tcpMsg, tcpErr := u.t.ExchangeContext(ctx, q)
+	if tcpErr == nil {
+		return tcpMsg, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("udp: %v; tcp: %w", err, tcpErr)
+	}
+	return nil, tcpErr
 }
 
 func (u *udpWithFallback) CloseIdleConnections() {

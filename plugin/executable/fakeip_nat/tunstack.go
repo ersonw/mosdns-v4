@@ -630,6 +630,11 @@ func (p *FakeIPNatPlugin) ownsTunDestination(pkt []byte) bool {
 	if p.isFakeAddr(dst) {
 		return true
 	}
+	if p.capturesAddr(dst) {
+		// A real edge the operator pinned: an app with its own address list
+		// connects here without ever resolving through this plugin.
+		return true
+	}
 	if dnsPacket(pkt) {
 		return true
 	}

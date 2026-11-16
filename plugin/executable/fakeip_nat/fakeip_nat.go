@@ -174,6 +174,16 @@ type Args struct {
 	// 配了代理时不会建表。仅 Linux 支持独立路由表；darwin 改为把出口 socket
 	// 绑定到 next_hop_dev。
 	TunRouteTable string `yaml:"tun_route_table"`
+
+	// CaptureCIDRs 是除虚拟地址段之外、本插件也要承载的真实目的地址前缀。
+	// 自带地址表的 App（TikTok 这类）从不走解析，连接直接落在虚拟段外，如果
+	// 不接管就会由主机自己拨号，在受限网络里表现为握手出去、回包全无。
+	// 这里列出的前缀会被路由进 tun 设备，并在读取循环里被接受，然后和其它
+	// 流量一样经由出口转发。仅在 use_tun 下生效。
+	CaptureCIDRs []string `yaml:"capture_cidrs"`
+	// CaptureFile 与 CaptureCIDRs 作用相同，但前缀从一个文本文件读取：每行
+	// 一个 CIDR，# 开头的行忽略。便于不改配置就扩充列表。
+	CaptureFile string `yaml:"capture_file"`
 }
 
 type FakeIPNatPlugin struct {
@@ -305,6 +315,13 @@ type FakeIPNatPlugin struct {
 	// the system instead of being DNAT-ed hop by hop.
 	useTun bool
 	tunDev string
+	// capturePrefixes are real destinations the device carries in addition to
+	// the fake range. An app that ships its own address list never asks the
+	// resolver, so its connections land outside the fake range and would be
+	// dialed straight from the host, where they are blocked or unreachable.
+	// Each prefix is routed into the device and accepted by the device read
+	// loop, then relayed through the outlet like any other flow.
+	capturePrefixes []netip.Prefix
 	// tunMTU is the MTU written to the device and advertised by the stack. It
 	// is resolved once in Init from tun_mtu, or from the outlet kind.
 	tunMTU uint32
@@ -331,6 +348,8 @@ type FakeIPNatPlugin struct {
 	tunEgressCleanup func()
 	// tunFakeRuleCleanup removes the rule that pins the fake range to main.
 	tunFakeRuleCleanup func()
+	// captureRuleCleanup removes the rules that pin capture prefixes to main.
+	captureRuleCleanup func()
 	// policyRuleSupported mirrors supportsNamedRouteTable(): only a platform with
 	// named routing tables and ip rule can pin the fake range ahead of the host
 	// policy routing.
@@ -519,6 +538,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			zap.Int("mss_clamp", cfg.MSSClamp), zap.Bool("use_tun", cfg.UseTun), zap.Bool("realip", cfg.RealIP))
 	}
 
+	capturePrefixes, err := loadCapturePrefixes(cfg.CaptureCIDRs, cfg.CaptureFile)
+	if err != nil {
+		return nil, err
+	}
+
 	// IPv6 egress detection: a direct outlet can only answer a fake IPv4 for an
 	// IPv6-only name when the host itself can reach IPv6. The probe target and
 	// the mode are fixed at startup; only the result is refreshed.
@@ -652,6 +676,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		mssClamp:          cfg.MSSClamp,
 		useTun:            cfg.UseTun,
 		tunDev:            strings.TrimSpace(cfg.TunDev),
+		capturePrefixes:   capturePrefixes,
 	}
 	p.runner = execRunner{}
 	p.probe = p.probeReachable
@@ -901,6 +926,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	// of this run are in the ledger before they are written, and the sweep only
 	// touches prefixes the ledger does not own.
 	p.deferStartup("residual-routes", p.sweepResidualRoutes)
+
+	// Capture prefixes are ledger rows too, and the sweep above deletes every
+	// prefix the ledger names. Queueing the install behind it means the routes
+	// are written after the leftovers are gone, instead of being swept as part
+	// of this run's own record.
+	if p.useTun && len(p.capturePrefixes) > 0 {
+		p.deferStartup("capture-routes", p.installCaptureRoutes)
+	}
 
 	// A proxied outlet carries the answers itself, so in tun + fakeip the mark has
 	// nothing to steer and stays uninstalled; the same configuration keeps the
