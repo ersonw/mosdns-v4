@@ -147,6 +147,21 @@ func (p *FakeIPNatPlugin) ensureMarkTable(ctx context.Context, table string) err
 // it. A failure here means the data path falls back to host routes, so the
 // caller only logs it instead of failing the plugin.
 func (p *FakeIPNatPlugin) setupMarkRouting(ctx context.Context) error {
+	// A routed exit that takes destinations owns the whole mark path: the set,
+	// the two chains, the rule and the table route. Writing a second copy here
+	// would leave two rules carrying the same mark, the kernel would keep both,
+	// and nothing would say which one the traffic took.
+	if p.borrowed != nil && !p.useTun && p.borrowed.registrar != nil {
+		p.markMu.Lock()
+		p.markReady = true
+		p.markActive = true
+		p.markMu.Unlock()
+		p.L().Info("route mark: destinations are marked by the borrowed exit",
+			zap.String("egress", p.borrowed.tag),
+			zap.String("exit", p.borrowed.decision.String()))
+		return nil
+	}
+
 	table := p.nftTableName()
 	if err := p.ensureMarkTable(ctx, table); err != nil {
 		return err
@@ -236,9 +251,16 @@ func (p *FakeIPNatPlugin) markRuleArgs(action string) []string {
 
 // markRealIPs adds several destinations at once. One nft call per answer keeps
 // the tun + fakeip path as cheap as the NAT path's per-address writes.
+//
+// When the exit takes destinations, the call goes to it: the set lives in the
+// exit's nft table and the mark on it is the exit's, so the address is routed
+// by the same decision that installed the rule.
 func (p *FakeIPNatPlugin) markRealIPs(ctx context.Context, ips []string) error {
 	if len(ips) == 0 {
 		return nil
+	}
+	if p.borrowed != nil && !p.useTun && p.borrowed.registrar != nil {
+		return p.borrowed.registrar.MarkDestinations(ctx, ips)
 	}
 	table := p.nftTableName()
 	if err := p.ensureMarkTable(ctx, table); err != nil {
@@ -255,20 +277,21 @@ func (p *FakeIPNatPlugin) markRealIPs(ctx context.Context, ips []string) error {
 // replacement for writing a /32 host route: the address never touches a
 // routing table.
 func (p *FakeIPNatPlugin) markRealIP(ctx context.Context, ip string) error {
-	table := p.nftTableName()
-	if err := p.ensureMarkTable(ctx, table); err != nil {
-		return err
-	}
-	if _, err := p.runner.Run(ctx, "nft", "add", "element", "ip", table, markSetName, "{ "+ip+" }"); err != nil {
-		return fmt.Errorf("nft add element %s %s %s: %w", table, markSetName, ip, err)
-	}
-	return nil
+	return p.markRealIPs(ctx, []string{ip})
 }
 
 // cleanupMarkRouting removes the policy rule and the default route of the
 // dedicated table, then marks the path as gone. The nft objects are dropped by
 // cleanupDataPath together with the rest of the table.
 func (p *FakeIPNatPlugin) cleanupMarkRouting(ctx context.Context) {
+	// A borrowed exit wrote every object of this path, and it removes them
+	// itself when it closes. Touching them here would delete the rule another
+	// plugin still needs.
+	if p.borrowed != nil && !p.useTun {
+		p.L().Debug("route mark: the borrowed exit owns the mark path, nothing to remove",
+			zap.String("egress", p.borrowed.tag))
+		return
+	}
 	// The kernel objects are being removed, so the claim must go with them:
 	// otherwise a restart in the same process would see a stale owner.
 	routepolicy.Default().Release(p.Tag())

@@ -55,6 +55,12 @@ var validTableName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 // route tables are either a name (main, oversea) or an iproute2 id.
 var validRouteTable = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
+// defaultRouteRulePriority is the ip rule priority used when the config leaves
+// it empty. A value equal to this default is treated as "not declared", which
+// is what lets an inherited exit decision replace it without a spurious
+// duplicate warning.
+const defaultRouteRulePriority = 1000
+
 // validHostLabel keeps hop_name_suffix a single DNS label.
 var validHostLabel = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 
@@ -226,6 +232,10 @@ type FakeIPNatPlugin struct {
 	markMu     sync.Mutex
 	markReady  bool
 	markActive bool
+	// borrowed is the exit named by egress. It carries the decision the exit
+	// installed and, when the exit owns a destination set, the registrar the
+	// non-tun path hands its mapped addresses to.
+	borrowed *borrowedExit
 	// mssClamp is the MSS value written into SYN / SYN-ACK packets, 0 to leave
 	// the negotiated value alone.
 	mssClamp int
@@ -429,7 +439,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 	routeRulePriority := cfg.RouteRulePriority
 	if routeRulePriority == 0 {
-		routeRulePriority = 1000
+		routeRulePriority = defaultRouteRulePriority
 	}
 	if err := validateRouteMark(cfg, routeRulePriority); err != nil {
 		return nil, err
@@ -716,10 +726,46 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		// exemptions: a socks5 outlet must keep the domain when local resolution
 		// returns one of our own fake addresses.
 		setFakeRange(p.egress, prefix)
+
+		// A routed exit can also take the destinations this plugin maps, which
+		// is the only correct owner for the non-tun path: the mark, the table
+		// and the route are already installed by the exit, and a second copy
+		// here would fight it.
+		var registrar routepolicy.DestinationRegistrar
+		if o, ok := outlet.(interface{ OutletDestSet() string }); ok && o.OutletDestSet() != "" {
+			if r, ok := outlet.(routepolicy.DestinationRegistrar); ok {
+				registrar = r
+			}
+		}
+		p.borrowed = &borrowedExit{tag: outlet.OutletTag(), decision: outlet.OutletDecision(), registrar: registrar}
+
+		fields, ignored := adoptExitFields(cfg, p.borrowed.decision, cfg.UseTun, registrar != nil)
+		if len(ignored) > 0 {
+			p.L().Warn("fakeip nat: these fields belong to the borrowed exit and are ignored here",
+				zap.Strings("ignored", ignored), zap.String("egress", cfg.Egress),
+				zap.String("exit", p.borrowed.decision.String()))
+		}
+		if fields.Mark != 0 {
+			p.routeMark = fields.Mark
+		}
+		if fields.Table != "" {
+			p.routeTable = fields.Table
+		}
+		if fields.Priority != 0 {
+			p.routeRulePriority = fields.Priority
+		}
+		if fields.NextHop != "" {
+			p.nextHop = fields.NextHop
+		}
+		if fields.Dev != "" {
+			p.nextHopDev = fields.Dev
+		}
+
 		p.L().Info("fakeip nat: exit borrowed from another plugin",
 			zap.String("egress", outlet.OutletTag()),
-			zap.String("exit", outlet.OutletDecision().String()),
-			zap.Bool("proxy_active", p.proxyActive))
+			zap.String("exit", p.borrowed.decision.String()),
+			zap.Bool("proxy_active", p.proxyActive),
+			zap.Bool("destination_registrar", registrar != nil))
 		if !cfg.UseTun && p.proxyActive {
 			p.L().Warn("the borrowed proxy only applies to the tun data path", zap.String("egress", cfg.Egress))
 		}
@@ -885,6 +931,12 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		if err != nil {
 			p.L().Error("route_mark is enabled but the mark routing could not be installed; falling back to host routes",
 				zap.Uint32("route_mark", p.routeMark), zap.String("route_table", p.routeTable), zap.Error(err))
+		} else if p.borrowed != nil && !p.useTun && p.borrowed.registrar != nil {
+			// The exit installed and reads back its own objects, and it is the
+			// one that removes them. Recording them as this plugin's state would
+			// let a later start try to clean up someone else's exit.
+			p.L().Debug("route mark: state belongs to the borrowed exit",
+				zap.String("egress", p.borrowed.tag))
 		} else {
 			// Installing is not proof: read the four objects back so a silently
 			// incomplete path shows up in the log instead of in the main table.
@@ -941,6 +993,73 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 // whether the mark applies (see markRoutingEnabled). Rejecting combinations here
 // used to take the whole resolver down on a start, which is what this signature
 // of validation exists to avoid.
+// borrowedExit is the exit named by egress: the fields it installed, and the
+// registrar that accepts the addresses this plugin maps.
+//
+// Two data paths read it differently. The tun path only mirrors the decision
+// so its logs name the real owner. The NAT path uses the registrar instead of
+// writing its own nft set, rule and default route, because those are exactly
+// the objects the exit already owns.
+type borrowedExit struct {
+	tag       string
+	decision  routepolicy.Decision
+	registrar routepolicy.DestinationRegistrar
+}
+
+// borrowedExitFields is the routing half a borrower takes from the exit it
+// pointed at with egress. egress_route owns mark, table, priority and next hop
+// for one piece of kernel state; repeating any of them in this plugin would let
+// two places disagree about the same exit.
+type borrowedExitFields struct {
+	Mark     uint32
+	Table    string
+	Priority int
+	NextHop  string
+	Dev      string
+}
+
+// adoptExitFields resolves what the borrowed exit replaces, and names the
+// fields the operator also wrote here so the log can say they were dropped
+// instead of letting them look effective.
+//
+// The tun data path consumes none of the mark, table or rule priority: it pins
+// the fake range into the main table and hands packets to its own stack. They
+// are still adopted so the admin view and the log report the exit's real
+// decision instead of a stale local copy.
+//
+// The NAT data path does install those objects, but only when the exit cannot
+// take destinations itself. A routed exit already writes the mark, the table
+// and the rule, so a borrower that repeated them would collide with the exit's
+// claim; when it offers a destination set, the borrower registers the mapped
+// addresses there and keeps its hands off the kernel.
+func adoptExitFields(cfg *Args, d routepolicy.Decision, useTun bool, canRegister bool) (borrowedExitFields, []string) {
+	declared := map[string]bool{
+		"route_mark":          cfg.RouteMark != 0,
+		"route_table":         strings.TrimSpace(cfg.RouteTable) != "" && strings.TrimSpace(cfg.RouteTable) != "main",
+		"route_rule_priority": cfg.RouteRulePriority != 0 && cfg.RouteRulePriority != defaultRouteRulePriority,
+		"next_hop":            strings.TrimSpace(cfg.NextHop) != "",
+		"next_hop_dev":        strings.TrimSpace(cfg.NextHopDev) != "",
+	}
+
+	owned := []string{"next_hop", "next_hop_dev"}
+	if useTun || canRegister {
+		owned = []string{"route_mark", "route_table", "route_rule_priority", "next_hop", "next_hop_dev"}
+	}
+	var ignored []string
+	for _, name := range owned {
+		if declared[name] {
+			ignored = append(ignored, name)
+		}
+	}
+
+	out := borrowedExitFields{NextHop: d.NextHop, Dev: d.Dev}
+	if useTun || canRegister {
+		// The exit installed these, so the reported decision matches the owner.
+		out.Mark, out.Table, out.Priority = d.Mark, d.Table, d.Priority
+	}
+	return out, ignored
+}
+
 func validateRouteMark(cfg *Args, routeRulePriority int) error {
 	if cfg.RouteMark == 0 {
 		return nil

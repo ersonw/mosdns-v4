@@ -708,12 +708,17 @@ type gostCandidate struct {
 // A UDP flow therefore never even tries an http outlet, and a TCP flow goes
 // straight to the protocol with the shortest handshake. When the chosen list is
 // empty, or every entry fails while connecting, the flow leaves through the
-// host network just like a run without a proxy link.
+// host network just like a run without a proxy link, unless the exit asked for
+// strict mode with SetNoDirectFallback.
 type gostEgress struct {
 	server string
 	all    []egressDialer
 	tcp    []gostCandidate
 	udp    []gostCandidate
+	// noFallback is set by an exit that must not leak around a broken proxy:
+	// when every flavour failed the dial returns an error instead of leaving
+	// through the host network.
+	noFallback bool
 }
 
 // newGostEgress builds the candidate list. socks5h comes first because it keeps
@@ -824,6 +829,16 @@ func (e *gostEgress) DialContext(ctx context.Context, network, addr string) (net
 			return conn, nil
 		}
 		lastErr = err
+	}
+
+	if e.noFallback {
+		// A strict exit keeps the flow off the host network even when the proxy
+		// is down: leaking here would put the traffic the exit exists to carry
+		// on an address the operator never chose, and do it silently.
+		if lastErr != nil {
+			return nil, fmt.Errorf("gost candidates failed (%v) and direct fallback is disabled", lastErr)
+		}
+		return nil, fmt.Errorf("gost %s has no usable candidate and direct fallback is disabled", e.server)
 	}
 
 	var direct directEgress

@@ -60,6 +60,11 @@ type Args struct {
 	// at for "send my flows through this proxy", with no kernel state involved.
 	Proxy         string `yaml:"proxy"`
 	ProxyInsecure bool   `yaml:"proxy_insecure"`
+	// DirectFallback allows a failed proxy dial to leave from this box's own
+	// address instead of failing. It defaults to true, which is what a general
+	// browsing exit wants; a strict exit whose destinations must never appear
+	// on the local address sets it to false.
+	DirectFallback *bool `yaml:"direct_fallback"`
 	// ProxyFrom borrows the proxy of another outlet instead of repeating the
 	// link here. This is what lets one exit be both a routed exit (its own mark
 	// and table) and a consumer of the box's single proxy definition: marks and
@@ -92,6 +97,12 @@ func (a *Args) validate() error {
 		if a.Mark == 0 && table != "" {
 			return fmt.Errorf("egress_route: route_table needs mark, or drop both for a proxy-only exit")
 		}
+		// Marked traffic has to leave somewhere, and the proxy is not a routing
+		// destination: the rule points at a table whose default route needs a
+		// next hop or a device.
+		if a.Mark != 0 && nextHop == "" && dev == "" {
+			return fmt.Errorf("egress_route: a marked proxy exit still needs next_hop or next_hop_dev for the rule it installs")
+		}
 		return nil
 	}
 	if a.Mark == 0 {
@@ -118,6 +129,13 @@ type plugin struct {
 	installed bool
 	claimed   bool
 	closeOnce sync.Once
+
+	// Destinations are the other half of the mark: this exit decides which
+	// addresses carry it, and a data path that resolves a name registers the
+	// address here instead of writing its own chains.
+	nft    *routepolicy.NFTInstaller
+	set    string
+	setTbl string
 }
 
 // Init builds the exit and installs it. Unlike the data-plane plugins this one
@@ -175,6 +193,15 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		p.proxy = proxyHost(raw)
 		p.L().Info("egress_route: proxy exit ready",
 			zap.String("proxy", egress.Redact(raw)), zap.String("exit", p.decision.String()))
+		if cfg.DirectFallback != nil && !*cfg.DirectFallback {
+			if !egress.SetNoDirectFallback(p.dialer) {
+				p.L().Warn("egress_route: direct_fallback is false but this link is a single protocol and never falls back",
+					zap.String("proxy", egress.Redact(raw)))
+			} else {
+				p.L().Info("egress_route: direct fallback disabled",
+					zap.String("proxy", egress.Redact(raw)))
+			}
+		}
 	} else {
 		if p.decision.NextHop == "" && p.decision.Dev == "" {
 			return nil, fmt.Errorf("egress_route: needs next_hop or next_hop_dev, or a proxy")
@@ -203,9 +230,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 	p.claimed = true
 
-	// A proxy exit installs no rule: the sockets it owns leave through the host
-	// route, and point them at a dedicated table would only lose the handshake.
-	if p.proxy == "" {
+	// A proxy exit that was also given a mark and a table is a routed exit that
+	// happens to carry the proxy too: the rule is what sends marked traffic
+	// somewhere, and the proxy only decides what the data path dials. Installing
+	// it is therefore not conditional on the proxy - only the mark is.
+	if p.decision.Mark != 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
 		err := p.installer.Apply(ctx, p.decision)
 		cancel()
@@ -216,6 +245,29 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		p.installed = true
 		p.L().Info("egress_route: exit installed",
 			zap.String("exit", p.decision.String()), zap.String("nft_table", p.decision.NFTable))
+	}
+
+	// A routed exit also owns the set its destinations are registered in, so a
+	// borrowing data path writes no nft object of its own. The table may be
+	// shared with the plugin that owns the destinations (asn_tun), which is why
+	// the set and the chains are namespaced by this exit's tag and the table is
+	// never deleted here.
+	if p.installed && p.decision.NFTable != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
+		set, err := routepolicy.NewNFTInstaller(execRunner{}).EnsureDestSet(ctx, bp.Tag(), p.decision, netip.Prefix{})
+		cancel()
+		if err != nil {
+			// The route and the rule are already in place, so the exit still
+			// works; only borrowers that register destinations are affected, and
+			// they find out when they ask.
+			p.L().Warn("egress_route: destination set not installed, borrowers must keep their own marking",
+				zap.String("nft_table", p.decision.NFTable), zap.Error(err))
+		} else {
+			p.nft = routepolicy.NewNFTInstaller(execRunner{})
+			p.set, p.setTbl = set, p.decision.NFTable
+			p.L().Info("egress_route: destination set ready",
+				zap.String("nft_table", p.setTbl), zap.String("set", p.set))
+		}
 	}
 
 	if err := routepolicy.RegisterOutlet(p); err != nil {
@@ -244,6 +296,12 @@ func (p *plugin) attachClose() {
 func (p *plugin) Close() error {
 	p.closeOnce.Do(func() {
 		routepolicy.UnregisterOutlet(p.Tag())
+		if p.set != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
+			p.nft.RemoveDestSet(ctx, p.Tag(), p.setTbl)
+			cancel()
+			p.set = ""
+		}
 		if p.installed {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
 			if err := p.installer.Remove(ctx, p.decision); err != nil {
@@ -274,6 +332,24 @@ func (p *plugin) OutletDialer() egress.Dialer { return p.dialer }
 // because the socket that reaches the proxy cannot itself take the mark. The
 // password stays here and never reaches the borrower's decision value.
 func (p *plugin) OutletProxyHost() string { return p.proxy }
+
+// OutletDestSet names the set this exit marks destinations in, or empty when
+// it carries no marking objects. A borrower reads it before asking to register
+// anything: a proxy-only exit marks nothing and would only fail the call.
+func (p *plugin) OutletDestSet() string { return p.set }
+
+// MarkDestinations registers the addresses a borrower mapped to this exit.
+//
+// This is the non-tun half of the split: the data path turns a name into a real
+// address and stops there, while the mark, the table and the route that send
+// that address out remain this exit's, which is the only place they are
+// written.
+func (p *plugin) MarkDestinations(ctx context.Context, ips []string) error {
+	if p.set == "" {
+		return fmt.Errorf("egress_route: %s has no destination set, it cannot mark addresses", p.Tag())
+	}
+	return p.nft.AddDestinations(ctx, p.setTbl, p.set, ips)
+}
 
 func proxyHost(raw string) string {
 	u, err := url.Parse(raw)

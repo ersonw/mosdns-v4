@@ -77,6 +77,21 @@ func SetFakeRange(d Dialer, prefix netip.Prefix) bool {
 	return setFakeRange(d, prefix)
 }
 
+// SetNoDirectFallback turns off the host-network fallback of a multi-protocol
+// outlet: once every proxy flavour failed, the dial reports the error instead
+// of leaving from this box's own address.
+//
+// It reports whether the outlet has such a fallback to disable. A link made of
+// a single protocol never falls back, so a false result is not a failure.
+func SetNoDirectFallback(d Dialer) bool {
+	g, ok := d.(*gostEgress)
+	if !ok {
+		return false
+	}
+	g.noFallback = true
+	return true
+}
+
 // Redact removes credentials from a proxy link before it reaches a log.
 func Redact(raw string) string {
 	return redactProxy(raw)

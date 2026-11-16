@@ -1,6 +1,7 @@
 package routepolicy
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
@@ -26,6 +27,18 @@ var (
 	outletMu    sync.RWMutex
 	outletByTag = make(map[string]Outlet)
 )
+
+// DestinationRegistrar is the optional half of an outlet that can mark the
+// destinations a borrower resolved.
+//
+// A data path that maps a name to an address owns that address for the rest of
+// its life, but the decision "this address leaves through me" belongs to the
+// exit. An exit that installs a destination set accepts them here, so the
+// borrower writes nothing into the kernel and the mark keeps a single owner.
+// A proxy-only exit registers none and does not implement this interface.
+type DestinationRegistrar interface {
+	MarkDestinations(ctx context.Context, ips []string) error
+}
 
 // RegisterOutlet publishes o under its tag. A second plugin on the same tag is
 // a configuration mistake: the borrower would take whichever won the race.
