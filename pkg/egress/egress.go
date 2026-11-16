@@ -76,6 +76,18 @@ func isIPv6Target(addr string) bool {
 	return err == nil && parsed.Is6()
 }
 
+// dialServer opens the connection to the proxy itself. base is the injected
+// path: a plugin whose proxy must leave through a pinned device passes its
+// direct outlet, so the socket is bound before it carries traffic. A nil base
+// leaves the decision to the host's own routing table.
+func dialServer(base Dialer, ctx context.Context, addr string) (net.Conn, error) {
+	if base != nil {
+		return base.DialContext(ctx, "tcp", addr)
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr)
+}
+
 // newEgress builds the outlet described by a proxy link. An empty link means
 // direct egress.
 func newEgress(raw string, insecure bool) (egressDialer, error) {
@@ -208,6 +220,9 @@ type socks5Egress struct {
 	user      string
 	pass      string
 	remoteDNS bool
+	// base dials the proxy itself. Nil means the host's own routing; a plugin
+	// that must leave through a pinned device injects its direct outlet here.
+	base Dialer
 	// fakeRange is the address range this plugin hands out itself. A local
 	// lookup that lands inside it was answered by the plugin's own DNS, so
 	// connecting to that address is pointless: the name is kept and the proxy
@@ -230,8 +245,7 @@ func (e *socks5Egress) DialContext(ctx context.Context, network, addr string) (n
 		addr = e.targetAddr(ctx, addr)
 	}
 
-	var d net.Dialer
-	c, err := d.DialContext(ctx, "tcp", e.server)
+	c, err := dialServer(e.base, ctx, e.server)
 	if err != nil {
 		return nil, fmt.Errorf("dial socks5 server %s: %w", e.server, err)
 	}
@@ -251,8 +265,7 @@ func (e *socks5Egress) DialContext(ctx context.Context, network, addr string) (n
 }
 
 func (e *socks5Egress) Probe(ctx context.Context) error {
-	var d net.Dialer
-	c, err := d.DialContext(ctx, "tcp", e.server)
+	c, err := dialServer(e.base, ctx, e.server)
 	if err != nil {
 		return fmt.Errorf("dial socks5 server %s: %w", e.server, err)
 	}
@@ -479,6 +492,8 @@ type httpEgress struct {
 	user   string
 	pass   string
 	tlsCfg *tls.Config // nil for plain http
+	// base dials the proxy itself; nil means the host's own routing.
+	base Dialer
 }
 
 func (e *httpEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -564,20 +579,21 @@ func (e *httpEgress) Probe(ctx context.Context) error {
 }
 
 func (e *httpEgress) dialProxy(ctx context.Context) (net.Conn, error) {
+	c, err := dialServer(e.base, ctx, e.server)
+	if err != nil {
+		return nil, fmt.Errorf("dial http proxy %s: %w", e.server, err)
+	}
 	if e.tlsCfg == nil {
-		var d net.Dialer
-		c, err := d.DialContext(ctx, "tcp", e.server)
-		if err != nil {
-			return nil, fmt.Errorf("dial http proxy %s: %w", e.server, err)
-		}
 		return c, nil
 	}
-	td := &tls.Dialer{Config: e.tlsCfg}
-	c, err := td.DialContext(ctx, "tcp", e.server)
-	if err != nil {
+	// The TLS handshake runs on the same socket, so a pinned device stays in
+	// force for the proxy connection itself.
+	tc := tls.Client(c, e.tlsCfg)
+	if err := tc.HandshakeContext(ctx); err != nil {
+		_ = c.Close()
 		return nil, fmt.Errorf("dial https proxy %s: %w", e.server, err)
 	}
-	return c, nil
+	return tc, nil
 }
 
 // trojanEgress speaks the trojan protocol over TLS (CONNECT only).
@@ -586,6 +602,8 @@ type trojanEgress struct {
 	password string
 	sni      string
 	insecure bool
+	// base dials the proxy itself; nil means the host's own routing.
+	base Dialer
 }
 
 func (e *trojanEgress) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -643,12 +661,17 @@ func (e *trojanEgress) Probe(ctx context.Context) error {
 }
 
 func (e *trojanEgress) dial(ctx context.Context) (net.Conn, error) {
-	td := &tls.Dialer{Config: &tls.Config{ServerName: e.sni, InsecureSkipVerify: e.insecure}}
-	c, err := td.DialContext(ctx, "tcp", e.server)
+	cfg := &tls.Config{ServerName: e.sni, InsecureSkipVerify: e.insecure}
+	c, err := dialServer(e.base, ctx, e.server)
 	if err != nil {
 		return nil, fmt.Errorf("dial trojan server %s: %w", e.server, err)
 	}
-	return c, nil
+	td := tls.Client(c, cfg)
+	if err := td.HandshakeContext(ctx); err != nil {
+		_ = c.Close()
+		return nil, fmt.Errorf("dial trojan server %s: %w", e.server, err)
+	}
+	return td, nil
 }
 
 // trojanConnectRequest builds the v1 header: the first 56 hex chars of

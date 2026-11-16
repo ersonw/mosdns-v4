@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/ersonw/mosdns-v4/coremain"
+	outlet "github.com/ersonw/mosdns-v4/pkg/egress"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/matcher/domain"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
@@ -140,8 +141,8 @@ type plugin struct {
 	alloc     *allocator
 	prefix    netip.Prefix
 	tlsConfig *tls.Config
-	proxy     egress
-	direct    *directEgress
+	proxy     outlet.Dialer
+	direct    *outlet.Direct
 	resolve   *resolver
 
 	plane *tunPlane
@@ -260,8 +261,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		tlsConfig: tlsConfig,
 	}
 
-	direct := &directEgress{dev: strings.TrimSpace(cfg.NextHopDev)}
-	direct.local = alloc.deviceAddr()
+	direct := outlet.NewDirect(strings.TrimSpace(cfg.NextHopDev), netip.Addr{})
+	direct.SetTimeout(dialTimeout)
+	direct.SetLocal(alloc.deviceAddr())
 	p.direct = direct
 
 	p.preallocateStore()
