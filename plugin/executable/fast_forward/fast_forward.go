@@ -29,6 +29,7 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/bundled_upstream"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/routepolicy"
 	"github.com/ersonw/mosdns-v4/pkg/upstream"
 	"github.com/ersonw/mosdns-v4/pkg/utils"
 	"github.com/miekg/dns"
@@ -56,6 +57,12 @@ type fastForward struct {
 type Args struct {
 	Upstream []*UpstreamConfig `yaml:"upstream"`
 	CA       []string          `yaml:"ca"`
+
+	// Egress borrows the exit of another plugin (typically an egress_route
+	// tag) for every upstream of this plugin, instead of naming a socks5,
+	// mark or device here. Empty keeps every upstream on the host routing
+	// table.
+	Egress string `yaml:"egress"`
 }
 
 type UpstreamConfig struct {
@@ -98,6 +105,15 @@ func newFastForward(bp *coremain.BP, args *Args) (*fastForward, error) {
 		}
 	}
 
+	var egressDialer upstream.EgressDialer
+	if tag := strings.TrimSpace(args.Egress); tag != "" {
+		outlet, ok := routepolicy.OutletFor(tag)
+		if !ok {
+			return nil, fmt.Errorf("egress outlet %q is not registered yet (declare the egress_route plugin before this fast_forward)", tag)
+		}
+		egressDialer = outlet.OutletDialer()
+	}
+
 	for i, c := range args.Upstream {
 		if len(c.Addr) == 0 {
 			return nil, errors.New("missing server addr")
@@ -128,6 +144,13 @@ func newFastForward(bp *coremain.BP, args *Args) (*fastForward, error) {
 				ClientSessionCache: tls.NewLRUClientSessionCache(64),
 			},
 			Logger: bp.L(),
+		}
+
+		if egressDialer != nil {
+			if c.Socks5 != "" || c.SoMark != 0 || c.BindToDevice != "" {
+				return nil, fmt.Errorf("upstream %q: plugin egress %q cannot be combined with socks5, so_mark or bind_to_device", c.Addr, args.Egress)
+			}
+			opt.Egress = egressDialer
 		}
 
 		u, err := upstream.NewUpstream(c.Addr, opt)

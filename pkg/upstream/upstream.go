@@ -21,6 +21,7 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"crypto/tls"
 	"fmt"
 	"github.com/ersonw/mosdns-v4/pkg/dnsutils"
@@ -105,8 +106,23 @@ type Opt struct {
 	// Available for DoT, DoH upstreams.
 	TLSConfig *tls.Config
 
+	// Egress pins every connection this upstream makes to the dialer an outlet
+	// publishes, typically the one behind an egress_route tag. When it is set,
+	// Socks5, SoMark and BindToDevice are not used: the outlet already owns
+	// the exit decision, including the mark and the device.
+	//
+	// A nil Egress keeps the upstream on the host routing table.
+	Egress EgressDialer
+
 	// Logger specifies the logger that the upstream will use.
 	Logger *zap.Logger
+}
+
+// EgressDialer is the outbound contract an upstream can be pinned to. It is
+// the same shape egress.Dialer satisfies, so an outlet dialer can be passed
+// straight in without this package depending on the egress package.
+type EgressDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
 }
 ///////////////////
 
@@ -132,6 +148,25 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		}),
 	}
 
+	// A pinned egress replaces the plain socket instead of stacking on it: the
+	// outlet already marks, binds and proxies the connection.
+	dialNet := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if opt.Egress != nil {
+			return opt.Egress.DialContext(ctx, network, addr)
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	dialTCPAddr := func(ctx context.Context, addr string) (net.Conn, error) {
+		if opt.Egress != nil {
+			return opt.Egress.DialContext(ctx, "tcp", addr)
+		}
+		return dialTCP(ctx, addr, opt.Socks5, dialer)
+	}
+
+	if opt.Egress != nil && opt.EnableHTTP3 {
+		return nil, errors.New("enable_http3 cannot be combined with a pinned egress: HTTP/3 dialing is not routed through an outlet")
+	}
+
 	switch addrURL.Scheme {
 	case "", "udp":
 		dialAddr := getDialAddrWithPort(addrURL.Host, opt.DialAddr, 53)
@@ -139,7 +174,7 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		uto := transport.Opts{
 			Logger: opt.Logger,
 			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				return dialer.DialContext(ctx, "udp", dialAddr)
+				return dialNet(ctx, "udp", dialAddr)
 			},
 			WriteFunc: dnsutils.WriteMsgToUDP,
 			ReadFunc: func(c io.Reader) (*dns.Msg, int, error) {
@@ -156,7 +191,7 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		tto := transport.Opts{
 			Logger: opt.Logger,
 			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp", dialAddr)
+				return dialNet(ctx, "tcp", dialAddr)
 			},
 			WriteFunc: dnsutils.WriteMsgToTCP,
 			ReadFunc:  dnsutils.ReadMsgFromTCP,
@@ -174,7 +209,7 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		to := transport.Opts{
 			Logger: opt.Logger,
 			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				return dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+				return dialTCPAddr(ctx, dialAddr)
 			},
 			WriteFunc:      dnsutils.WriteMsgToTCP,
 			ReadFunc:       dnsutils.ReadMsgFromTCP,
@@ -198,7 +233,7 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		to := transport.Opts{
 			Logger: opt.Logger,
 			DialFunc: func(ctx context.Context) (net.Conn, error) {
-				conn, err := dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+				conn, err := dialTCPAddr(ctx, dialAddr)
 				if err != nil {
 					return nil, err
 				}
@@ -257,7 +292,7 @@ func NewUpstream(addr string, opt *Opt) (Upstream, error) {
 		} else {
 			t1 := &http.Transport{
 				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) { // overwrite server addr
-					return dialTCP(ctx, dialAddr, opt.Socks5, dialer)
+					return dialTCPAddr(ctx, dialAddr)
 				},
 				TLSClientConfig:     opt.TLSConfig,
 				TLSHandshakeTimeout: tlsHandshakeTimeout,
