@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ersonw/mosdns-v4/pkg/routepolicy"
 	"go.uber.org/zap"
 )
 
@@ -200,6 +201,18 @@ func (p *FakeIPNatPlugin) setupMarkRouting(ctx context.Context) error {
 		return fmt.Errorf("ip %s: %w", strings.Join(p.markRuleArgs("add"), " "), err)
 	}
 
+	// Record who owns this mark. Two plugins that write the same mark both
+	// install a rule and the kernel keeps both, so the loser is unreachable and
+	// nothing says which one it was. The claim makes that conflict visible.
+	if err := routepolicy.Default().Claim(routepolicy.Claim{
+		Owner:    p.Tag(),
+		Mark:     p.routeMark,
+		Table:    p.routeTable,
+		Priority: p.routeRulePriority,
+	}); err != nil {
+		p.L().Error("route mark: routing object already owned", zap.Error(err))
+	}
+
 	p.markMu.Lock()
 	p.markActive = true
 	p.markMu.Unlock()
@@ -256,6 +269,9 @@ func (p *FakeIPNatPlugin) markRealIP(ctx context.Context, ip string) error {
 // dedicated table, then marks the path as gone. The nft objects are dropped by
 // cleanupDataPath together with the rest of the table.
 func (p *FakeIPNatPlugin) cleanupMarkRouting(ctx context.Context) {
+	// The kernel objects are being removed, so the claim must go with them:
+	// otherwise a restart in the same process would see a stale owner.
+	routepolicy.Default().Release(p.Tag())
 	if p.routeMark == 0 {
 		return
 	}

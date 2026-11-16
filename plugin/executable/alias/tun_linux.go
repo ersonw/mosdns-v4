@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/pkg/routepolicy"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 )
@@ -301,6 +302,14 @@ func installOutletRoute(ctx context.Context, p *plugin, cfg *Args, local netip.A
 		p.log().Warn("alias: install outlet route failed", zap.String("table", table), zap.Error(err))
 		return nil
 	}
+	// A source rule is identified by its table and priority, not by a mark; the
+	// claim keeps that pair from being silently shared with another plugin.
+	if err := routepolicy.Default().Claim(routepolicy.Claim{
+		Owner: p.Tag(), Table: table, Priority: prio,
+	}); err != nil {
+		p.log().Error("alias: routing object already owned", zap.Error(err))
+	}
+
 	// Traffic the host itself sends to the virtual range must stay on the
 	// connected tun route. Without this higher-priority exception, the outlet
 	// rule below would match the device source address and send a local

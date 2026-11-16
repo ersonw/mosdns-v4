@@ -55,6 +55,51 @@ type Context struct {
 
 	r     *dns.Msg
 	marks map[uint]struct{}
+	// values carries request scoped data that plugins pass along the chain.
+	// The key is opaque: pkg/pipeline builds typed, owner attributed slots on
+	// top of it, so this map never becomes a bag of loosely named strings.
+	values map[any]any
+}
+
+// ValueEntry is one request scoped value. Key is opaque to this package; the
+// owner that stored it knows how to interpret it.
+type ValueEntry struct {
+	Key   any
+	Value any
+}
+
+// SetValue stores v under key. Re-setting the same key replaces the value.
+func (ctx *Context) SetValue(key, v any) {
+	if ctx.values == nil {
+		ctx.values = make(map[any]any)
+	}
+	ctx.values[key] = v
+}
+
+// Value returns the value stored under key.
+func (ctx *Context) Value(key any) (any, bool) {
+	if ctx.values == nil {
+		return nil, false
+	}
+	v, ok := ctx.values[key]
+	return v, ok
+}
+
+// DeleteValue removes key from the context.
+func (ctx *Context) DeleteValue(key any) {
+	delete(ctx.values, key)
+}
+
+// Values returns a snapshot of all request scoped values.
+func (ctx *Context) Values() []ValueEntry {
+	if len(ctx.values) == 0 {
+		return nil
+	}
+	out := make([]ValueEntry, 0, len(ctx.values))
+	for k, v := range ctx.values {
+		out = append(out, ValueEntry{Key: k, Value: v})
+	}
+	return out
 }
 
 var contextUid uint32
@@ -172,6 +217,15 @@ func (ctx *Context) CopyTo(d *Context) *Context {
 	}
 	for m := range ctx.marks {
 		d.AddMark(m)
+	}
+	// A branch sees the values decided before it forked. The map is copied so a
+	// branch cannot add its own entries to a sibling; the values themselves are
+	// shared, which is why they are documented as read-only once stored.
+	if len(ctx.values) > 0 {
+		d.values = make(map[any]any, len(ctx.values))
+		for k, v := range ctx.values {
+			d.values[k] = v
+		}
 	}
 	return d
 }

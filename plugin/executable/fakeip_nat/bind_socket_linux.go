@@ -2,7 +2,11 @@
 
 package fakeipnat
 
-import "syscall"
+import (
+	"syscall"
+
+	"github.com/ersonw/mosdns-v4/pkg/egress"
+)
 
 // bindSocketToDevice pins an already opened socket to one interface
 // (SO_BINDTODEVICE). The egress dialer is bound the same way, see
@@ -13,5 +17,5 @@ func bindSocketToDevice(fd uintptr, dev string) error {
 	if dev == "" {
 		return nil
 	}
-	return syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, soBindToDevice, dev)
+	return syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, egress.SoBindToDevice, dev)
 }

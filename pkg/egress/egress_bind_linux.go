@@ -15,6 +15,10 @@ const soBindToDevice = 25
 
 const sourceBindingSupported = true
 
+// SoBindToDevice is SO_BINDTODEVICE, exposed for the socket layer that lives in
+// the plugin (raw ICMP and per-probe UDP sockets).
+const SoBindToDevice = soBindToDevice
+
 // SourceBindingSupported reports whether the kernel accepts a source address
 // owned by another interface. Exporting it keeps callers from re-deciding.
 const SourceBindingSupported = sourceBindingSupported

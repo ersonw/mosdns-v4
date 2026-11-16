@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ersonw/mosdns-v4/pkg/routepolicy"
 	"go.uber.org/zap"
 )
 
@@ -24,6 +25,14 @@ func (p *ASNTunPlugin) installRoutes(ctx context.Context) error {
 	}
 	if _, err := p.runner.Run(ctx, "ip", p.ingressRuleArgs("add")...); err != nil {
 		return fmt.Errorf("install ingress rule: %w", err)
+	}
+
+	// Same guard as the other routing plugins: a mark or table taken by someone
+	// else must be reported while the owner can still be named.
+	if err := routepolicy.Default().Claim(routepolicy.Claim{
+		Owner: p.Tag(), Mark: p.mark, Table: p.routeTable, Priority: p.rulePrio,
+	}); err != nil {
+		p.L().Error("asn_tun: routing object already owned", zap.Error(err))
 	}
 
 	if p.proxyActive {
