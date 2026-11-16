@@ -38,6 +38,25 @@ type Trojan = trojanEgress
 // Gost is the gost link outlet that probes several protocols per host.
 type Gost = gostEgress
 
+// CBP is the CBP/1 outlet. It is not a stream relay: it owns a tunnel session
+// and a userspace IP stack, so TCP, UDP and ICMP all leave through one outlet.
+type CBP = cbpEgress
+
+// egressCloser is implemented by outlets that hold long-lived resources.
+type egressCloser interface {
+	Close() error
+}
+
+// Close releases whatever an outlet holds. A stream outlet holds nothing
+// between dials, so it has no Close; an outlet that owns a tunnel gets torn
+// down here when the plugin that built it is replaced or stopped.
+func Close(d Dialer) error {
+	if closer, ok := d.(egressCloser); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 // New builds the outlet described by a proxy link. An empty link means direct
 // egress, which is what a plugin without a proxy must use.
 func New(raw string, insecure bool) (Dialer, error) {

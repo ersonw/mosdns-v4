@@ -52,7 +52,25 @@ type Args struct {
 	NextHop    string `yaml:"next_hop"`
 	NextHopDev string `yaml:"next_hop_dev"`
 	// Proxy is the TCP outlet of this exit. Supported schemes are the same as
-	// the data-plane plugins: socks5, socks5h, http, https, trojan and gost.
+	// the data-plane plugins: socks5, socks5h, http, https, trojan, gost and
+	// cbp.
+	//
+	// cbp:// is the one scheme that is not a stream relay: CBP/1 carries raw
+	// IPv4/IPv6 packets, so the outlet runs a userspace stack and dials TCP,
+	// UDP and ICMP through a tunnel instead of handing one TCP connection to
+	// the proxy. Its extra parameters ride in the URL query:
+	//
+	//	cbp://<edge-control>:<port>?identity_file=/etc/mosdns/cbp-client-identity.json
+	//
+	// Supported keys: token (or the URL userinfo), identity_file (required),
+	// identity_server, identity_token, client_id, device_id, regions=a,b,
+	// ca_file, sni, insecure=true and dial_timeout.
+	//
+	// identity_file accepts two shapes. A standalone edge's `cbpserver keygen`
+	// bundle is nested and carries the client key, node auth token, CA path and
+	// endpoints, so the URL may omit token and ca_file. A flat identity.json is
+	// the central flow: when it is absent, identity_server issues the key pair
+	// on first use and the result is cached in identity_file.
 	//
 	// A proxy exit owns no rule and no table: the socket that reaches the proxy
 	// leaves through the host route, so mark and route_table may be left out.
@@ -296,6 +314,10 @@ func (p *plugin) attachClose() {
 func (p *plugin) Close() error {
 	p.closeOnce.Do(func() {
 		routepolicy.UnregisterOutlet(p.Tag())
+		if p.dialer != nil {
+			_ = egress.Close(p.dialer)
+			p.dialer = nil
+		}
 		if p.set != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
 			p.nft.RemoveDestSet(ctx, p.Tag(), p.setTbl)
