@@ -20,6 +20,7 @@ import (
 // IdleWatch records when a flow last carried traffic.
 type IdleWatch struct {
 	last atomic.Int64
+	idle atomic.Int64 // nanoseconds; 0 means "not watched"
 }
 
 // NewIdleWatch returns a watch that starts counting from now.
@@ -37,35 +38,54 @@ func (w *IdleWatch) IdleFor() time.Duration {
 	return time.Duration(time.Now().UnixNano() - w.last.Load())
 }
 
-// Start runs the watchdog and calls closeFn once the flow has been silent for
-// idle. The returned stop function ends the watchdog and is safe to call more
-// than once.
+// A flow is watched by one shared sweeper rather than one goroutine per flow.
+// A per-flow watchdog doubles the goroutine count of the data plane, and the
+// count is exactly what an overloaded router must keep small: one TCP flow was
+// two copiers, a relay and a watchdog. One scan over the live flows every
+// second costs nothing and keeps the per-flow cost at zero goroutines.
+var (
+	sweepOnce sync.Once
+	sweepMu   sync.Mutex
+	swept     = make(map[*IdleWatch]func())
+)
+
+func sweepLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		sweepMu.Lock()
+		for w, closeFn := range swept {
+			idle := time.Duration(w.idle.Load())
+			if idle <= 0 || w.IdleFor() < idle {
+				continue
+			}
+			delete(swept, w)
+			closeFn()
+		}
+		sweepMu.Unlock()
+	}
+}
+
+// Start watches the flow and calls closeFn once it has been silent for idle.
+// The returned stop function ends the watch and is safe to call more than once.
 func (w *IdleWatch) Start(idle time.Duration, closeFn func()) (stop func()) {
 	if idle <= 0 {
 		return func() {}
 	}
-	interval := idle / 4
-	if interval < 100*time.Millisecond {
-		interval = 100 * time.Millisecond
-	}
-	ticker := time.NewTicker(interval)
-	done := make(chan struct{})
+	w.idle.Store(int64(idle))
+	sweepMu.Lock()
+	swept[w] = closeFn
+	sweepMu.Unlock()
+	sweepOnce.Do(func() { go sweepLoop() })
+
 	var once sync.Once
-	go func() {
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				if w.IdleFor() >= idle {
-					closeFn()
-					return
-				}
-			}
-		}
-	}()
-	return func() { once.Do(func() { close(done) }) }
+	return func() {
+		once.Do(func() {
+			sweepMu.Lock()
+			delete(swept, w)
+			sweepMu.Unlock()
+		})
+	}
 }
 
 // touchReader refreshes the watch whenever a read returns data.
