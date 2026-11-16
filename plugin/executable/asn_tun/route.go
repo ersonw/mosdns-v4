@@ -35,6 +35,15 @@ func (p *ASNTunPlugin) installRoutes(ctx context.Context) error {
 		p.L().Error("asn_tun: routing object already owned", zap.Error(err))
 	}
 
+	if p.outlet != nil {
+		// The exit - its mark, table, rule and route - belongs to the
+		// egress_route plugin that installed it. Writing the same objects here
+		// would leave two rules and no way to tell which one wins.
+		p.L().Info("asn_tun: outlet policy owned by another plugin, egress rule not installed",
+			zap.String("egress", p.outlet.OutletTag()), zap.String("egress_table", p.egressTable))
+		return nil
+	}
+
 	if p.proxyActive {
 		// The proxy is reached through the host's main route. An egress table
 		// would only send the proxy handshake somewhere else.
@@ -84,10 +93,11 @@ func (p *ASNTunPlugin) cleanupRoutes(ctx context.Context) {
 
 func (p *ASNTunPlugin) removeRoutes(ctx context.Context) error {
 	var first error
-	for _, args := range [][]string{
-		p.ingressRuleArgs("del"),
-		p.egressRuleArgs("del"),
-	} {
+	rules := [][]string{p.ingressRuleArgs("del")}
+	if p.outlet == nil {
+		rules = append(rules, p.egressRuleArgs("del"))
+	}
+	for _, args := range rules {
 		if _, err := p.runner.Run(ctx, "ip", args...); err != nil && first == nil {
 			first = err
 		}
@@ -95,8 +105,10 @@ func (p *ASNTunPlugin) removeRoutes(ctx context.Context) error {
 	if _, err := p.runner.Run(ctx, "ip", "route", "del", "default", "table", p.routeTable); err != nil && first == nil {
 		first = err
 	}
-	if _, err := p.runner.Run(ctx, "ip", "route", "del", "default", "table", p.egressTable); err != nil && first == nil {
-		first = err
+	if p.outlet == nil {
+		if _, err := p.runner.Run(ctx, "ip", "route", "del", "default", "table", p.egressTable); err != nil && first == nil {
+			first = err
+		}
 	}
 	return first
 }
@@ -111,13 +123,15 @@ func (p *ASNTunPlugin) routeTableExists(ctx context.Context, table string) bool 
 // "ip rule del" would leave the rest in the packet path.
 func (p *ASNTunPlugin) removeAllRules(ctx context.Context) error {
 	var first error
-	for _, spec := range []struct {
+	type ruleSpec struct {
 		mark  uint32
 		table string
-	}{
-		{p.mark, p.routeTable},
-		{p.egressMark, p.egressTable},
-	} {
+	}
+	specs := []ruleSpec{{p.mark, p.routeTable}}
+	if p.outlet == nil {
+		specs = append(specs, ruleSpec{p.egressMark, p.egressTable})
+	}
+	for _, spec := range specs {
 		out, err := p.runner.Run(ctx, "ip", "rule", "show")
 		if err != nil {
 			if first == nil {

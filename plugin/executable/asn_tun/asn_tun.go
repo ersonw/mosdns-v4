@@ -20,6 +20,7 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/helperscript"
 	"github.com/ersonw/mosdns-v4/pkg/matcher/netlist"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/routepolicy"
 	"go.uber.org/zap"
 )
 
@@ -108,6 +109,12 @@ type Args struct {
 	// socks5, socks5h, http, https, trojan and gost.
 	Proxy         string `yaml:"proxy"`
 	ProxyInsecure bool   `yaml:"proxy_insecure"`
+
+	// Egress names an egress_route plugin that owns this plugin's exit. When it
+	// is set, egress_mark / egress_table / next_hop / next_hop_dev / proxy are
+	// read from that plugin instead of from here, so one exit is declared once.
+	// The egress_route plugin must appear before this one in the config.
+	Egress string `yaml:"egress"`
 }
 
 type ASNTunPlugin struct {
@@ -147,6 +154,8 @@ type ASNTunPlugin struct {
 
 	egress      egressDialer
 	proxyActive bool
+	// outlet is the borrowed exit, nil when this plugin owns its own.
+	outlet routepolicy.Outlet
 
 	runCtx        context.Context
 	runCancel     context.CancelFunc
@@ -162,6 +171,13 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	p, err := newPlugin(bp, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if tag := strings.TrimSpace(cfg.Egress); tag != "" {
+		outlet, ok := routepolicy.OutletFor(tag)
+		if !ok {
+			return nil, fmt.Errorf("egress %q is not loaded: declare the egress_route plugin before asn_tun", tag)
+		}
+		p.outlet = outlet
 	}
 	if err := p.start(); err != nil {
 		// asn_tun is an optional data-plane add-on: its nft/TUN/route setup
@@ -359,8 +375,8 @@ func newPlugin(bp *coremain.BP, cfg *Args) (*ASNTunPlugin, error) {
 	if nextHopDev != "" && strings.ContainsAny(nextHopDev, " \t\r\n") {
 		return nil, fmt.Errorf("invalid next_hop_dev %q", nextHopDev)
 	}
-	if nextHop == "" && nextHopDev == "" && strings.TrimSpace(cfg.Proxy) == "" {
-		return nil, fmt.Errorf("no proxy and no next_hop/next_hop_dev: direct outlet has no route to install")
+	if nextHop == "" && nextHopDev == "" && strings.TrimSpace(cfg.Proxy) == "" && strings.TrimSpace(cfg.Egress) == "" {
+		return nil, fmt.Errorf("no proxy, no next_hop/next_hop_dev and no egress: the outlet has nothing to send traffic through")
 	}
 
 	mtu := cfg.TunMTU
@@ -551,7 +567,7 @@ func (p *ASNTunPlugin) start() error {
 	// objects in the packet path forever.
 	p.cleanupStaleState(ctx)
 
-	if err := p.setupEgress(ctx); err != nil {
+	if err := p.setupOutlet(ctx); err != nil {
 		return err
 	}
 	p.bypass = p.bypassAddresses()
@@ -649,6 +665,9 @@ func (p *ASNTunPlugin) bypassAddresses() []netip.Addr {
 
 	if p.proxyActive {
 		host := proxyHost(p.args.Proxy)
+		if p.outlet != nil {
+			host = p.outlet.OutletProxyHost()
+		}
 		if host != "" {
 			ips, err := net.LookupIP(host)
 			if err != nil {

@@ -30,6 +30,7 @@ import (
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/client_limiter"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/dual_selector"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/ecs"
+	_ "github.com/ersonw/mosdns-v4/plugin/executable/egress_route"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/edns0_filter"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/exec_script"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/fakeip_nat"
