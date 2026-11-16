@@ -20,7 +20,6 @@
 package coremain
 
 import (
-	"context"
 	"fmt"
 	"github.com/ersonw/mosdns-v4/mlog"
 	"github.com/kardianos/service"
@@ -184,8 +183,6 @@ func startServer(sf *serverFlags, handleSignals bool) error {
 		stopWatching := watchShutdownSignals()
 		defer stopWatching()
 	}
-
-	startUpdateLoop(context.Background(), cfg, cfgPath)
 
 	if err := RunMosdns(cfg); err != nil {
 		return fmt.Errorf("mosdns exited, %w", err)

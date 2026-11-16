@@ -20,6 +20,7 @@
 package coremain
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/ersonw/mosdns-v4/mlog"
@@ -166,6 +167,7 @@ func RunMosdns(cfg *Config) error {
 	if err := startSelfGuard(lg, cfg.Runtime, m.sc); err != nil {
 		return err
 	}
+	startUpdateLoop(context.Background(), cfg, lg)
 
 	m.httpAPIMux.Handle("/metrics", promhttp.HandlerFor(m.metricsReg, promhttp.HandlerOpts{}))
 	m.httpAPIMux.HandleFunc("/debug/pprof/", pprof.Index)

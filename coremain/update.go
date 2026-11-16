@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ersonw/mosdns-v4/mlog"
 	"github.com/ersonw/mosdns-v4/pkg/configmigrate"
 	"github.com/ersonw/mosdns-v4/pkg/selfupdate"
 	"go.uber.org/zap"
@@ -110,19 +109,22 @@ type updater struct {
 // startUpdateLoop spawns the polling loop. It waits one interval before the
 // first check: a binary that was just started by an operator should not be
 // replaced under their feet moments later.
-func startUpdateLoop(ctx context.Context, cfg *Config, cfgPath string) {
+// startUpdateLoop is called from RunMosdns, after the logger has been built
+// from the config: starting it earlier sent its first lines to the default
+// stderr logger, which a service does not have.
+func startUpdateLoop(ctx context.Context, cfg *Config, lg *zap.Logger) {
 	if !cfg.Update.Enabled {
 		return
 	}
 	if cfg.Update.Repo == "" {
-		mlog.L().Warn("update: enabled without a repo, the loop stays off")
+		lg.Warn("update: enabled without a repo, the loop stays off")
 		return
 	}
-	cfgPath = cfg.Update.ConfigPath
+	cfgPath := cfg.Update.ConfigPath
 	if cfgPath == "" {
 		cfgPath = cfg.configPath
 	}
-	u := &updater{cfg: cfg.Update, cfgPath: cfgPath, l: mlog.L().Named("update")}
+	u := &updater{cfg: cfg.Update, cfgPath: cfgPath, l: lg.Named("update")}
 	go u.loop(ctx)
 }
 
