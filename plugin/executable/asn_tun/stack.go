@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/pkg/tunrelay"
 	"github.com/metacubex/gvisor/pkg/buffer"
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/adapters/gonet"
@@ -212,6 +212,14 @@ func (p *ASNTunPlugin) relayUDP(r *udp.ForwarderRequest) {
 		return
 	}
 	defer remote.Close()
+
+	watch := tunrelay.NewIdleWatch()
+	stopIdle := watch.Start(udpFlowIdle, func() {
+		_ = local.Close()
+		_ = remote.Close()
+	})
+	defer stopIdle()
+
 	p.L().Debug("asn_tun: UDP flow opened",
 		zap.String("target", target),
 		zap.String("client", id.RemoteAddress.String()),
@@ -230,6 +238,7 @@ func (p *ASNTunPlugin) relayUDP(r *udp.ForwarderRequest) {
 			if _, writeErr := local.Write(buf[:n]); writeErr != nil {
 				return
 			}
+			watch.Touch()
 		}
 	}()
 
@@ -242,29 +251,21 @@ func (p *ASNTunPlugin) relayUDP(r *udp.ForwarderRequest) {
 		if _, writeErr := remote.Write(buf[:n]); writeErr != nil {
 			break
 		}
+		watch.Touch()
 	}
 	_ = remote.Close()
 	<-done
 }
 
+// A flow that carries nothing for this long is treated as abandoned; without
+// it a vanished peer keeps two goroutines and two buffers alive forever.
+const (
+	flowIdle    = 10 * time.Minute
+	udpFlowIdle = 2 * time.Minute
+)
+
 func pipeConns(a, b net.Conn) (fromA, fromB int64) {
-	var wg sync.WaitGroup
-	copySide := func(dst, src net.Conn, counter *int64) {
-		defer wg.Done()
-		buf := make([]byte, tunRelayBuffer)
-		n, _ := io.CopyBuffer(dst, src, buf)
-		*counter = n
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-			return
-		}
-		_ = dst.Close()
-	}
-	wg.Add(2)
-	go copySide(a, b, &fromB)
-	go copySide(b, a, &fromA)
-	wg.Wait()
-	return fromA, fromB
+	return tunrelay.Pipe(a, b, flowIdle)
 }
 
 func tunErr(err tcpip.Error) error {

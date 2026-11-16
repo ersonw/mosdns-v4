@@ -17,13 +17,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/pkg/tunrelay"
 	"github.com/metacubex/gvisor/pkg/buffer"
 	"github.com/metacubex/gvisor/pkg/tcpip"
 	"github.com/metacubex/gvisor/pkg/tcpip/adapters/gonet"
@@ -354,6 +354,16 @@ func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
 	}
 	defer remote.Close()
 
+	// A UDP flow has no FIN: the client's socket simply stops existing. The
+	// watchdog closes both endpoints once neither side has spoken for
+	// udpFlowIdle, which is what lets the two loops below return.
+	watch := tunrelay.NewIdleWatch()
+	stopIdle := watch.Start(udpFlowIdle, func() {
+		_ = local.Close()
+		_ = remote.Close()
+	})
+	defer stopIdle()
+
 	// Register the flow so an ICMP error quoting the upstream socket can be
 	// routed back to the client. The key is the upstream local port, which is
 	// what the quoted UDP header carries.
@@ -418,6 +428,7 @@ func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
 			}
 			downDatagrams++
 			downBytes += int64(n)
+			watch.Touch()
 		}
 	}()
 
@@ -434,6 +445,7 @@ func (p *FakeIPNatPlugin) relayUDP(r *udp.ForwarderRequest, t *tunStack) {
 		}
 		upDatagrams++
 		upBytes += int64(n)
+		watch.Touch()
 	}
 	_ = remote.Close()
 	<-done
@@ -706,26 +718,19 @@ func tunError(err tcpip.Error) error {
 	return fmt.Errorf("%v", err)
 }
 
+// A flow that carries nothing for this long is treated as abandoned. A peer
+// that disappears without a FIN looks exactly like an idle one, and without
+// this timeout each such flow kept two goroutines and two buffers alive for
+// the life of the process - the growth that eventually starved the host.
+const (
+	flowIdle    = 10 * time.Minute
+	udpFlowIdle = 2 * time.Minute
+)
+
 // pipeConns copies both directions until each side is done, propagating
-// half-close where the transport supports it.
+// half-close where the transport supports it, and closes silent pairs.
 func pipeConns(a, b net.Conn) (fromA, fromB int64) {
-	var wg sync.WaitGroup
-	copySide := func(dst, src net.Conn, counter *int64) {
-		defer wg.Done()
-		buf := make([]byte, tunRelayBuffer)
-		n, _ := io.CopyBuffer(dst, src, buf)
-		*counter = n
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-			return
-		}
-		_ = dst.Close()
-	}
-	wg.Add(2)
-	go copySide(a, b, &fromB)
-	go copySide(b, a, &fromA)
-	wg.Wait()
-	return fromA, fromB
+	return tunrelay.Pipe(a, b, flowIdle)
 }
 
 // writeOut writes one packet to the device. The stack write loop and the ICMP
