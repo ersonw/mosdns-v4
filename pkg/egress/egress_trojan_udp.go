@@ -1,4 +1,4 @@
-package fakeipnat
+package egress
 
 import (
 	"crypto/sha256"

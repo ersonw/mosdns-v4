@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"go.uber.org/zap"
 )
 
@@ -109,12 +110,12 @@ func (p *FakeIPNatPlugin) setupTunEgress() {
 // leaves from the range instead of the host's primary address, which is the
 // same source the data path already rewrites the packets to.
 func (p *FakeIPNatPlugin) prepareDirectEgress() {
-	d, ok := p.egress.(*directEgress)
+	d, ok := p.egress.(*egress.Direct)
 	if !ok {
 		return
 	}
-	d.dev = p.tunEgressDev
-	if !sourceBindingSupported {
+	d.SetDev(p.tunEgressDev)
+	if !egress.SourceBindingSupported {
 		// Without a host SNAT layer the kernel would reject a source address
 		// owned by the tun device on the physical interface, so the socket
 		// keeps the host address and only the device is pinned.
@@ -128,7 +129,7 @@ func (p *FakeIPNatPlugin) prepareDirectEgress() {
 			zap.String("addr", src.String()))
 		return
 	}
-	d.local = src
+	d.SetLocal(src)
 	p.L().Info("tun egress: direct outlet bound",
 		zap.String("source", src.String()), zap.String("dev", p.tunEgressDev))
 }

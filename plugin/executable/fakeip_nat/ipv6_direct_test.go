@@ -3,6 +3,7 @@ package fakeipnat
 import (
 	"context"
 	"errors"
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"net/netip"
 	"testing"
 
@@ -209,8 +210,8 @@ func TestIsIPv6Target(t *testing.T) {
 		{addr: "example.com:443", want: false},
 	}
 	for _, c := range cases {
-		if got := isIPv6Target(c.addr); got != c.want {
-			t.Fatalf("isIPv6Target(%q) = %v, want %v", c.addr, got, c.want)
+		if got := egress.IPv6Target(c.addr); got != c.want {
+			t.Fatalf("egress.IPv6Target(%q) = %v, want %v", c.addr, got, c.want)
 		}
 	}
 }

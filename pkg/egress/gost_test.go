@@ -1,4 +1,4 @@
-package fakeipnat
+package egress
 
 // Tests for the gost outlet: one address that may answer several protocols.
 // The outlet has to keep only the flavours that reply, order them by handshake

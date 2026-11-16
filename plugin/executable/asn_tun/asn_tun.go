@@ -15,11 +15,11 @@ import (
 
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/data_provider"
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/helperscript"
 	"github.com/ersonw/mosdns-v4/pkg/matcher/netlist"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
-	"github.com/ersonw/mosdns-v4/plugin/executable/fakeip_nat"
 	"go.uber.org/zap"
 )
 
@@ -618,13 +618,13 @@ func (p *ASNTunPlugin) setupEgress(ctx context.Context) error {
 		return nil
 	}
 
-	proxy, err := fakeipnat.NewProxyEgress(raw, p.args.ProxyInsecure)
+	proxy, err := egress.New(raw, p.args.ProxyInsecure)
 	if err != nil {
 		return err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if err := fakeipnat.ProbeEgress(probeCtx, proxy); err != nil {
+	if err := egress.Probe(probeCtx, proxy); err != nil {
 		// A configured proxy is a policy decision, not a best-effort hint.
 		// Silently switching to direct would leak traffic that the caller
 		// explicitly asked to send through the proxy.

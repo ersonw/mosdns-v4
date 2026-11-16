@@ -1,4 +1,4 @@
-package fakeipnat
+package egress
 
 // This file is the egress half of the tun data path. Every TCP connection the
 // userspace side accepts is dialed through an egressDialer, so a proxy link

@@ -5,6 +5,8 @@ package fakeipnat
 import (
 	"net"
 	"syscall"
+
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 )
 
 // bindSocketToDevice pins an already opened socket to one interface
@@ -19,5 +21,5 @@ func bindSocketToDevice(fd uintptr, dev string) error {
 	if err != nil {
 		return err
 	}
-	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, ipBoundIf, ifi.Index)
+	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, egress.IPBoundIf, ifi.Index)
 }

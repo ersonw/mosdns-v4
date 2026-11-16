@@ -1,6 +1,6 @@
 //go:build linux
 
-package fakeipnat
+package egress
 
 // This file binds an egress socket to one interface. Linux exposes
 // SO_BINDTODEVICE (25) for this; the constant is not exported by the syscall
@@ -14,6 +14,10 @@ import (
 const soBindToDevice = 25
 
 const sourceBindingSupported = true
+
+// SourceBindingSupported reports whether the kernel accepts a source address
+// owned by another interface. Exporting it keeps callers from re-deciding.
+const SourceBindingSupported = sourceBindingSupported
 
 func bindToDevice(d *net.Dialer, dev string) {
 	d.Control = func(network, address string, c syscall.RawConn) error {

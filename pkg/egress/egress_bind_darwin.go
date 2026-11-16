@@ -1,6 +1,6 @@
 //go:build darwin
 
-package fakeipnat
+package egress
 
 // This file binds an egress socket to one interface. Darwin has no
 // SO_BINDTODEVICE; IP_BOUND_IF (25) takes an interface index instead.
@@ -13,6 +13,14 @@ import (
 const ipBoundIf = 25
 
 const sourceBindingSupported = false
+
+// SourceBindingSupported reports whether the kernel accepts a source address
+// owned by another interface.
+const SourceBindingSupported = sourceBindingSupported
+
+// IPBoundIf is the IP_BOUND_IF sockopt number, exposed for the socket layer
+// that lives in the plugin.
+const IPBoundIf = ipBoundIf
 
 func bindToDevice(d *net.Dialer, dev string) {
 	ifi, err := net.InterfaceByName(dev)

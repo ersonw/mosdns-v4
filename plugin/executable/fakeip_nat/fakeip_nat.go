@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ersonw/mosdns-v4/coremain"
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
 	"github.com/ersonw/mosdns-v4/pkg/timeutil"
@@ -637,7 +638,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 	p.runner = execRunner{}
 	p.probe = p.probeReachable
-	p.egress = &directEgress{}
+	p.egress = &egress.Direct{}
 	p.conn = newConntrack(defaultConntrackSize, defaultConntrackTTL)
 	p.runtime = newRuntimeMap()
 	p.watch = newTrafficWatch()
@@ -709,7 +710,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		}
 		p.L().Debug("fakeip nat: proxy link parsed",
 			zap.String("proxy", redactProxy(cfg.Proxy)),
-			zap.String("outlet", describeEgress(dialer)),
+			zap.String("outlet", egress.Describe(dialer)),
 			zap.Bool("insecure", cfg.ProxyInsecure))
 		if !cfg.UseTun {
 			p.L().Warn("proxy is configured but use_tun is false; it only applies to the tun data path",
@@ -718,7 +719,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			// A gost link probes one flavour per protocol it may answer, so it
 			// gets a budget that covers all of them instead of a single dial.
 			probeBudget := 5 * time.Second
-			if _, ok := dialer.(*gostEgress); ok {
+			if _, ok := dialer.(*egress.Gost); ok {
 				probeBudget = 10 * time.Second
 			}
 			probeStarted := time.Now()
@@ -736,11 +737,11 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 				// the log names the flavours that actually answered: TCP is
 				// ordered by handshake time, UDP only lists the ones whose
 				// association was granted.
-				if g, ok := dialer.(*gostEgress); ok {
+				if g, ok := dialer.(*egress.Gost); ok {
 					p.L().Info("gost outlet protocols selected",
-						zap.String("server", g.server),
-						zap.Strings("tcp_protocols", g.tcpProtocols()),
-						zap.Strings("udp_protocols", g.udpProtocols()))
+						zap.String("server", g.Server()),
+						zap.Strings("tcp_protocols", g.TCPProtocols()),
+						zap.Strings("udp_protocols", g.UDPProtocols()))
 				}
 				p.L().Info("proxy egress ready", zap.String("proxy", redactProxy(cfg.Proxy)))
 			}
