@@ -53,8 +53,57 @@ type Args struct {
 	NextHopDev string `yaml:"next_hop_dev"`
 	// Proxy is the TCP outlet of this exit. Supported schemes are the same as
 	// the data-plane plugins: socks5, socks5h, http, https, trojan and gost.
+	//
+	// A proxy exit owns no rule and no table: the socket that reaches the proxy
+	// leaves through the host route, so mark and route_table may be left out.
+	// That is what lets this plugin be the one place a data-plane plugin points
+	// at for "send my flows through this proxy", with no kernel state involved.
 	Proxy         string `yaml:"proxy"`
 	ProxyInsecure bool   `yaml:"proxy_insecure"`
+	// ProxyFrom borrows the proxy of another outlet instead of repeating the
+	// link here. This is what lets one exit be both a routed exit (its own mark
+	// and table) and a consumer of the box's single proxy definition: marks and
+	// tables can never be shared, but the credentials and the endpoint can.
+	// The named outlet must be declared before this one.
+	ProxyFrom string `yaml:"proxy_from"`
+}
+
+// validate rejects an exit that cannot mean one thing. Half an exit is worse
+// than a missing one: the borrower starts and its traffic goes somewhere the
+// operator did not choose.
+func (a *Args) validate() error {
+	table := strings.TrimSpace(a.RouteTable)
+	proxy := strings.TrimSpace(a.Proxy)
+	nextHop := strings.TrimSpace(a.NextHop)
+	dev := strings.TrimSpace(a.NextHopDev)
+
+	if strings.TrimSpace(a.ProxyFrom) != "" {
+		if proxy != "" {
+			return fmt.Errorf("egress_route: proxy_from and proxy are mutually exclusive, name one place the link lives")
+		}
+		proxy = "borrowed"
+	}
+	if proxy != "" {
+		// A proxy exit installs nothing, so a mark without a table (or the reverse)
+		// would reserve kernel state that never appears.
+		if a.Mark != 0 && table == "" {
+			return fmt.Errorf("egress_route: mark needs route_table, or drop both for a proxy-only exit")
+		}
+		if a.Mark == 0 && table != "" {
+			return fmt.Errorf("egress_route: route_table needs mark, or drop both for a proxy-only exit")
+		}
+		return nil
+	}
+	if a.Mark == 0 {
+		return fmt.Errorf("egress_route: mark is required for a routed exit, it is how marked traffic finds this exit")
+	}
+	if table == "" {
+		return fmt.Errorf("egress_route: route_table is required for a routed exit")
+	}
+	if nextHop == "" && dev == "" {
+		return fmt.Errorf("egress_route: a routed exit needs next_hop or next_hop_dev")
+	}
+	return nil
 }
 
 type plugin struct {
@@ -76,11 +125,8 @@ type plugin struct {
 // feature, and the plugins that borrow it cannot work without it.
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	cfg := args.(*Args)
-	if cfg.Mark == 0 {
-		return nil, fmt.Errorf("egress_route: mark is required, it is how marked traffic finds this exit")
-	}
-	if strings.TrimSpace(cfg.RouteTable) == "" {
-		return nil, fmt.Errorf("egress_route: route_table is required")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 
 	p := &plugin{
@@ -95,6 +141,21 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			NextHop:  strings.TrimSpace(cfg.NextHop),
 			Dev:      strings.TrimSpace(cfg.NextHopDev),
 		},
+	}
+
+	if from := strings.TrimSpace(cfg.ProxyFrom); from != "" {
+		outlet, ok := routepolicy.OutletFor(from)
+		if !ok {
+			return nil, fmt.Errorf("egress_route: proxy_from %q is not declared before this plugin", from)
+		}
+		if outlet.OutletProxyHost() == "" {
+			return nil, fmt.Errorf("egress_route: proxy_from %q is a direct exit, it has no proxy to borrow", from)
+		}
+		p.dialer = outlet.OutletDialer()
+		p.proxy = outlet.OutletProxyHost()
+		p.L().Info("egress_route: proxy borrowed from another outlet",
+			zap.String("proxy_from", from), zap.String("proxy", p.proxy),
+			zap.String("exit", p.decision.String()))
 	}
 
 	if raw := strings.TrimSpace(cfg.Proxy); raw != "" {
@@ -120,6 +181,19 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		}
 		p.dialer = egress.NewDirect(p.decision.Dev, netip.Addr{})
 		p.L().Info("egress_route: direct exit ready", zap.String("exit", p.decision.String()))
+	}
+
+	// A proxy-only exit writes nothing into the kernel, so there is no mark
+	// for two plugins to fight over and nothing to claim.
+	if p.proxy != "" && p.decision.Mark == 0 {
+		if err := routepolicy.RegisterOutlet(p); err != nil {
+			_ = p.Close()
+			return nil, fmt.Errorf("egress_route: %w", err)
+		}
+		p.attachClose()
+		p.L().Info("egress_route: proxy outlet registered, no kernel state",
+			zap.String("exit", p.decision.String()))
+		return p, nil
 	}
 
 	if err := routepolicy.Default().Claim(routepolicy.Claim{
@@ -149,7 +223,14 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		return nil, fmt.Errorf("egress_route: %w", err)
 	}
 
-	if m := bp.M(); m != nil {
+	p.attachClose()
+	return p, nil
+}
+
+// attachClose binds teardown to the manager's close signal, so a plugin that
+// disappears also releases its tag and its kernel state.
+func (p *plugin) attachClose() {
+	if m := p.BP.M(); m != nil {
 		if sc := m.GetSafeClose(); sc != nil {
 			sc.Attach(func(done func(), closeSignal <-chan struct{}) {
 				defer done()
@@ -158,7 +239,6 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			})
 		}
 	}
-	return p, nil
 }
 
 func (p *plugin) Close() error {

@@ -6,6 +6,7 @@ import (
 
 	"github.com/ersonw/mosdns-v4/plugin/executable/asn_tun"
 	"github.com/ersonw/mosdns-v4/plugin/executable/egress_route"
+	"github.com/ersonw/mosdns-v4/plugin/executable/fakeip_nat"
 	"gopkg.in/yaml.v3"
 )
 
@@ -60,6 +61,37 @@ func TestSplitConfigDecodesStrictly(t *testing.T) {
 	}
 	if doc.ASN.Egress != "egress_asn" {
 		t.Fatalf("asn block lost its egress reference: %+v", *doc.ASN)
+	}
+}
+
+// The data-plane plugins borrow the exit by tag now, so their own config must
+// accept the new key and keep rejecting anything unknown.
+const borrowedConfig = `
+egress_tiktok:
+  proxy: "gost://admin:admin@11.10.10.31:1080"
+  proxy_insecure: true
+
+fakeip:
+  ipv4_range: 198.17.0.0/16
+  use_tun: true
+  egress: egress_tiktok
+`
+
+func TestBorrowedEgressDecodesStrictly(t *testing.T) {
+	var doc struct {
+		FakeIP *fakeipnat.Args    `yaml:"fakeip"`
+		Exit   *egress_route.Args `yaml:"egress_tiktok"`
+	}
+	dec := yaml.NewDecoder(strings.NewReader(borrowedConfig))
+	dec.KnownFields(true)
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatalf("the borrowed config does not decode strictly: %v", err)
+	}
+	if doc.FakeIP == nil || doc.Exit == nil {
+		t.Fatal("both blocks must decode")
+	}
+	if doc.FakeIP.Egress != "egress_tiktok" {
+		t.Fatalf("fakeip lost its egress reference: %+v", *doc.FakeIP)
 	}
 }
 

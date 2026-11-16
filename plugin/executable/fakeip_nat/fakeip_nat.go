@@ -16,6 +16,7 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/query_context"
+	"github.com/ersonw/mosdns-v4/pkg/routepolicy"
 	"github.com/ersonw/mosdns-v4/pkg/timeutil"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -134,6 +135,12 @@ type Args struct {
 	Proxy string `yaml:"proxy"`
 	// ProxyInsecure 跳过 https / trojan 代理的证书校验，供自签证书使用。
 	ProxyInsecure bool `yaml:"proxy_insecure"`
+	// Egress 借用另一个插件声明的出口（一般是 egress_route 的 tag），用来代替
+	// 这里的 proxy / proxy_insecure。出口的 mark、路由表和代理都在那个插件里
+	// 维护，本插件只拿它的拨号器，所以同一个出口可以被多个数据面共用、统一
+	// 巡检和回滚。
+	// 与 proxy 互斥；被借用的插件必须在配置里排在它前面，否则启动时找不到。
+	Egress string `yaml:"egress"`
 
 	// IPv6Egress 控制直连 tun 出口的 IPv6 能力探测，默认 "auto"：
 	// auto：启动时拨一次 ipv6_probe，之后按 ipv6_probe_interval 复查。拨通才给
@@ -695,6 +702,30 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			zap.String("route_table", p.hostRouteTable()),
 			zap.String("hint", "set route_mark to keep the split inside the plugin's nft set instead"))
 	}
+	if strings.TrimSpace(cfg.Egress) != "" {
+		if cfg.Proxy != "" {
+			return nil, fmt.Errorf("fakeip nat: egress and proxy are mutually exclusive, name one outlet")
+		}
+		outlet, ok := routepolicy.OutletFor(strings.TrimSpace(cfg.Egress))
+		if !ok {
+			return nil, fmt.Errorf("fakeip nat: egress %q is not declared before this plugin", cfg.Egress)
+		}
+		p.egress = outlet.OutletDialer()
+		p.proxyActive = outlet.OutletProxyHost() != ""
+		// The borrowed dialer is shared, so the fake range is added to its
+		// exemptions: a socks5 outlet must keep the domain when local resolution
+		// returns one of our own fake addresses.
+		setFakeRange(p.egress, prefix)
+		p.L().Info("fakeip nat: exit borrowed from another plugin",
+			zap.String("egress", outlet.OutletTag()),
+			zap.String("exit", outlet.OutletDecision().String()),
+			zap.Bool("proxy_active", p.proxyActive))
+		if !cfg.UseTun && p.proxyActive {
+			p.L().Warn("the borrowed proxy only applies to the tun data path", zap.String("egress", cfg.Egress))
+		}
+		p.logStep("egress-borrow", time.Now())
+	}
+
 	if cfg.Proxy != "" {
 		dialer, err := newEgress(cfg.Proxy, cfg.ProxyInsecure)
 		if err != nil {
