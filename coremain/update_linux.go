@@ -13,8 +13,9 @@ import (
 
 // launchInstallerScript starts the swap outside the running service's cgroup.
 //
-// The script ends with "systemctl restart mosdns", and a restart kills every
-// process in that unit's cgroup - including a child started from inside it.
+// The script restarts the unit through "mosdns service restart", and a restart
+// kills every process in that unit's cgroup - including a child started from
+// inside it.
 // That is how an earlier version lost its health check and its rollback: the
 // binary had been installed, the restart had been issued, and then the script
 // itself was killed. A transient unit lives in its own cgroup and survives.
