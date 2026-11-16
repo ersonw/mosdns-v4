@@ -20,6 +20,7 @@
 package coremain
 
 import (
+	"context"
 	"fmt"
 	"github.com/ersonw/mosdns-v4/mlog"
 	"github.com/kardianos/service"
@@ -159,6 +160,7 @@ func startServer(sf *serverFlags, handleSignals bool) error {
 
 	cfgPath := v.ConfigFileUsed()
 	cfg.configDir = filepath.Dir(cfgPath)
+	cfg.configPath = cfgPath
 	// The command line flag wins over the file: an operator overriding the
 	// thread count for one run must not be silently second-guessed by the
 	// runtime block.
@@ -182,6 +184,8 @@ func startServer(sf *serverFlags, handleSignals bool) error {
 		stopWatching := watchShutdownSignals()
 		defer stopWatching()
 	}
+
+	startUpdateLoop(context.Background(), cfg, cfgPath)
 
 	if err := RunMosdns(cfg); err != nil {
 		return fmt.Errorf("mosdns exited, %w", err)

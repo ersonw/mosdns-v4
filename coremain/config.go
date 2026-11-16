@@ -39,12 +39,19 @@ type Config struct {
 	// unchanged.
 	Runtime RuntimeConfig `yaml:"runtime"`
 
+	// Update lets the binary keep itself current with the repository's
+	// releases: check, download, migrate the config, validate it with the new
+	// binary, then swap. Every field is optional and an empty block disables it.
+	Update UpdateConfig `yaml:"update"`
+
 	// Experimental
 	Security SecurityConfig `yaml:"security"`
 
-	// configDir is the directory of the loaded main config file. It is filled
-	// by startServer after config loading and is not part of the YAML schema.
-	configDir string
+	// configDir and configPath describe the loaded main config file. They are
+	// filled by startServer after config loading and are not part of the YAML
+	// schema.
+	configDir  string
+	configPath string
 }
 
 // RuntimeConfig is the optional `runtime:` block. A router has a small,

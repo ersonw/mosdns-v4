@@ -35,6 +35,23 @@ var (
 )
 
 func init() {
+	coremain.SetBuildVersion(version)
+
+	// check-config exists for the updater: the binary that is about to be
+	// installed is the only one that can say whether it accepts the migrated
+	// configuration. It parses and exits without touching anything.
+	var checkDir, checkCfg string
+	check := &cobra.Command{
+		Use:   "check-config",
+		Short: "Parse the config file, report schema problems and exit.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return coremain.CheckConfigFile(checkDir, checkCfg)
+		},
+	}
+	check.Flags().StringVarP(&checkDir, "dir", "d", "", "working directory")
+	check.Flags().StringVarP(&checkCfg, "config", "c", "config.yaml", "config file")
+	coremain.AddSubCmd(check)
+
 	coremain.AddSubCmd(&cobra.Command{
 		Use:   "version",
 		Short: "Print out version info and exit.",
