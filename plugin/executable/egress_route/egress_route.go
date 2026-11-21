@@ -161,6 +161,16 @@ type plugin struct {
 // feature, and the plugins that borrow it cannot work without it.
 func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	cfg := args.(*Args)
+	if strings.TrimSpace(cfg.NextHopDev) == "" && cfg.Mark != 0 {
+		dev, err := systemDefaultRouteDev(context.Background())
+		if err != nil {
+			bp.L().Warn("egress_route: resolving the system default route device failed", zap.Error(err))
+		} else {
+			cfg.NextHopDev = dev
+			bp.L().Info("egress_route: next_hop_dev resolved from the system default route",
+				zap.String("dev", dev))
+		}
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}

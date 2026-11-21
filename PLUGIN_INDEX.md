@@ -1,6 +1,6 @@
 # mosdns-v4 插件功能索引
 
-> 覆盖 `plugin/` 下 **32 个插件目录**（30 executable + 2 matcher）、**32 个可配置 type**、**21 个预置 tag**。
+> 覆盖 `plugin/` 下 **33 个插件目录**（31 executable + 2 matcher）、**33 个可配置 type**、**21 个预置 tag**。
 > 行号对应当前工作树；「是否可配置」= 是否能在 `plugins[].type` 里写。
 > 配套文档：`CODEBASE_MAP.md`（框架与链路）。
 > 配套配置模板：`etc/mosdns/config.yaml`（顶部为最小可运行段，其下为 26 个可配置 type + 21 个预置 tag + 全部顶层字段的英文注释清单）。
@@ -34,6 +34,7 @@
 | `asn_tun` | ✅ | `plugin/executable/asn_tun` | **定制**：按 ASN 的 IPv4 前缀用 nftables 打标，把标记流量送到 TUN；gVisor 处理真实目的 IP 的 TCP/UDP，再按有代理/无代理出站。不做 fake IP，不支持 ICMP/IPv6 | — |
 | `fakeip_nat` | ✅ | `plugin/executable/fakeip_nat` | **定制**：A 记录改写成假 IP，落 SQLite；默认用内置 NAT（nftables DNAT + host route + CIDR 聚合），`use_tun` 可切到 TUN 数据面（TCP/UDP/ICMP 统一 SNAT，逐跳探测把 traceroute 全路径送回 tun） | — |
 | `alias` | ✅ | `plugin/executable/alias` | **定制**：自有域名文件命中即分配虚拟 IP（不查上游），TUN 收包后反查域名；有代理直接按域名交给代理，无代理现场解析并按 `next_hop`/`next_hop_dev` 出站；TCP 80 走 HTTP 网关（明文进、改写 Host 回源） | — |
+| `sni_route` | ✅ | `plugin/executable/sni_route` | **定制**：按指定网卡/源地址拦截 TCP，读 TLS ClientHello 的 SNI，按后缀命中走指定出口（可借 `egress_route`），未命中交回系统路由；可选丢弃 QUIC 逼回 TCP | — |
 | `ocserv_ctl` | ✅ | `plugin/executable/ocserv_ctl` | **定制**：把 DNS 请求的源地址映射到 ocserv 登录用户（`occtl show users`），命中时给查询打标记 | — |
 | `telegram_bot` | ✅ | `plugin/executable/telegram_bot` | **定制**：Telegram 长轮询管理 fakeip / ocserv / RADIUS 账号 / 配置 / 脚本，按角色下发权限 | — |
 | `radius` | ✅ | `plugin/executable/radius` | **定制**：给 ocserv 当 RADIUS 服务端（PAP 认证 + RFC 2866 记账），账号存本机 SQLite，由 bot 的 `/user` 增删改 | — |

@@ -50,6 +50,7 @@ import (
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/reverse_lookup"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/sequence"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/sleep"
+	_ "github.com/ersonw/mosdns-v4/plugin/executable/sni_route"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/telegram_bot"
 	_ "github.com/ersonw/mosdns-v4/plugin/executable/ttl"
 	_ "github.com/ersonw/mosdns-v4/plugin/matcher/query_matcher"
