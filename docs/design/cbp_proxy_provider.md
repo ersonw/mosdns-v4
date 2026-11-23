@@ -1038,3 +1038,26 @@ mosdns-v4 因此调整为：
 结论：当前线上 SG relay forwarder 尚未启用，不能无条件信任 lowest-RTT relay；已加入主服务端优先回退和 NODE_LIST 候选验证。线上二进制和配置本轮均未替换。
 
 注意：本地实测复用了线上 `cbp_aa2` 的客户端身份和节点 token，日志会出现 `session ... superseded ... (relay reconnect)`；这是同一 client_id 新建会话导致的正常替换，线上客户端会自动重连，不是配置或二进制被改动。
+
+## 24. 代理与出口日志细化（2026-11-23）
+
+本轮只补可观测性，不改选路、握手和出口行为。日志按四级划分：
+
+- **Debug**：逐连接、逐候选、逐地址的细节。`cbp_proxy` 输出 `refresh loop started/stopped`、`node cache hit/stale/refreshed`、`bootstrap candidates fetched`、`main candidates ranked`、`NODE_LIST candidate failed`、`node resolved`、`relay choices`、`trying coordinator relay`、`starting CBP handshake`、`CBP dial` / `CBP dial ready` / `CBP dial failed`、`probing CBP session`、`closing CBP dialer`；`egress_route` 输出 `exit config`、`proxy probe passed`、每次出口连接的 `dialing` / `dial ready`、`closing exit`。
+- **Info**：生命周期与成功选路。`cbp_proxy` 输出 `plugin initializing/ready`、`manager initialized`、`provider configured`、`provider dialer ready`、`CBP node list refreshed`（含 `relay_fallbacks`）、`CBP stream session ready`（含 `session_id`、`elapsed`）；`egress_route` 输出 `proxy exit ready`、`direct exit ready`、`proxy outlet registered`、`proxy borrowed from another outlet`、`direct fallback disabled`。
+- **Warn**：可回退的失败或会收紧行为的配置。`cbp_proxy` 输出 `provider dialer failed`、`CBP handshake failed`、`CBP session unhealthy, reconnecting`、`CBP reconnect failed`、`CBP probe failed`；`egress_route` 输出 `proxy probe failed`、每次 `dial failed`、`direct_fallback is false but this link is a single protocol`、`exit cleanup incomplete`。
+- **Error**：初始化失败。`cbp_proxy` 输出 `plugin initialization failed`。
+
+字段约束：
+
+- `proxy` 统一走 `egress.Redact`，只显示协议、主机和端口，不显示用户名密码；`proxy_host` 只显示主机。
+- `node_token_set` / `identity_file_set` 只输出布尔，不输出 token、身份文件内容或私钥。
+- `session_id` 是 CBP 会话号，不是凭据；`relay_addr`、`address`、`target` 是网络地址，不包含认证信息。
+- `egress_route` 新加 `loggingDialer` 只包装 `DialContext`，不实现 `Prober`：启动 probe 仍打在真实 outlet 上；`UnwrapDialer` 让 `egress.SetFakeRange`、`SetNoDirectFallback`、`Probe`、`Describe` 仍能到达真实 outlet，避免影响 `fakeip_nat` 借用出口。
+
+本地验证：
+
+- `go test ./pkg/egress ./pkg/cbpstream ./pkg/cbpcoord ./plugin/executable/cbp_proxy ./plugin/executable/egress_route ./plugin/executable/fakeip_nat ./plugin/executable/asn_tun -count=1` 全部通过。
+- 新增 `TestManagerLogsLifecycleAndDialAtExpectedLevels`，用 fake bootstrap、fake coordinator、fake CBP node 跑完整链路，断言 `node cache stale` 为 Debug、`CBP node list refreshed` / `CBP stream session ready` / `CBP dial ready` 的级别，并确认日志中没有节点 token。
+- 新增 `TestLoggingDialerRecordsSuccessAtDebug` / `TestLoggingDialerRecordsFailureAtWarn`，断言出口逐连接成功为 Debug、失败为 Warn，且 `proxy_host` / `target` 字段存在。
+- 本地 `mosdns start` 冒烟：临时配置 `egress_route` + 本机 SOCKS5 监听，Debug 级别实际输出 `egress_route: exit config`、`egress_route: proxy probe passed`、`egress_route: proxy exit ready`、`egress_route: proxy outlet registered, no kernel state`；probe 失败时输出 `egress_route: proxy probe failed` 并阻止启动。该冒烟未连接线上节点，未改线上二进制和配置。

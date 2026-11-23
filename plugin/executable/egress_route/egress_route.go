@@ -11,6 +11,7 @@ package egress_route
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os/exec"
@@ -188,6 +189,20 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			Dev:      strings.TrimSpace(cfg.NextHopDev),
 		},
 	}
+	directFallback := true
+	if cfg.DirectFallback != nil {
+		directFallback = *cfg.DirectFallback
+	}
+	p.L().Debug("egress_route: exit config",
+		zap.Uint32("mark", cfg.Mark),
+		zap.String("route_table", cfg.RouteTable),
+		zap.Int("rule_priority", cfg.RulePriority),
+		zap.String("nft_table", cfg.NFTable),
+		zap.String("next_hop", cfg.NextHop),
+		zap.String("next_hop_dev", cfg.NextHopDev),
+		zap.String("proxy", egress.Redact(cfg.Proxy)),
+		zap.String("proxy_from", cfg.ProxyFrom),
+		zap.Bool("direct_fallback", directFallback))
 
 	if from := strings.TrimSpace(cfg.ProxyFrom); from != "" {
 		outlet, ok := routepolicy.OutletFor(from)
@@ -238,16 +253,23 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			host = proxyHost(raw)
 		}
 
+		probeStart := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
 		probeErr := egress.Probe(ctx, d)
 		cancel()
 		if probeErr != nil {
+			p.L().Warn("egress_route: proxy probe failed",
+				zap.String("proxy", egress.Redact(raw)), zap.String("exit", p.decision.String()),
+				zap.Duration("elapsed", time.Since(probeStart)), zap.Error(probeErr))
 			// A configured proxy is a policy decision: falling back to direct
 			// would leak the traffic this exit exists to carry.
 			return nil, fmt.Errorf("egress_route: proxy %s is not usable: %w", egress.Redact(raw), probeErr)
 		}
 		p.dialer = d
 		p.proxy = host
+		p.L().Debug("egress_route: proxy probe passed",
+			zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host),
+			zap.Duration("elapsed", time.Since(probeStart)))
 		p.L().Info("egress_route: proxy exit ready",
 			zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host), zap.String("exit", p.decision.String()))
 		if cfg.DirectFallback != nil && !*cfg.DirectFallback {
@@ -265,6 +287,13 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		}
 		p.dialer = egress.NewDirect(p.decision.Dev, netip.Addr{})
 		p.L().Info("egress_route: direct exit ready", zap.String("exit", p.decision.String()))
+	}
+
+	p.dialer = &loggingDialer{
+		dialer: p.dialer,
+		log:    p.L().With(zap.String("exit", p.decision.String())),
+		exit:   p.decision.String(),
+		proxy:  p.proxy,
 	}
 
 	// A proxy-only exit writes nothing into the kernel, so there is no mark
@@ -351,6 +380,7 @@ func (p *plugin) attachClose() {
 }
 
 func (p *plugin) Close() error {
+	p.L().Debug("egress_route: closing exit", zap.String("exit", p.decision.String()))
 	p.closeOnce.Do(func() {
 		routepolicy.UnregisterOutlet(p.Tag())
 		if p.dialer != nil {
@@ -377,6 +407,46 @@ func (p *plugin) Close() error {
 		}
 	})
 	return nil
+}
+
+// loggingDialer records the per-connection outcome at Debug and the failures
+// at Warn, without changing the outlet's behaviour. It deliberately does not
+// implement Prober: the startup probe runs on the real outlet before wrapping.
+type loggingDialer struct {
+	dialer egress.Dialer
+	log    *zap.Logger
+	exit   string
+	proxy  string
+}
+
+func (d *loggingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	mode := "direct"
+	if d.proxy != "" {
+		mode = "proxy"
+	}
+	start := time.Now()
+	d.log.Debug("egress_route: dialing",
+		zap.String("mode", mode), zap.String("proxy_host", d.proxy),
+		zap.String("network", network), zap.String("target", addr))
+	conn, err := d.dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		d.log.Warn("egress_route: dial failed",
+			zap.String("mode", mode), zap.String("proxy_host", d.proxy),
+			zap.String("network", network), zap.String("target", addr),
+			zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		return nil, err
+	}
+	d.log.Debug("egress_route: dial ready",
+		zap.String("mode", mode), zap.String("proxy_host", d.proxy),
+		zap.String("network", network), zap.String("target", addr),
+		zap.Duration("elapsed", time.Since(start)))
+	return conn, nil
+}
+
+func (d *loggingDialer) UnwrapDialer() egress.Dialer { return d.dialer }
+
+func (d *loggingDialer) Close() error {
+	return egress.Close(d.dialer)
 }
 
 // OutletTag lets the borrower name its exit in a log line.

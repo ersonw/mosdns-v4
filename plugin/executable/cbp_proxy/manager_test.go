@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -18,6 +19,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +27,8 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/cbp"
 	"github.com/ersonw/mosdns-v4/pkg/cbpcoord"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestManagerClosesLoopFromBootstrapToCBPStream(t *testing.T) {
@@ -483,5 +487,94 @@ func TestWriteManagedDatOnlyRewritesWhenNodeTableChanges(t *testing.T) {
 	}
 	if info.ModTime().Equal(stamp) {
 		t.Fatal("changed node table did not rewrite the dat")
+	}
+}
+
+func TestManagerLogsLifecycleAndDialAtExpectedLevels(t *testing.T) {
+	cert := testCertificate(t, "cbp-test")
+	nodeAuth := make(chan string, 1)
+	nodeAddr, closeNode, err := startFakeCBPNode(cert, nodeAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeNode()
+	coordinatorAddr, closeCoordinator, err := startFakeCoordinator(cert, "edge-sg-1", nodeAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeCoordinator()
+
+	identity := newTestIdentity(t, "cbp_sg")
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/edge/bootstrap":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"server": map[string]any{
+					"candidates": []map[string]any{{
+						"id": "main", "role": "main", "addresses": []string{coordinatorAddr},
+					}},
+				},
+			})
+		case "/v1/identity/client":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"client_id": identity.clientID, "public_key": identity.publicKey, "private_key": identity.privateKey,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := coremain.ProxyProvideConfig{
+		Tag:          "cbp_sg",
+		Domain:       srv.URL,
+		Token:        "test-token",
+		NodeToken:    "node-token",
+		IdentityFile: filepath.Join(t.TempDir(), "identity.json"),
+	}
+	core, logs := observer.New(zap.DebugLevel)
+	m, err := NewManager([]coremain.ProxyProvideConfig{cfg}, zap.New(core))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, _, err := m.NewProxyDialer("cbp_sg:edge-sg-1", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := dialer.DialContext(context.Background(), "tcp", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	_ = egressClose(dialer)
+
+	want := map[string]zapcore.Level{
+		"cbp_proxy: manager initialized":          zapcore.InfoLevel,
+		"cbp_proxy: provider configured":          zapcore.InfoLevel,
+		"cbp_proxy: node cache stale":             zapcore.DebugLevel,
+		"cbp_proxy: bootstrap candidates fetched": zapcore.DebugLevel,
+		"cbp_proxy: main candidates ranked":       zapcore.DebugLevel,
+		"cbp_proxy: CBP node list refreshed":      zapcore.InfoLevel,
+		"cbp_proxy: trying coordinator relay":     zapcore.DebugLevel,
+		"cbp_proxy: starting CBP handshake":       zapcore.DebugLevel,
+		"cbp_proxy: CBP stream session ready":     zapcore.InfoLevel,
+		"cbp_proxy: CBP dial":                     zapcore.DebugLevel,
+		"cbp_proxy: CBP dial ready":               zapcore.DebugLevel,
+	}
+	seen := map[string]zapcore.Level{}
+	for _, entry := range logs.All() {
+		seen[entry.Message] = entry.Level
+		if strings.Contains(entry.Message, "node-token") || strings.Contains(fmt.Sprint(entry.ContextMap()), "node-token") {
+			t.Fatalf("node token leaked into %q: %v", entry.Message, entry.ContextMap())
+		}
+	}
+	for message, level := range want {
+		got, ok := seen[message]
+		if !ok {
+			t.Fatalf("missing log %q, got %v", message, seen)
+		}
+		if got != level {
+			t.Fatalf("log %q level = %v, want %v", message, got, level)
+		}
 	}
 }

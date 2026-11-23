@@ -85,15 +85,35 @@ func NewTrojan(server, password, sni string, insecure bool) *Trojan {
 	return &trojanEgress{server: server, password: password, sni: sni, insecure: insecure}
 }
 
+// dialerUnwrapper lets a decorator expose the concrete outlet underneath so
+// type-specific options still reach the real implementation.
+type dialerUnwrapper interface {
+	UnwrapDialer() Dialer
+}
+
+func unwrapDialer(d Dialer) Dialer {
+	for {
+		u, ok := d.(dialerUnwrapper)
+		if !ok {
+			return d
+		}
+		next := u.UnwrapDialer()
+		if next == nil || next == d {
+			return d
+		}
+		d = next
+	}
+}
+
 // Probe verifies an outlet before it carries real traffic.
 func Probe(ctx context.Context, d Dialer) error {
-	return probeEgress(ctx, d)
+	return probeEgress(ctx, unwrapDialer(d))
 }
 
 // SetFakeRange teaches a SOCKS5 outlet the range this plugin hands out itself,
 // so a fake answer is not dialed as if it were a real address.
 func SetFakeRange(d Dialer, prefix netip.Prefix) bool {
-	return setFakeRange(d, prefix)
+	return setFakeRange(unwrapDialer(d), prefix)
 }
 
 // SetNoDirectFallback turns off the host-network fallback of a multi-protocol
@@ -103,7 +123,7 @@ func SetFakeRange(d Dialer, prefix netip.Prefix) bool {
 // It reports whether the outlet has such a fallback to disable. A link made of
 // a single protocol never falls back, so a false result is not a failure.
 func SetNoDirectFallback(d Dialer) bool {
-	g, ok := d.(*gostEgress)
+	g, ok := unwrapDialer(d).(*gostEgress)
 	if !ok {
 		return false
 	}

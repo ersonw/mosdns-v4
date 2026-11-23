@@ -64,6 +64,16 @@ func NewManager(configs []coremain.ProxyProvideConfig, logger *zap.Logger) (*Man
 			nodes: make(map[string]cbpcoord.Node),
 		}
 	}
+	m.logger.Info("cbp_proxy: manager initialized", zap.Int("providers", len(configs)))
+	for _, cfg := range configs {
+		m.byTag[cfg.Tag].log.Info("cbp_proxy: provider configured",
+			zap.String("domain", cfg.Domain),
+			zap.String("config_dat", cfg.ConfigDat),
+			zap.Bool("manage_dat", cfg.ManageDat),
+			zap.Bool("generate_dat", cfg.GenerateDat),
+			zap.Bool("node_token_set", cfg.NodeTokenValue() != ""),
+			zap.Bool("identity_file_set", cfg.IdentityFile != ""))
+	}
 	return m, nil
 }
 
@@ -74,11 +84,13 @@ func NewManager(configs []coremain.ProxyProvideConfig, logger *zap.Logger) (*Man
 // RunRefreshLoop keeps the NODE_LIST cache current. Without it the table
 // would only be refreshed when egress_route asks for a dialer at startup.
 func (m *Manager) RunRefreshLoop(ctx context.Context) {
+	m.logger.Debug("cbp_proxy: refresh loop started", zap.Duration("interval", nodeRefreshCheckInterval))
 	ticker := time.NewTicker(nodeRefreshCheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
+			m.logger.Debug("cbp_proxy: refresh loop stopped")
 			return
 		case <-ticker.C:
 			m.refreshStale(ctx)
@@ -131,6 +143,7 @@ func (s *tagState) cfgInsecure() bool {
 }
 
 func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, string, error) {
+	m.logger.Debug("cbp_proxy: resolving dialer", zap.String("params", params), zap.Bool("insecure", insecure))
 	tag, nodeName, ok := strings.Cut(strings.TrimSpace(params), ":")
 	if !ok || strings.TrimSpace(tag) == "" || strings.TrimSpace(nodeName) == "" {
 		return nil, "", fmt.Errorf("cbp_proxy: want <tag>:<node_id_or_label>, got %q", params)
@@ -163,6 +176,8 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	}
 	nodeID := node.ID
 	addresses := nodeControlAddresses(node)
+	m.logger.Debug("cbp_proxy: node resolved", zap.String("tag", tag), zap.String("node", nodeID),
+		zap.String("label", node.Label), zap.Int("legacy_direct_addresses", len(addresses)))
 	// The current server advertises node TCP ports as coordinator relay
 	// candidates. The node forwards those bytes to the main server without
 	// terminating TLS, so they are not CBP control endpoints: dialing them
@@ -170,7 +185,10 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	// whenever one exists, and keep the legacy direct path only as a fallback
 	// for an older standalone node that is not registered at the coordinator.
 	var relayErrs []string
-	for _, relay := range relayChoices(coordinator, fallbacks) {
+	choices := relayChoices(coordinator, fallbacks)
+	m.logger.Debug("cbp_proxy: relay choices", zap.Int("count", len(choices)), zap.Strings("addresses", relayAddresses(choices)))
+	for _, relay := range choices {
+		m.logger.Debug("cbp_proxy: trying coordinator relay", zap.String("address", relay.Address), zap.String("role", relay.Role))
 		dialer, host, err := m.dialNode(ctx, state, node, "", relay, true, insecure)
 		if err == nil {
 			return dialer, host, nil
@@ -187,6 +205,7 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 
 	// Legacy path: an older standalone node still exposes direct control
 	// endpoints. Try them only after every relay candidate failed.
+	m.logger.Debug("cbp_proxy: all relay candidates failed, trying legacy direct endpoints", zap.Strings("addresses", addresses))
 	probes, probeErr := selectNodeAddresses(ctx, addresses)
 	var directErrs []string
 	if probeErr != nil {
@@ -238,7 +257,16 @@ func relayChoices(primary SelectedMain, fallbacks []SelectedMain) []SelectedMain
 	return out
 }
 
+func relayAddresses(choices []SelectedMain) []string {
+	out := make([]string, 0, len(choices))
+	for _, choice := range choices {
+		out = append(out, choice.Address)
+	}
+	return out
+}
+
 func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.Node, address string, coordinator SelectedMain, relay bool, insecure bool) (egress.Dialer, string, error) {
+	start := time.Now()
 	serverName := nodeServerName(node, address)
 	relayAddr := ""
 	if relay {
@@ -274,8 +302,14 @@ func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.N
 			InsecureSkipVerify: insecure,
 		}
 	}
+	state.log.Debug("cbp_proxy: starting CBP handshake",
+		zap.String("node", node.ID), zap.String("address", address),
+		zap.String("server_name", serverName), zap.Bool("relay", relay),
+		zap.String("relay_addr", relayAddr), zap.Duration("timeout", dialTimeout))
 	client, err := cbpstream.Dial(ctx, streamCfg)
 	if err != nil {
+		state.log.Warn("cbp_proxy: CBP handshake failed",
+			zap.String("node", node.ID), zap.Bool("relay", relay), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
 		return nil, "", err
 	}
 	host := address
@@ -283,10 +317,13 @@ func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.N
 		host = relayAddr
 	}
 	host = hostOnly(host)
+	ready := client.Ready()
 	state.log.Info("cbp_proxy: CBP stream session ready",
 		zap.String("node", node.ID), zap.String("control", address),
-		zap.Bool("relay", relay), zap.String("relay_addr", relayAddr))
-	return &cbpDialer{client: client, cfg: streamCfg, host: host, node: node.ID}, host, nil
+		zap.Bool("relay", relay), zap.String("relay_addr", relayAddr),
+		zap.Uint64("session_id", ready.SessionID), zap.Duration("elapsed", time.Since(start)))
+	return &cbpDialer{client: client, cfg: streamCfg, host: host, node: node.ID,
+		log: state.log.With(zap.String("node", node.ID), zap.Bool("relay", relay))}, host, nil
 }
 
 func hostOnly(address string) string {
@@ -304,8 +341,10 @@ func (s *tagState) ensure(ctx context.Context, insecure bool) error {
 	lastErr := s.lastErr
 	s.mu.RUnlock()
 	if fresh {
+		s.log.Debug("cbp_proxy: node cache hit", zap.Int("nodes", nodes), zap.Duration("age", time.Since(s.refreshedAt)))
 		return nil
 	}
+	s.log.Debug("cbp_proxy: node cache stale", zap.Int("nodes", nodes))
 
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -328,6 +367,7 @@ func (s *tagState) ensure(ctx context.Context, insecure bool) error {
 		}
 		return fmt.Errorf("cbp_proxy: refresh %s: %w", s.cfg.Tag, err)
 	}
+	s.log.Debug("cbp_proxy: node cache refreshed")
 	return nil
 }
 
@@ -336,10 +376,12 @@ func (s *tagState) refresh(ctx context.Context, insecure bool) error {
 	if err != nil {
 		return err
 	}
+	s.log.Debug("cbp_proxy: bootstrap candidates fetched", zap.Int("candidates", len(candidates)))
 	ranked, err := RankMainCandidates(ctx, candidates)
 	if err != nil {
 		return err
 	}
+	s.log.Debug("cbp_proxy: main candidates ranked", zap.Int("reachable", len(ranked)))
 
 	// A node relay candidate is only useful when the node actually forwards
 	// TCP to the coordinator. Probe the ranked candidates with NODE_LIST and
@@ -365,6 +407,8 @@ func (s *tagState) refresh(ctx context.Context, insecure bool) error {
 			break
 		}
 		fetchErrs = append(fetchErrs, fmt.Sprintf("%s (%s): %v", candidate.Address, candidate.Role, err))
+		s.log.Debug("cbp_proxy: NODE_LIST candidate failed",
+			zap.String("address", candidate.Address), zap.String("role", candidate.Role), zap.Duration("rtt", candidate.RTT), zap.Error(err))
 	}
 	if selected.Address == "" {
 		return fmt.Errorf("cbp_proxy: NODE_LIST failed on every main-server candidate: %s", strings.Join(fetchErrs, "; "))
@@ -403,7 +447,7 @@ func (s *tagState) refresh(ctx context.Context, insecure bool) error {
 	s.mu.Unlock()
 	s.log.Info("cbp_proxy: CBP node list refreshed",
 		zap.Int("nodes", len(table)), zap.String("main", selected.Address),
-		zap.String("role", selected.Role), zap.Duration("rtt", selected.RTT))
+		zap.String("role", selected.Role), zap.Duration("rtt", selected.RTT), zap.Int("relay_fallbacks", len(fallbacks)))
 	if s.cfg.ManageDat || s.cfg.GenerateDat {
 		s.writeDatIfChanged(nodes, insecure)
 	}
@@ -587,6 +631,7 @@ type cbpDialer struct {
 	cfg    cbpstream.Config
 	host   string
 	node   string
+	log    *zap.Logger
 	closed bool
 }
 
@@ -604,13 +649,16 @@ func (d *cbpDialer) ensureClient(ctx context.Context) (*cbpstream.Client, error)
 		return d.client, nil
 	}
 	if d.client != nil {
+		d.log.Warn("cbp_proxy: CBP session unhealthy, reconnecting")
 		_ = d.client.Close()
 		d.client = nil
 	}
 	client, err := cbpstream.Dial(ctx, d.cfg)
 	if err != nil {
+		d.log.Warn("cbp_proxy: CBP reconnect failed", zap.Error(err))
 		return nil, fmt.Errorf("cbp_proxy: reconnect node %s: %w", d.node, err)
 	}
+	d.log.Info("cbp_proxy: CBP session reconnected", zap.Uint64("session_id", client.Ready().SessionID))
 	if d.closed {
 		_ = client.Close()
 		return nil, errors.New("cbp_proxy: dialer is closed")
@@ -634,6 +682,7 @@ func isClientClosed(err error) bool {
 
 func (d *cbpDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	network = strings.ToLower(strings.TrimSpace(network))
+	d.log.Debug("cbp_proxy: CBP dial", zap.String("network", network), zap.String("target", addr))
 	for attempt := 0; attempt < 2; attempt++ {
 		client, err := d.ensureClient(ctx)
 		if err != nil {
@@ -659,22 +708,30 @@ func (d *cbpDialer) DialContext(ctx context.Context, network, addr string) (net.
 			return nil, fmt.Errorf("cbp_proxy: unsupported network %q", network)
 		}
 		if err == nil {
+			d.log.Debug("cbp_proxy: CBP dial ready", zap.String("target", addr), zap.Int("attempt", attempt+1))
 			return conn, nil
 		}
 		if attempt == 1 || !isClientClosed(err) {
+			d.log.Debug("cbp_proxy: CBP dial failed", zap.String("network", network), zap.String("target", addr), zap.Int("attempt", attempt+1), zap.Error(err))
 			return nil, err
 		}
+		d.log.Debug("cbp_proxy: CBP stream closed during dial, retrying", zap.String("target", addr), zap.Error(err))
 		d.invalidate(client)
 	}
 	return nil, errors.New("cbp_proxy: CBP stream session is not available")
 }
 
 func (d *cbpDialer) Probe(ctx context.Context) error {
+	d.log.Debug("cbp_proxy: probing CBP session")
 	_, err := d.ensureClient(ctx)
+	if err != nil {
+		d.log.Warn("cbp_proxy: CBP probe failed", zap.Error(err))
+	}
 	return err
 }
 
 func (d *cbpDialer) Close() error {
+	d.log.Debug("cbp_proxy: closing CBP dialer")
 	d.mu.Lock()
 	if d.closed {
 		d.mu.Unlock()

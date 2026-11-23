@@ -48,7 +48,7 @@ func (e *directEgress) SetTimeout(d time.Duration) { e.dialer.Timeout = d }
 
 // Describe is the log form of an outlet: protocol and server, never the
 // credentials.
-func Describe(d Dialer) string { return describeEgress(d) }
+func Describe(d Dialer) string { return describeEgress(unwrapDialer(d)) }
 
 // FakeRange reports the range this outlet refuses to dial, because the plugin
 // itself answered that address and the name must survive instead.
