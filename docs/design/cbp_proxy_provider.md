@@ -975,3 +975,21 @@ mosdns 客户端的对齐结果：
 3. **逐个尝试**。TCP 可连接不代表 CBP TLS/AUTH 一定成功，因此按顺序尝试完所有候选，只有全部直连失败才回退主服务端 relay。
 
 `public_addr` 和 `public_tcp_endpoint` 仍然作为兼容地址；它们与 `control_addresses` 去重后合并。
+
+---
+
+## 21. 线上 SG/HK 出口类型互换（2026-11-23）
+
+线上 VyOS `192.168.10.1` 的 `/etc/mosdns/config.yaml` 只改了两个 `egress_route.proxy`，mark、nft 表、route table、`next_hop` 和 `next_hop_dev` 均未动：
+
+- `egress_sg`：`cbp_proxy:cbp_aa2:edge-vyos-sg1` → `gost://11.10.10.31:1080`
+- `egress_hk`：`gost://11.10.10.13:1080` → `cbp_proxy:cbp_aa2:edge-vyos-hk1`
+
+改动前备份：`/etc/mosdns/config.yaml.bak.20261123T085151Z`。`mosdns check-config` 通过后重启服务。
+
+验证结果：
+
+1. SG gost 直连 `11.10.10.31:1080` 请求 `ipinfo.io`，出口为 `43.128.119.39`（Singapore）。
+2. HK CBP 经 `198.18.15.146` fakeip 请求 `ipinfo.io`，出口为 `103.49.60.205`（Hong Kong）。
+3. DNS `example.com`、`google.com`、`www.tiktok.com` 均返回 fakeip；HTTPS 经 HK CBP 和 SG gost 均返回 200。
+4. HK CBP 直连 `11.10.10.13:8443` 时 `control TLS: EOF`，客户端按既有逻辑回退主服务端 relay `11.10.10.13:9443`，会话建立成功；运行 2 分钟以上无 `client closed`。
