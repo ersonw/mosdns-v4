@@ -334,9 +334,19 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 
 	env, err := cbp.ReadControlFrame(conn)
-	if err != nil || env.Type != "HELLO_ACK" {
+	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("cbpstream: read HELLO_ACK: %v", err)
+		return nil, fmt.Errorf("cbpstream: read HELLO_ACK: %w", err)
+	}
+	if env.Type == "ERROR" {
+		var em cbp.ErrorMessage
+		_ = cbp.UnmarshalPayload(env.Payload, &em)
+		_ = conn.Close()
+		return nil, fmt.Errorf("cbpstream: pre-auth error: %s: %s", em.Code, em.Message)
+	}
+	if env.Type != "HELLO_ACK" {
+		_ = conn.Close()
+		return nil, fmt.Errorf("cbpstream: expected HELLO_ACK, got %s", env.Type)
 	}
 	var hello cbp.HelloAck
 	if err := cbp.UnmarshalPayload(env.Payload, &hello); err != nil {

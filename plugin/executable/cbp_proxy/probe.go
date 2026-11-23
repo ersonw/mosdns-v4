@@ -34,12 +34,12 @@ type probeResult struct {
 	err       error
 }
 
-// SelectMainCandidate probes every address of every main-server TCP candidate
-// and returns the lowest RTT that answered. ICMP is tried first, TCP connect
-// is the fallback. Candidates are never treated as CBP nodes.
-func SelectMainCandidate(ctx context.Context, candidates []MainCandidate) (SelectedMain, error) {
+// RankMainCandidates probes every address of every main-server TCP candidate
+// and returns reachable endpoints ordered by lowest RTT. ICMP is tried first,
+// TCP connect is the fallback. Candidates are never treated as CBP nodes.
+func RankMainCandidates(ctx context.Context, candidates []MainCandidate) ([]SelectedMain, error) {
 	if len(candidates) == 0 {
-		return SelectedMain{}, errors.New("cbp_proxy: no main-server candidates")
+		return nil, errors.New("cbp_proxy: no main-server candidates")
 	}
 	results := make(chan probeResult, len(candidates)*2)
 	var wg sync.WaitGroup
@@ -65,7 +65,7 @@ func SelectMainCandidate(ctx context.Context, candidates []MainCandidate) (Selec
 		}
 	}
 	if len(reachable) == 0 {
-		return SelectedMain{}, errors.New("cbp_proxy: all main-server candidates are unreachable")
+		return nil, errors.New("cbp_proxy: all main-server candidates are unreachable")
 	}
 	sort.SliceStable(reachable, func(i, j int) bool {
 		a, b := reachable[i], reachable[j]
@@ -78,21 +78,34 @@ func SelectMainCandidate(ctx context.Context, candidates []MainCandidate) (Selec
 		}
 		return a.address < b.address
 	})
-	best := reachable[0]
-	serverName := strings.TrimSpace(best.candidate.PublicIP)
-	if serverName == "" {
-		host, _, err := net.SplitHostPort(best.address)
-		if err == nil {
-			serverName = strings.Trim(host, "[]")
+	ranked := make([]SelectedMain, 0, len(reachable))
+	for _, best := range reachable {
+		serverName := strings.TrimSpace(best.candidate.PublicIP)
+		if serverName == "" {
+			host, _, err := net.SplitHostPort(best.address)
+			if err == nil {
+				serverName = strings.Trim(host, "[]")
+			}
 		}
+		ranked = append(ranked, SelectedMain{
+			ID:         best.candidate.ID,
+			Role:       best.candidate.Role,
+			Address:    best.address,
+			ServerName: serverName,
+			RTT:        best.rtt,
+		})
 	}
-	return SelectedMain{
-		ID:         best.candidate.ID,
-		Role:       best.candidate.Role,
-		Address:    best.address,
-		ServerName: serverName,
-		RTT:        best.rtt,
-	}, nil
+	return ranked, nil
+}
+
+// SelectMainCandidate is the single-endpoint compatibility wrapper used by
+// tests and callers that do not need per-candidate fallback.
+func SelectMainCandidate(ctx context.Context, candidates []MainCandidate) (SelectedMain, error) {
+	ranked, err := RankMainCandidates(ctx, candidates)
+	if err != nil {
+		return SelectedMain{}, err
+	}
+	return ranked[0], nil
 }
 
 func roleRank(role string) int {

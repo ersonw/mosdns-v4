@@ -38,11 +38,12 @@ type tagState struct {
 	cfg coremain.ProxyProvideConfig
 	log *zap.Logger
 
-	mu          sync.RWMutex
-	nodes       map[string]cbpcoord.Node
-	coordinator SelectedMain
-	refreshedAt time.Time
-	lastErr     error
+	mu                   sync.RWMutex
+	nodes                map[string]cbpcoord.Node
+	coordinator          SelectedMain
+	coordinatorFallbacks []SelectedMain
+	refreshedAt          time.Time
+	lastErr              error
 
 	refreshMu      sync.Mutex
 	datFingerprint string
@@ -68,8 +69,8 @@ func NewManager(configs []coremain.ProxyProvideConfig, logger *zap.Logger) (*Man
 
 // NewProxyDialer parses "<tag>:<node>", ensures the NODE_LIST cache is fresh,
 // resolves <node> by node ID first and then by node label, and opens its stream
-// session. A direct node dial is tried first; if it fails, the selected
-// main-server TCP candidate is used as a relay.
+// session. The selected coordinator relay is tried first; legacy direct node
+// control endpoints are only a fallback for older standalone nodes.
 // RunRefreshLoop keeps the NODE_LIST cache current. Without it the table
 // would only be refreshed when egress_route asks for a dialer at startup.
 func (m *Manager) RunRefreshLoop(ctx context.Context) {
@@ -152,6 +153,7 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	state.mu.RLock()
 	node, found, lookupErr := findNode(state.nodes, nodeName)
 	coordinator := state.coordinator
+	fallbacks := append([]SelectedMain(nil), state.coordinatorFallbacks...)
 	state.mu.RUnlock()
 	if lookupErr != nil {
 		return nil, "", fmt.Errorf("cbp_proxy: tag %q: %w", tag, lookupErr)
@@ -161,36 +163,79 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	}
 	nodeID := node.ID
 	addresses := nodeControlAddresses(node)
-	if len(addresses) == 0 {
-		return nil, "", fmt.Errorf("cbp_proxy: CBP node %q has no TCP control endpoint", nodeID)
-	}
-	probes, err := selectNodeAddresses(ctx, addresses)
-	if err != nil {
-		return nil, "", fmt.Errorf("cbp_proxy: node %q: %w", nodeID, err)
-	}
-
-	// Try every reachable address in latency order. A TCP-reachable address
-	// can still fail the CBP TLS/AUTH handshake, so the runner-up must be
-	// tried before falling back to the main-server relay.
-	var directErrs []string
-	for _, candidate := range probes {
-		dialer, host, err := m.dialNode(ctx, state, node, candidate.Address, coordinator, false, insecure)
+	// The current server advertises node TCP ports as coordinator relay
+	// candidates. The node forwards those bytes to the main server without
+	// terminating TLS, so they are not CBP control endpoints: dialing them
+	// with cbp-control/2 fails ALPN. Prefer the selected coordinator relay
+	// whenever one exists, and keep the legacy direct path only as a fallback
+	// for an older standalone node that is not registered at the coordinator.
+	var relayErrs []string
+	for _, relay := range relayChoices(coordinator, fallbacks) {
+		dialer, host, err := m.dialNode(ctx, state, node, "", relay, true, insecure)
 		if err == nil {
 			return dialer, host, nil
 		}
-		directErrs = append(directErrs, fmt.Sprintf("%s (%v)", candidate.Address, err))
-		m.logger.Warn("cbp_proxy: direct CBP node candidate failed",
+		relayErrs = append(relayErrs, fmt.Sprintf("%s (%s): %v", relay.Address, relay.Role, err))
+		m.logger.Warn("cbp_proxy: coordinator relay candidate failed",
 			zap.String("tag", tag), zap.String("node", nodeID),
-			zap.String("address", candidate.Address), zap.Duration("rtt", candidate.RTT), zap.Error(err))
+			zap.String("address", relay.Address), zap.String("role", relay.Role), zap.Error(err))
 	}
-	relayAddress := probes[0].Address
-	m.logger.Warn("cbp_proxy: direct CBP node failed, trying main-server relay",
-		zap.String("tag", tag), zap.String("node", nodeID), zap.String("address", relayAddress), zap.Error(errors.New(strings.Join(directErrs, "; "))))
-	dialer, host, relayErr := m.dialNode(ctx, state, node, relayAddress, coordinator, true, insecure)
-	if relayErr != nil {
-		return nil, "", fmt.Errorf("cbp_proxy: node %q direct: %s; relay %s: %w", nodeID, strings.Join(directErrs, "; "), coordinator.Address, relayErr)
+
+	if len(addresses) == 0 {
+		return nil, "", fmt.Errorf("cbp_proxy: node %q has no direct control endpoint; relay failed: %s", nodeID, strings.Join(relayErrs, "; "))
 	}
-	return dialer, host, nil
+
+	// Legacy path: an older standalone node still exposes direct control
+	// endpoints. Try them only after every relay candidate failed.
+	probes, probeErr := selectNodeAddresses(ctx, addresses)
+	var directErrs []string
+	if probeErr != nil {
+		directErrs = append(directErrs, probeErr.Error())
+	} else {
+		for _, candidate := range probes {
+			dialer, host, err := m.dialNode(ctx, state, node, candidate.Address, coordinator, false, insecure)
+			if err == nil {
+				return dialer, host, nil
+			}
+			directErrs = append(directErrs, fmt.Sprintf("%s (%v)", candidate.Address, err))
+			m.logger.Warn("cbp_proxy: legacy direct CBP node candidate failed",
+				zap.String("tag", tag), zap.String("node", nodeID),
+				zap.String("address", candidate.Address), zap.Duration("rtt", candidate.RTT), zap.Error(err))
+		}
+	}
+	return nil, "", fmt.Errorf("cbp_proxy: node %q relay: %s; direct: %s", nodeID, strings.Join(relayErrs, "; "), strings.Join(directErrs, "; "))
+}
+
+// relayChoices orders the relay attempts. The lowest-RTT coordinator is
+// first; when it is a node relay and fails, the main coordinator is tried
+// before the remaining candidates so a stale node forwarder cannot take the
+// egress offline.
+func relayChoices(primary SelectedMain, fallbacks []SelectedMain) []SelectedMain {
+	out := make([]SelectedMain, 0, len(fallbacks)+1)
+	seen := make(map[string]struct{}, len(fallbacks)+1)
+	add := func(candidate SelectedMain) {
+		if candidate.Address == "" {
+			return
+		}
+		if _, ok := seen[candidate.Address]; ok {
+			return
+		}
+		seen[candidate.Address] = struct{}{}
+		out = append(out, candidate)
+	}
+	add(primary)
+	if !strings.EqualFold(strings.TrimSpace(primary.Role), "main") {
+		for _, candidate := range fallbacks {
+			if strings.EqualFold(strings.TrimSpace(candidate.Role), "main") {
+				add(candidate)
+				break
+			}
+		}
+	}
+	for _, candidate := range fallbacks {
+		add(candidate)
+	}
+	return out
 }
 
 func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.Node, address string, coordinator SelectedMain, relay bool, insecure bool) (egress.Dialer, string, error) {
@@ -291,24 +336,45 @@ func (s *tagState) refresh(ctx context.Context, insecure bool) error {
 	if err != nil {
 		return err
 	}
-	selected, err := SelectMainCandidate(ctx, candidates)
+	ranked, err := RankMainCandidates(ctx, candidates)
 	if err != nil {
 		return err
 	}
-	nodes, err := cbpcoord.FetchNodes(ctx, cbpcoord.Config{
-		Address:                    selected.Address,
-		ServerName:                 selected.ServerName,
-		InsecureSkipVerify:         insecure,
-		ClientID:                   s.clientID(),
-		IdentityFile:               s.cfg.IdentityFile,
-		IdentityServerURL:          coremain.ProxyProvideIdentityURL(s.cfg.Domain),
-		IdentityToken:              s.cfg.Token,
-		IdentityInsecureSkipVerify: insecure,
-		Timeout:                    dialTimeout,
-	})
-	if err != nil {
-		return err
+
+	// A node relay candidate is only useful when the node actually forwards
+	// TCP to the coordinator. Probe the ranked candidates with NODE_LIST and
+	// keep the first that authenticates; a stale relay entry must not take the
+	// whole egress offline when the main path is healthy.
+	var selected SelectedMain
+	var nodes []cbpcoord.Node
+	var fetchErrs []string
+	for _, candidate := range relayChoices(ranked[0], ranked[1:]) {
+		nodes, err = cbpcoord.FetchNodes(ctx, cbpcoord.Config{
+			Address:                    candidate.Address,
+			ServerName:                 candidate.ServerName,
+			InsecureSkipVerify:         insecure,
+			ClientID:                   s.clientID(),
+			IdentityFile:               s.cfg.IdentityFile,
+			IdentityServerURL:          coremain.ProxyProvideIdentityURL(s.cfg.Domain),
+			IdentityToken:              s.cfg.Token,
+			IdentityInsecureSkipVerify: insecure,
+			Timeout:                    dialTimeout,
+		})
+		if err == nil {
+			selected = candidate
+			break
+		}
+		fetchErrs = append(fetchErrs, fmt.Sprintf("%s (%s): %v", candidate.Address, candidate.Role, err))
 	}
+	if selected.Address == "" {
+		return fmt.Errorf("cbp_proxy: NODE_LIST failed on every main-server candidate: %s", strings.Join(fetchErrs, "; "))
+	}
+	if len(fetchErrs) > 0 {
+		s.log.Warn("cbp_proxy: NODE_LIST candidate fallback used",
+			zap.String("tag", s.cfg.Tag), zap.String("selected", selected.Address),
+			zap.String("role", selected.Role), zap.String("failed", strings.Join(fetchErrs, "; ")))
+	}
+
 	table := make(map[string]cbpcoord.Node, len(nodes))
 	for _, node := range nodes {
 		if strings.TrimSpace(node.ID) == "" {
@@ -320,9 +386,18 @@ func (s *tagState) refresh(ctx context.Context, insecure bool) error {
 		return errors.New("cbp_proxy: NODE_LIST contained no usable CBP node ID")
 	}
 
+	fallbacks := make([]SelectedMain, 0, len(ranked)-1)
+	for _, candidate := range ranked {
+		if candidate.Address == selected.Address {
+			continue
+		}
+		fallbacks = append(fallbacks, candidate)
+	}
+
 	s.mu.Lock()
 	s.nodes = table
 	s.coordinator = selected
+	s.coordinatorFallbacks = fallbacks
 	s.refreshedAt = time.Now()
 	s.lastErr = nil
 	s.mu.Unlock()

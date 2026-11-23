@@ -40,3 +40,18 @@ func TestSelectNodeAddressesRequiresTCPAndSkipsClosedPorts(t *testing.T) {
 		}
 	}
 }
+
+func TestRelayChoicesPrefersMainAfterNodeRelay(t *testing.T) {
+	primary := SelectedMain{ID: "edge-sg", Role: "relay", Address: "43.128.119.39:8443", RTT: 3 * time.Millisecond}
+	fallbacks := []SelectedMain{
+		{ID: "edge-ph", Role: "relay", Address: "82.41.237.60:8443", RTT: 30 * time.Millisecond},
+		{ID: "main", Role: "main", Address: "103.49.60.205:9443", RTT: 40 * time.Millisecond},
+	}
+	got := relayChoices(primary, fallbacks)
+	if len(got) != 3 {
+		t.Fatalf("choices = %+v", got)
+	}
+	if got[0].Address != primary.Address || got[1].Address != "103.49.60.205:9443" || got[2].Address != "82.41.237.60:8443" {
+		t.Fatalf("choices = %+v", got)
+	}
+}

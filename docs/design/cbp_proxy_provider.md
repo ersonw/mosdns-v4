@@ -1002,8 +1002,39 @@ mosdns 客户端的对齐结果：
 
 对照 `/Users/macos/customBrowserServer` 当前工作区的 CBP 实现，mosdns-v4 客户端做了三处对齐：
 
-1. **`control_addresses` 权威化**：节点目录 `internal/edge/directory.go` 和多地址文档明确要求客户端探测 `control_addresses`，legacy `endpoint`/`tcp_endpoint`/`lan_tcp_endpoint` 只作 fallback，`public_addr` 只作展示。客户端的 `nodeControlAddresses` 已改为：`control_addresses` 非空时只使用该列表；为空时才回退 legacy 字段，最后才用 `public_addr`。这样 HK 这类只发布公网控制地址的 relay-only 节点不会再先拨一个服务端未发布的 LAN/旧地址。
+1. **`control_addresses` 权威化**：节点目录 `internal/edge/directory.go` 和多地址文档明确要求客户端探测 `control_addresses`，legacy `endpoint`/`tcp_endpoint`/`lan_tcp_endpoint` 只作 fallback，`public_addr` 只作展示。客户端的 `nodeControlAddresses` 已改为：`control_addresses` 非空时只使用该列表；为空时才回退 legacy 字段；`public_addr` 只作展示，任何情况下都不拨号。这样 HK 这类只发布公网控制地址的 relay-only 节点不会再先拨一个服务端未发布的 LAN/旧地址。
 2. **`SESSION_READY.data_addresses`**：服务端 `internal/cbp/protocol.go` 新增该字段；客户端 `pkg/cbp.SessionReady` 已同步，`pkg/cbpstream` 解析时不会丢弃。mosdns 走 TCP control stream，不建立 QUIC data 会话，因此该字段只做协议对齐，不参与选路。
 3. **relay-only 节点的直连失败语义**：服务端 `internal/cbpserver/server.go` 的 `acceptControl()` 在 TLS 握手前调用 `allowControlSource()`；节点挂了 coordinator 后，非 `CoordinatorRelaySources` 来源会被直接 `conn.Close()`，客户端表现为 `control TLS: EOF`。这不是证书/ALPN 问题，客户端也不应绕过。现有逻辑在直连候选全部失败后回退 coordinator relay 是正确的；本次只去掉不可信的 legacy 直连地址，减少无意义尝试，不改变 relay 回退路径。
 
 本地验证：`go test ./plugin/executable/cbp_proxy ./pkg/cbp ./pkg/cbpstream` 通过；`go test ./...` 中仅 `plugin/executable/ocserv_ctl` 的 `TestMarksQueryForRemoteIP` 在整包并行运行时偶发失败，单独重跑通过，与本次 CBP 改动无关。
+
+
+---
+
+## 23. 主服务端 nearest-relay 候选对齐与本地实测（2026-11-23）
+
+对照服务端当前工作区的 `internal/coord/tcp.go`、`internal/httpapi/network_candidates.go`、`internal/cbpserver/server.go` 和 `docs/CBP.md`，主服务端已把每个已授权节点的 `control_addresses` 作为 `server.candidates` 的 `role=relay` 条目推送给客户端；节点 TCP 端口现在是从节点到主服务端的 TCP forwarder，不再是 CBP control endpoint。客户端连接该端口时：
+
+- NODE_LIST 仍使用 `cbp-coord/1`，由节点把 TLS 字节原样转发到主服务端；
+- CBP 会话使用 `cbp-relay/1`，由主服务端做节点级 relay；
+- 直接使用 `cbp-control/2` 拨节点会失败（节点在 TLS 前按准入规则拒绝，或返回 `ERROR relay_auth_failed`）。
+
+mosdns-v4 因此调整为：
+
+1. **relay 优先**：`NewProxyDialer` 先按 `relayChoices` 尝试最低 RTT 候选；node relay 失败时优先尝试 `role=main` 的主服务端，再尝试其余候选。只有所有 relay 都失败后，才对旧版 standalone 节点尝试 legacy 直连。
+2. **NODE_LIST 候选回退**：`RankMainCandidates` 返回全部可达候选；`refresh` 逐个用 NODE_LIST 验证，选择第一个认证成功的候选，并保存其余候选作为 relay fallback。这样某个节点 forwarder 未启用时，不会把整个出口拖死。
+3. **不再拨 `public_addr`**：节点上报的 `public_addr` 只展示，不作为控制地址；当前线上 NODE_LIST 仍带有 control/data 字段，但客户端只把它们当兼容 fallback，正常情况下走 relay。
+4. 保留 `SESSION_READY.data_addresses` 对齐；mosdns 走 TCP control stream，不建立 QUIC data 会话。
+
+本地实测（使用线上真实 bootstrap、NODE_LIST、节点 AUTH token 和已有客户端身份，未改线上）：
+
+- `direct-node` 拨 SG `43.128.119.39:8443`：失败，节点在 HELLO 阶段返回错误，说明节点直连 control 不可用。
+- `relay-main` 拨主服务端 `11.10.10.13:9443`：`HTTP/1.1 200 OK`。
+- `relay-node-forward` 拨 SG `43.128.119.39:8443`：`control TLS: EOF`，说明该节点 forwarder 目前未启用。
+- 完整 `Manager` 路径：SG relay 的 NODE_LIST 失败后自动回退主服务端，`NewProxyDialer("...:edge-vyos-sg1")` 成功，`ipinfo.io` 返回 `"ip": "43.128.119.39"`、`"country": "SG"`，即仍从 SG 节点出口。
+- 同一 relay 路径实测 PH1 出口 `66.253.10.209`（PH）、PH2 `82.41.237.60`（PH）；HK 对 `example.com` 和 `www.google.com` 返回 200，说明 HK 节点数据面正常。HK 对 `ipinfo.io` 单站点返回空响应，属目标站点差异，不是客户端协议问题。
+- `go test ./plugin/executable/cbp_proxy ./pkg/cbpstream ./pkg/cbpcoord` 通过；`go test ./...` 仍只有 `plugin/executable/ocserv_ctl` 的 `TestMarksQueryForRemoteIP` 整包并行偶发失败，单独重跑通过。
+
+结论：当前线上 SG relay forwarder 尚未启用，不能无条件信任 lowest-RTT relay；已加入主服务端优先回退和 NODE_LIST 候选验证。线上二进制和配置本轮均未替换。
+
+注意：本地实测复用了线上 `cbp_aa2` 的客户端身份和节点 token，日志会出现 `session ... superseded ... (relay reconnect)`；这是同一 client_id 新建会话导致的正常替换，线上客户端会自动重连，不是配置或二进制被改动。

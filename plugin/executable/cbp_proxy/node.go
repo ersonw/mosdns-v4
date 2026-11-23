@@ -8,16 +8,16 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/cbpcoord"
 )
 
-// nodeControlAddresses derives the CBP node's TCP control endpoints. These
-// are node endpoints from NODE_LIST, not main-server candidates.
+// nodeControlAddresses derives legacy CBP node TCP control endpoints from
+// NODE_LIST. The current server uses node TCP ports as coordinator relay
+// forwarders instead, so NewProxyDialer tries relay first and only falls back
+// here for an older standalone node.
 //
-// The server's control_addresses list is authoritative: it already carries
-// every NIC/public control endpoint and is validated as IP:port. Only nodes
-// from an older coordinator fall back to public_tcp_endpoint, tcp_endpoint,
-// lan_tcp_endpoint and finally public_addr. public_addr is display metadata
-// derived from an observed NAT address, so it must never be preferred over
-// the published control endpoints. Order is only a stable tie-break; the
-// dial path probes all entries and selects by latency.
+// control_addresses, when present, is the only accepted legacy list; nodes
+// from an older coordinator fall back to public_tcp_endpoint, tcp_endpoint
+// and lan_tcp_endpoint. public_addr is display metadata derived from an
+// observed NAT address; it is never dialed. Order is only a stable tie-break;
+// the dial path probes all entries and selects by latency.
 func nodeControlAddresses(node cbpcoord.Node) []string {
 	port := endpointPort(node.PublicTCPEndpoint)
 	if port == "" {
@@ -44,14 +44,7 @@ func nodeControlAddresses(node cbpcoord.Node) []string {
 		}
 	}
 
-	raw := addAll(node.PublicTCPEndpoint, node.TCPEndpoint, node.LANTCPEndpoint)
-	if got := normalizeNodeAddresses(raw); len(got) > 0 {
-		return got
-	}
-	if node.PublicAddr != "" {
-		return normalizeNodeAddresses([]string{withNodePort(node.PublicAddr, port)})
-	}
-	return nil
+	return normalizeNodeAddresses(addAll(node.PublicTCPEndpoint, node.TCPEndpoint, node.LANTCPEndpoint))
 }
 
 // withNodePort turns a bare IP/host from the main-server address list into a

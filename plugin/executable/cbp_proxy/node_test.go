@@ -33,15 +33,14 @@ func TestNodeControlAddressesPreferPublicTCP(t *testing.T) {
 	}
 }
 
-func TestNodeControlAddressesUsePublicAddrPlusTCPPort(t *testing.T) {
+func TestNodeControlAddressesNeverDialDisplayPublicAddr(t *testing.T) {
 	node := cbpcoord.Node{
 		ID:          "edge-sg-1",
 		PublicAddr:  "203.0.113.10",
 		TCPEndpoint: "tls://0.0.0.0:8443",
 	}
-	got := nodeControlAddresses(node)
-	if len(got) != 1 || got[0] != "203.0.113.10:8443" {
-		t.Fatalf("addresses = %+v", got)
+	if got := nodeControlAddresses(node); len(got) != 0 {
+		t.Fatalf("display public_addr must not be dialed: %+v", got)
 	}
 }
 
