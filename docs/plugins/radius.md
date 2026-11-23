@@ -21,6 +21,8 @@ plugin's SQLite database, independent of ocserv's `ocpasswd`.
 | `ocserv_config` | `ocserv.conf` path; `ipv4-network` is used as the automatic address pool. |
 | `ip_pool` | Manual pool override (`CIDR` or `start-end`); takes priority over `ocserv_config`. |
 | `timezone` | Display timezone for accounts and sessions, default `Asia/Shanghai`. |
+| `require_vhost` | Off by default: one account table shared by every vhost. When `true`, an account only authenticates from the vhost (NAS-Identifier) assigned to it. |
+| `auth_log_max` | Row cap for `radius_auth_log`, default `20000`; `0` keeps the table unbounded. |
 
 ## Authentication
 
@@ -34,6 +36,45 @@ written.
 When `ocserv_config` or `ip_pool` defines a pool, new accounts automatically
 receive a fixed address from the high end of the pool. The ocserv tun/server
 address is reserved and cannot be assigned.
+
+## What is stored
+
+Everything ocserv sends along with a request is persisted except the password,
+which only exists for the duration of the check:
+
+| Source attribute | Column | Where |
+|---|---|---|
+| `Calling-Station-Id(31)` | `client_ip` | `radius_sessions`, `radius_auth_log` |
+| `NAS-Identifier(32)` | `nas_identifier` | `radius_sessions`, `radius_auth_log` |
+| `Connect-Info(77)` | `user_agent` | `radius_sessions`, `radius_auth_log` |
+| `Acct-Session-Id(44)` | `session_id` | `radius_auth_log` |
+| `NAS-Port(5)`, `Service-Type(6)`, `NAS-Port-Type(61)` | `nas_port`, `service_type`, `nas_port_type` | `radius_auth_log` |
+
+`radius_sessions.remote_ip` stays the UDP source of the request, i.e. the NAS
+itself, so `client_ip` is the address the user actually connected from.
+
+`radius_auth_log` records every `Access-Request` outcome, accepted or rejected,
+with the reason string the plugin answered (`invalid credentials`,
+`vhost mismatch`, `missing user-password`, ...). It is pruned after each insert
+to stay within `auth_log_max` rows.
+
+## Vhost isolation
+
+By default the plugin keeps a single account table: any account authenticates
+from any vhost, which is how it behaved before. With `require_vhost: true`,
+`handleAccess` additionally requires:
+
+1. the request carries `NAS-Identifier(32)` — ocserv only sends it when that
+   vhost's auth string sets `nas-identifier=`, e.g.
+   `auth = "radius[config=...,nas-identifier=ph-vpn1.dyize.com]"`;
+2. the account's `vhost` equals that value (case-insensitive, `-` clears it via
+   `/user vhost <name> -`).
+
+A request without `NAS-Identifier` is rejected with
+`vhost required: set nas-identifier in the ocserv vhost auth line`; an account
+with an empty `vhost` cannot log in at all while isolation is on. Switching the
+switch does not touch existing accounts, so enabling it on a live database also
+requires assigning each account a vhost first.
 
 ## Accounting and quotas
 
@@ -60,8 +101,9 @@ being bound to two accounts. `radius_sessions` stores per-session counters and
 ## Admin interface
 
 `Admin` exposes `Users`, `AddUser`, `DeleteUser`, `SetPassword`, `SetEnabled`,
-`SetIP`, `Sessions`, `SetQuota` and `ResetQuota`, plus `SetGroup`. The
-`telegram_bot` `/user` command uses these methods.
+`SetIP`, `SetVhost`, `Sessions`, `SetQuota` and `ResetQuota`, plus `SetGroup`.
+The `telegram_bot` `/user` command uses these methods; the vhost is set with
+`/user vhost <name> <vhost|->`.
 
 `Exec` is a pass-through; the plugin does not sit in the DNS chain. It is
 discovered through `GetExecutables()` by the bot.
@@ -77,6 +119,8 @@ discovered through `GetExecutables()` by the bot.
     ocserv_config: /run/ocserv/ocserv.conf
     # ip_pool: "10.9.0.2-10.9.0.254"
     timezone: Asia/Shanghai
+    # require_vhost: true     # default false: one shared account table
+    # auth_log_max: 20000     # audit rows kept, 0 = unbounded
 ```
 
 ocserv side:

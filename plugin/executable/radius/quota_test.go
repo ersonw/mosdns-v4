@@ -27,12 +27,12 @@ func TestQuotaAccountingIsIdempotent(t *testing.T) {
 		{acctStatusStop, 100, 100},
 	}
 	for _, step := range steps {
-		if _, err := st.applyAccounting("sess-1", "alice", "192.0.2.10", step.status, step.in, step.out); err != nil {
+		if _, err := st.applyAccounting("sess-1", "alice", "192.0.2.10", sessionMeta{}, step.status, step.in, step.out); err != nil {
 			t.Fatalf("accounting %+v: %v", step, err)
 		}
 	}
 	// A duplicated stop record must not add the same bytes twice.
-	if _, err := st.applyAccounting("sess-1", "alice", "192.0.2.10", acctStatusStop, 100, 100); err != nil {
+	if _, err := st.applyAccounting("sess-1", "alice", "192.0.2.10", sessionMeta{}, acctStatusStop, 100, 100); err != nil {
 		t.Fatalf("duplicate stop: %v", err)
 	}
 

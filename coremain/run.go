@@ -228,11 +228,13 @@ func mergeInclude(cfg *Config, depth int, paths, absPaths []string) error {
 		}
 
 		includedCfg.DataProviders = append(includedCfg.DataProviders, subCfg.DataProviders...)
+		includedCfg.ProxyProvides = append(includedCfg.ProxyProvides, subCfg.ProxyProvides...)
 		includedCfg.Plugins = append(includedCfg.Plugins, subCfg.Plugins...)
 		includedCfg.Servers = append(includedCfg.Servers, subCfg.Servers...)
 	}
 
 	cfg.DataProviders = append(includedCfg.DataProviders, cfg.DataProviders...)
+	cfg.ProxyProvides = append(includedCfg.ProxyProvides, cfg.ProxyProvides...)
 	cfg.Plugins = append(includedCfg.Plugins, cfg.Plugins...)
 	cfg.Servers = append(includedCfg.Servers, cfg.Servers...)
 	return nil

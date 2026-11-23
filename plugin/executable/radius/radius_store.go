@@ -20,6 +20,11 @@ const (
 	pbkdf2KeyLen     = 32
 	userTableName    = "radius_users"
 	sessionTableName = "radius_sessions"
+	authLogTableName = "radius_auth_log"
+
+	// defaultAuthLogMax bounds the audit table on a router with a small disk.
+	// Every Access-Request is recorded, so without a cap it grows forever.
+	defaultAuthLogMax = 20000
 )
 
 // errUserExists is returned by AddUser when the name is already taken.
@@ -34,10 +39,13 @@ var errInvalidIP = errors.New("radius: invalid ipv4 address")
 
 // userRow is one account, as stored and as handed to the admin surface.
 type userRow struct {
-	Name      string
-	Password  string // the stored hash, never the plaintext
-	Group     string
-	IP        string // fixed tunnel address, empty means "from the pool"
+	Name     string
+	Password string // the stored hash, never the plaintext
+	Group    string
+	IP       string // fixed tunnel address, empty means "from the pool"
+	// Vhost is the NAS-Identifier this account may authenticate from when the
+	// plugin runs with require_vhost. Empty means "any vhost".
+	Vhost     string
 	Enabled   bool
 	CreatedAt int64
 	UpdatedAt int64
@@ -56,11 +64,16 @@ type sessionRow struct {
 	SessionID string
 	Name      string
 	RemoteIP  string
-	StartedAt int64
-	UpdatedAt int64
-	EndedAt   int64
-	InOctets  int64
-	OutOctets int64
+	// ClientIP is the Calling-Station-Id ocserv reported, i.e. the address the
+	// user actually connected from. RemoteIP is the NAS that sent the record.
+	ClientIP      string
+	NASIdentifier string
+	UserAgent     string
+	StartedAt     int64
+	UpdatedAt     int64
+	EndedAt       int64
+	InOctets      int64
+	OutOctets     int64
 	// CountedIn/CountedOut is how much of this session already went into the
 	// user quota counters. It makes repeated interim/stop records idempotent.
 	CountedIn  int64
@@ -68,8 +81,36 @@ type sessionRow struct {
 	Active     bool
 }
 
+// sessionMeta is the per-request context ocserv sends alongside the accounting
+// counters. It is stored with the session so a record can be traced back to the
+// device and the server that produced it.
+type sessionMeta struct {
+	ClientIP      string // Calling-Station-Id
+	NASIdentifier string // NAS-Identifier, if the vhost configures one
+	UserAgent     string // Connect-Info
+}
+
+// authLogRow is one Access-Request outcome. Passwords are deliberately absent:
+// they only live in memory for the duration of the check.
+type authLogRow struct {
+	Name       string
+	Result     string // accept | reject
+	Reason     string
+	ClientIP   string
+	NASIP      string
+	NASID      string
+	UserAgent  string
+	SessionID  string
+	NASPort    uint32
+	Service    uint32
+	NASPortTyp uint32
+	At         int64
+}
+
 type store struct {
 	db *sql.DB
+	// authLogMax keeps the audit table bounded; 0 disables pruning.
+	authLogMax int
 }
 
 func openStore(path string) (*store, error) {
@@ -84,7 +125,7 @@ func openStore(path string) (*store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("radius: ping database: %w", err)
 	}
-	s := &store{db: db}
+	s := &store{db: db, authLogMax: defaultAuthLogMax}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -122,8 +163,25 @@ func (s *store) migrate() error {
 			counted_out INTEGER NOT NULL DEFAULT 0,
 			active INTEGER NOT NULL DEFAULT 1
 		)`, sessionTableName),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL DEFAULT '',
+			result TEXT NOT NULL DEFAULT '',
+			reason TEXT NOT NULL DEFAULT '',
+			client_ip TEXT NOT NULL DEFAULT '',
+			nas_ip TEXT NOT NULL DEFAULT '',
+			nas_identifier TEXT NOT NULL DEFAULT '',
+			user_agent TEXT NOT NULL DEFAULT '',
+			session_id TEXT NOT NULL DEFAULT '',
+			nas_port INTEGER NOT NULL DEFAULT 0,
+			service_type INTEGER NOT NULL DEFAULT 0,
+			nas_port_type INTEGER NOT NULL DEFAULT 0,
+			at INTEGER NOT NULL DEFAULT 0
+		)`, authLogTableName),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_name ON %s (name)`, sessionTableName, sessionTableName),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_active ON %s (active, updated_at)`, sessionTableName, sessionTableName),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_at ON %s (at)`, authLogTableName, authLogTableName),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS idx_%s_name_at ON %s (name, at)`, authLogTableName, authLogTableName),
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
@@ -155,6 +213,7 @@ func (s *store) migrate() error {
 		{"reset_period", "INTEGER NOT NULL DEFAULT 0"},
 		{"period_start", "INTEGER NOT NULL DEFAULT 0"},
 		{"quota_disabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"vhost", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, c := range extraUserColumns {
 		has, err := s.hasColumn(userTableName, c.name)
@@ -175,6 +234,9 @@ func (s *store) migrate() error {
 	}{
 		{"counted_in", "INTEGER NOT NULL DEFAULT 0"},
 		{"counted_out", "INTEGER NOT NULL DEFAULT 0"},
+		{"client_ip", "TEXT NOT NULL DEFAULT ''"},
+		{"nas_identifier", "TEXT NOT NULL DEFAULT ''"},
+		{"user_agent", "TEXT NOT NULL DEFAULT ''"},
 	}
 	for _, c := range extraSessionColumns {
 		has, err := s.hasColumn(sessionTableName, c.name)
@@ -297,9 +359,9 @@ func (s *store) getUser(name string) (userRow, bool, error) {
 	var u userRow
 	var enabled, quotaDisabled int
 	err := s.db.QueryRow(fmt.Sprintf(
-		"SELECT name, password, group_name, ip, enabled, created_at, updated_at, used_in, used_out, max_total, reset_period, period_start, quota_disabled FROM %s WHERE name = ?",
+		"SELECT name, password, group_name, ip, vhost, enabled, created_at, updated_at, used_in, used_out, max_total, reset_period, period_start, quota_disabled FROM %s WHERE name = ?",
 		userTableName), name).
-		Scan(&u.Name, &u.Password, &u.Group, &u.IP, &enabled, &u.CreatedAt, &u.UpdatedAt,
+		Scan(&u.Name, &u.Password, &u.Group, &u.IP, &u.Vhost, &enabled, &u.CreatedAt, &u.UpdatedAt,
 			&u.UsedIn, &u.UsedOut, &u.MaxTotal, &u.ResetPeriod, &u.PeriodStart, &quotaDisabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return userRow{}, false, nil
@@ -340,6 +402,19 @@ func (s *store) addUserWithIP(name, password, group, ip string) error {
 		return fmt.Errorf("radius: add user: %w", err)
 	}
 	return nil
+}
+
+// setVhost records which NAS-Identifier an account may authenticate from. An
+// empty value means "any vhost" and is only honoured while require_vhost is off.
+func (s *store) setVhost(name, vhost string) (bool, error) {
+	res, err := s.db.Exec(fmt.Sprintf(
+		"UPDATE %s SET vhost = ?, updated_at = ? WHERE name = ?", userTableName),
+		vhost, time.Now().Unix(), name)
+	if err != nil {
+		return false, fmt.Errorf("radius: set vhost: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *store) deleteUser(name string) (bool, error) {
@@ -433,7 +508,7 @@ func (s *store) ipOwner(ip string) (string, bool, error) {
 
 func (s *store) listUsers() ([]userRow, error) {
 	rows, err := s.db.Query(fmt.Sprintf(
-		"SELECT name, password, group_name, ip, enabled, created_at, updated_at, used_in, used_out, max_total, reset_period, period_start, quota_disabled FROM %s ORDER BY name", userTableName))
+		"SELECT name, password, group_name, ip, vhost, enabled, created_at, updated_at, used_in, used_out, max_total, reset_period, period_start, quota_disabled FROM %s ORDER BY name", userTableName))
 	if err != nil {
 		return nil, fmt.Errorf("radius: list users: %w", err)
 	}
@@ -442,7 +517,7 @@ func (s *store) listUsers() ([]userRow, error) {
 	for rows.Next() {
 		var u userRow
 		var enabled, quotaDisabled int
-		if err := rows.Scan(&u.Name, &u.Password, &u.Group, &u.IP, &enabled, &u.CreatedAt, &u.UpdatedAt,
+		if err := rows.Scan(&u.Name, &u.Password, &u.Group, &u.IP, &u.Vhost, &enabled, &u.CreatedAt, &u.UpdatedAt,
 			&u.UsedIn, &u.UsedOut, &u.MaxTotal, &u.ResetPeriod, &u.PeriodStart, &u.QuotaDisabled); err != nil {
 			return nil, fmt.Errorf("radius: scan user: %w", err)
 		}
@@ -453,8 +528,10 @@ func (s *store) listUsers() ([]userRow, error) {
 	return out, rows.Err()
 }
 
-// applyAccounting folds one Accounting-Request into the session table.
-func (s *store) applyAccounting(sessionID, name, remoteIP string, status uint32, inOctets, outOctets int64) (bool, error) {
+// applyAccounting folds one Accounting-Request into the session table. meta
+// carries the context ocserv sends with it (client address, NAS identifier,
+// user agent); remoteIP is the NAS that delivered the request.
+func (s *store) applyAccounting(sessionID, name, remoteIP string, meta sessionMeta, status uint32, inOctets, outOctets int64) (bool, error) {
 	if sessionID == "" {
 		return false, nil // nothing to key on; ocserv always sends one
 	}
@@ -465,35 +542,44 @@ func (s *store) applyAccounting(sessionID, name, remoteIP string, status uint32,
 	switch status {
 	case acctStatusStart, acctStatusStart2:
 		_, err := s.db.Exec(fmt.Sprintf(
-			`INSERT INTO %s (session_id, name, remote_ip, started_at, updated_at, ended_at, input_octets, output_octets, active)
-			 VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1)
+			`INSERT INTO %s (session_id, name, remote_ip, client_ip, nas_identifier, user_agent, started_at, updated_at, ended_at, input_octets, output_octets, active)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1)
 			 ON CONFLICT(session_id) DO UPDATE SET
 			   name = excluded.name, remote_ip = excluded.remote_ip,
+			   client_ip = excluded.client_ip, nas_identifier = excluded.nas_identifier,
+			   user_agent = excluded.user_agent,
 			   updated_at = excluded.updated_at, input_octets = excluded.input_octets,
 			   output_octets = excluded.output_octets, active = 1, ended_at = 0`,
-			sessionTableName), sessionID, name, remoteIP, now, now, inOctets, outOctets)
+			sessionTableName), sessionID, name, remoteIP, meta.ClientIP, meta.NASIdentifier, meta.UserAgent,
+			now, now, inOctets, outOctets)
 		if err != nil {
 			return false, wrapAcct(err)
 		}
 	case acctStatusInterim, acctStatusAlive:
 		_, err := s.db.Exec(fmt.Sprintf(
-			`INSERT INTO %s (session_id, name, remote_ip, started_at, updated_at, input_octets, output_octets, active)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+			`INSERT INTO %s (session_id, name, remote_ip, client_ip, nas_identifier, user_agent, started_at, updated_at, input_octets, output_octets, active)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 			 ON CONFLICT(session_id) DO UPDATE SET
 			   updated_at = excluded.updated_at, input_octets = excluded.input_octets,
-			   output_octets = excluded.output_octets, active = 1`,
-			sessionTableName), sessionID, name, remoteIP, now, now, inOctets, outOctets)
+			   output_octets = excluded.output_octets, active = 1,
+			   client_ip = excluded.client_ip, nas_identifier = excluded.nas_identifier,
+			   user_agent = excluded.user_agent`,
+			sessionTableName), sessionID, name, remoteIP, meta.ClientIP, meta.NASIdentifier, meta.UserAgent,
+			now, now, inOctets, outOctets)
 		if err != nil {
 			return false, wrapAcct(err)
 		}
 	case acctStatusStop:
 		_, err := s.db.Exec(fmt.Sprintf(
-			`INSERT INTO %s (session_id, name, remote_ip, started_at, updated_at, ended_at, input_octets, output_octets, active)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+			`INSERT INTO %s (session_id, name, remote_ip, client_ip, nas_identifier, user_agent, started_at, updated_at, ended_at, input_octets, output_octets, active)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
 			 ON CONFLICT(session_id) DO UPDATE SET
 			   updated_at = excluded.updated_at, ended_at = excluded.ended_at,
-			   input_octets = excluded.input_octets, output_octets = excluded.output_octets, active = 0`,
-			sessionTableName), sessionID, name, remoteIP, now, now, now, inOctets, outOctets)
+			   input_octets = excluded.input_octets, output_octets = excluded.output_octets, active = 0,
+			   client_ip = excluded.client_ip, nas_identifier = excluded.nas_identifier,
+			   user_agent = excluded.user_agent`,
+			sessionTableName), sessionID, name, remoteIP, meta.ClientIP, meta.NASIdentifier, meta.UserAgent,
+			now, now, now, inOctets, outOctets)
 		if err != nil {
 			return false, wrapAcct(err)
 		}
@@ -504,6 +590,68 @@ func (s *store) applyAccounting(sessionID, name, remoteIP string, status uint32,
 		return false, err
 	}
 	return s.enforceQuota(name, now)
+}
+
+// setAuthLogMax caps the audit table. 0 leaves it unbounded.
+func (s *store) setAuthLogMax(n int) {
+	if n < 0 {
+		n = 0
+	}
+	s.authLogMax = n
+}
+
+// recordAuth appends one Access-Request outcome. The password is not part of the
+// record: it exists only for the duration of the check. Pruning runs on every
+// insert so the audit table cannot grow past authLogMax rows.
+func (s *store) recordAuth(row authLogRow) error {
+	if row.At == 0 {
+		row.At = time.Now().Unix()
+	}
+	if _, err := s.db.Exec(fmt.Sprintf(
+		`INSERT INTO %s (name, result, reason, client_ip, nas_ip, nas_identifier, user_agent,
+			session_id, nas_port, service_type, nas_port_type, at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		authLogTableName),
+		row.Name, row.Result, row.Reason, row.ClientIP, row.NASIP, row.NASID, row.UserAgent,
+		row.SessionID, int64(row.NASPort), int64(row.Service), int64(row.NASPortTyp), row.At); err != nil {
+		return fmt.Errorf("radius: record auth: %w", err)
+	}
+	if s.authLogMax <= 0 {
+		return nil
+	}
+	if _, err := s.db.Exec(fmt.Sprintf(
+		"DELETE FROM %s WHERE id IN (SELECT id FROM %s ORDER BY id DESC LIMIT -1 OFFSET %d)",
+		authLogTableName, authLogTableName, s.authLogMax)); err != nil {
+		return fmt.Errorf("radius: prune auth log: %w", err)
+	}
+	return nil
+}
+
+// listAuthLog returns the newest records first.
+func (s *store) listAuthLog(limit int) ([]authLogRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(fmt.Sprintf(
+		`SELECT name, result, reason, client_ip, nas_ip, nas_identifier, user_agent,
+			session_id, nas_port, service_type, nas_port_type, at FROM %s ORDER BY id DESC LIMIT %d`,
+		authLogTableName, limit))
+	if err != nil {
+		return nil, fmt.Errorf("radius: list auth log: %w", err)
+	}
+	defer rows.Close()
+	var out []authLogRow
+	for rows.Next() {
+		var r authLogRow
+		var nasPort, service, portType int64
+		if err := rows.Scan(&r.Name, &r.Result, &r.Reason, &r.ClientIP, &r.NASIP, &r.NASID,
+			&r.UserAgent, &r.SessionID, &nasPort, &service, &portType, &r.At); err != nil {
+			return nil, fmt.Errorf("radius: scan auth log: %w", err)
+		}
+		r.NASPort, r.Service, r.NASPortTyp = uint32(nasPort), uint32(service), uint32(portType)
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // settleSession adds only the bytes this session has not yet contributed to
@@ -730,7 +878,7 @@ func (s *store) listSessions(activeOnly bool, limit int) ([]sessionRow, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-	q := fmt.Sprintf("SELECT session_id, name, remote_ip, started_at, updated_at, ended_at, input_octets, output_octets, counted_in, counted_out, active FROM %s", sessionTableName)
+	q := fmt.Sprintf("SELECT session_id, name, remote_ip, client_ip, nas_identifier, user_agent, started_at, updated_at, ended_at, input_octets, output_octets, counted_in, counted_out, active FROM %s", sessionTableName)
 	if activeOnly {
 		q += " WHERE active = 1"
 	}
@@ -744,8 +892,8 @@ func (s *store) listSessions(activeOnly bool, limit int) ([]sessionRow, error) {
 	for rows.Next() {
 		var r sessionRow
 		var active int
-		if err := rows.Scan(&r.SessionID, &r.Name, &r.RemoteIP, &r.StartedAt, &r.UpdatedAt,
-			&r.EndedAt, &r.InOctets, &r.OutOctets, &r.CountedIn, &r.CountedOut, &active); err != nil {
+		if err := rows.Scan(&r.SessionID, &r.Name, &r.RemoteIP, &r.ClientIP, &r.NASIdentifier, &r.UserAgent,
+			&r.StartedAt, &r.UpdatedAt, &r.EndedAt, &r.InOctets, &r.OutOctets, &r.CountedIn, &r.CountedOut, &active); err != nil {
 			return nil, fmt.Errorf("radius: scan session: %w", err)
 		}
 		r.Active = active != 0

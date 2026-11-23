@@ -18,6 +18,7 @@ type stubRadius struct {
 	enabled  [][2]bool
 	groups   [][2]string
 	ips      [][2]string
+	vhosts   [][2]string
 	quotas   [][3]interface{}
 	resets   []string
 }
@@ -56,6 +57,11 @@ func (s *stubRadius) SetGroup(name, group string) (bool, error) {
 
 func (s *stubRadius) SetIP(name, ip string) (bool, error) {
 	s.ips = append(s.ips, [2]string{name, ip})
+	return true, nil
+}
+
+func (s *stubRadius) SetVhost(name, vhost string) (bool, error) {
+	s.vhosts = append(s.vhosts, [2]string{name, vhost})
 	return true, nil
 }
 

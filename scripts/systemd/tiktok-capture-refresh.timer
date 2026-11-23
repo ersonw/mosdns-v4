@@ -1,0 +1,10 @@
+[Unit]
+Description=Monthly refresh of the fakeip_nat TikTok capture prefix list
+
+[Timer]
+OnCalendar=*-*-01 04:17:00
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

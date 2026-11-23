@@ -205,10 +205,39 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 
 	if raw := strings.TrimSpace(cfg.Proxy); raw != "" {
-		d, err := egress.New(raw, cfg.ProxyInsecure)
-		if err != nil {
-			return nil, fmt.Errorf("egress_route: proxy: %w", err)
+		var d egress.Dialer
+		var host string
+
+		// A custom protocol plugin owns the first segment. The rest is
+		// passed through verbatim; no URL parsing happens here, so a node
+		// name such as "edge-sg-1" cannot be mistaken for a port.
+		if pluginTag, params, ok := strings.Cut(raw, ":"); ok && pluginTag != "" {
+			if provider := bp.M().GetProxyProvider(pluginTag); provider != nil {
+				var err error
+				d, host, err = provider.NewProxyDialer(params, cfg.ProxyInsecure)
+				if err != nil {
+					return nil, fmt.Errorf("egress_route: proxy provider %s: %w", pluginTag, err)
+				}
+				if strings.TrimSpace(host) == "" {
+					return nil, fmt.Errorf("egress_route: proxy provider %s returned an empty proxy host", pluginTag)
+				}
+			} else {
+				var err error
+				d, err = egress.New(raw, cfg.ProxyInsecure)
+				if err != nil {
+					return nil, fmt.Errorf("egress_route: proxy: %w", err)
+				}
+				host = proxyHost(raw)
+			}
+		} else {
+			var err error
+			d, err = egress.New(raw, cfg.ProxyInsecure)
+			if err != nil {
+				return nil, fmt.Errorf("egress_route: proxy: %w", err)
+			}
+			host = proxyHost(raw)
 		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
 		probeErr := egress.Probe(ctx, d)
 		cancel()
@@ -218,9 +247,9 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 			return nil, fmt.Errorf("egress_route: proxy %s is not usable: %w", egress.Redact(raw), probeErr)
 		}
 		p.dialer = d
-		p.proxy = proxyHost(raw)
+		p.proxy = host
 		p.L().Info("egress_route: proxy exit ready",
-			zap.String("proxy", egress.Redact(raw)), zap.String("exit", p.decision.String()))
+			zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host), zap.String("exit", p.decision.String()))
 		if cfg.DirectFallback != nil && !*cfg.DirectFallback {
 			if !egress.SetNoDirectFallback(p.dialer) {
 				p.L().Warn("egress_route: direct_fallback is false but this link is a single protocol and never falls back",

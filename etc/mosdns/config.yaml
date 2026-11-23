@@ -659,6 +659,49 @@ servers:
 #   guard_cooldown: 5m         # How long the GOMAXPROCS downshift lasts. Extended, never
 #                              #   cut short, while CPU is still saturated.
 
+# proxy_provides - main-server entries for the CBP proxy provider.
+# This is outbound proxy infrastructure, not DNS data. It is consumed through
+# a plugin instance, normally tagged "cbp_proxy":
+#
+#   plugins:
+#     - tag: cbp_proxy
+#       type: cbp_proxy
+#
+#   - tag: egress_sg
+#     type: egress_route
+#     args:
+#       proxy: "cbp_proxy:cbp_sg:edge-sg-1"
+#
+# The first segment is that plugin instance tag, the second is a
+# proxy_provides tag, and the third is a CBP node ID from NODE_LIST. If it
+# does not match an ID, it is resolved as the node's label; duplicate labels
+# are rejected rather than resolved arbitrarily. The HTTPS API returns
+# main-server TCP candidates only; the CBP node list is fetched separately
+# through that selected main server's TCP coordinator.
+# The built-in api.aa2.dev / api.aa3.dev hosts have an embedded cbak_
+# bootstrap API key and node AUTH credential, so token / node_token may be
+# omitted for them. For other hosts an empty token means no authentication
+# header. A non-desktop API key (cbak_...) is sent only as X-API-Key, never as
+# Authorization; config_dat
+# reads the CBP section from a CustomBrowser config.proto ConfigDocument: portable
+# CBCFG1 can be read directly, runtime CBCFG2 needs config_key_file with the
+# 32-byte CustomBrowser DB key. Explicit YAML fields win over config_dat. The
+# identity file is optional and is created on first coordinator use under
+# <config-dir>/proxy_provides/<tag>.json; an existing file's client_id wins
+# over the root tag. When config_dat is omitted, the default
+# <config-dir>/proxy_provides/<tag>.dat is generated after the first NODE_LIST
+# and rewritten atomically when the node table changes. A config_dat outside
+# <config-dir>/proxy_provides that already exists is treated as read-only.
+# -----------------------------------------------------------------------------
+# proxy_provides:
+#   - tag: cbp_sg                    # required, unique provider name
+#     domain: https://api.example.com # required, HTTPS only
+#     token: ""                      # optional non-desktop API key; built-in hosts use embedded credential
+#     node_token: ""                 # optional; built-in hosts use embedded node credential
+#     # config_dat: /etc/mosdns/proxy_provides/cbp_sg.dat  # optional; generated if missing, kept in sync
+#     # config_key_file: /etc/mosdns/proxy_provides/cbp_sg.key  # CBCFG2 only
+#     # identity_file: /etc/mosdns/proxy_provides/cbp_sg.json  # optional
+
 # data_providers - named files that matchers / hosts / redirect reference.
 # Two file families are supported; the file itself must exist at startup.
 #   * plain text  - one domain / keyword / regexp ("domain ip" for hosts)

@@ -31,7 +31,40 @@ ocserv 打开 `auth = radius` 后发 `Access-Request`（PAP），插件校验用
       # 可选：手动指定池，优先于 ocserv_config；CIDR 或 起始-结束
       # ip_pool: "10.9.0.2-10.9.0.254"
       timezone: Asia/Shanghai           # 展示账号与会话时间用的时区
+      # require_vhost: true             # 默认关闭；开启后认证必须带 vhost（NAS-Identifier）
+      # auth_log_max: 20000             # 审计表保留行数，默认 20000；0 表示不裁剪
 ```
+## 存了什么
+
+ocserv 随请求一起送来的信息，除了只在内存里比对一次的密码之外，全部落库：
+
+| 来源属性 | 列 | 落库位置 |
+|---|---|---|
+| `Calling-Station-Id(31)` | `client_ip` | `radius_sessions`、`radius_auth_log` |
+| `NAS-Identifier(32)` | `nas_identifier` | `radius_sessions`、`radius_auth_log` |
+| `Connect-Info(77)` | `user_agent` | `radius_sessions`、`radius_auth_log` |
+| `Acct-Session-Id(44)` | `session_id` | `radius_auth_log` |
+| `NAS-Port(5)`、`Service-Type(6)`、`NAS-Port-Type(61)` | `nas_port`、`service_type`、`nas_port_type` | `radius_auth_log` |
+
+`radius_sessions.remote_ip` 仍然是请求的 UDP 源地址（也就是 NAS 自己），用户真正的
+接入地址在 `client_ip` 里。`radius_auth_log` 逐条记录每次 `Access-Request` 的结果与
+原因（`invalid credentials`、`vhost mismatch`、`missing user-password` 等），每次写入后
+按 `auth_log_max` 裁剪，表不会无限增长。
+
+## vhost 隔离
+
+默认是单账号表：任何 vhost 都能用同一个账号登录，与改造前行为一致。`require_vhost: true`
+时 `handleAccess` 额外要求：
+
+1. 请求里带 `NAS-Identifier(32)`——ocserv 只有在该 vhost 的 auth 串里写了
+   `nas-identifier=` 才会发，例如
+   `auth = "radius[config=...,nas-identifier=ph-vpn1.dyize.com]"`；
+2. 账号的 `vhost` 与该值相等（大小写不敏感，`/user vhost <name> -` 清除）。
+
+没带 `NAS-Identifier` 的请求会被拒，回 `vhost required: set nas-identifier in the
+ocserv vhost auth line`；开启后 `vhost` 为空的账号一律拒绝登录。开关不会改动已有账号，
+所以对线上库开启前需要先给每个账号分配 vhost。
+
 老库（`radius_users` 还没有 `ip` 列）在插件启动时自动补列，不需要手工迁移；固定 IP 由
 `ip <> ''` 的部分唯一索引约束，同一个地址不能同时绑两个账号。
 ocserv 侧对应（版本不同，段名可能是 `radius server` / `radius secret`，以本机 `ocserv.conf` 注释为准）：

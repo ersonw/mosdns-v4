@@ -3,6 +3,7 @@ package radius
 import (
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,10 @@ type server struct {
 	secret []byte
 	store  *store
 	lg     *zap.Logger
+
+	// requireVhost makes an account usable only from the NAS-Identifier it was
+	// assigned to. Off by default: one shared account table, as before.
+	requireVhost bool
 
 	auth *net.UDPConn
 	acct *net.UDPConn
@@ -135,8 +140,33 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 	}
 
 	name := p.getString(attrUserName)
+
+	// Everything ocserv sends about the request itself is kept: the address the
+	// user came from, the NAS identifier (the only place a vhost name travels),
+	// the client's user agent and the port/service typing.
+	meta := sessionMeta{
+		ClientIP:      p.getString(attrCallingStationID),
+		NASIdentifier: p.getString(attrNASIdentifier),
+		UserAgent:     p.getString(attrConnectInfo),
+	}
+	nasPort, _ := p.getUint32(attrNASPort)
+	serviceType, _ := p.getUint32(attrServiceType)
+	nasPortType, _ := p.getUint32(attrNASPortType)
+	sessionID := p.getString(attrAcctSessionID)
+	audit := func(result, reason string) {
+		if err := s.store.recordAuth(authLogRow{
+			Name: name, Result: result, Reason: reason,
+			ClientIP: meta.ClientIP, NASIP: src.String(), NASID: meta.NASIdentifier,
+			UserAgent: meta.UserAgent, SessionID: sessionID,
+			NASPort: nasPort, Service: serviceType, NASPortTyp: nasPortType,
+		}); err != nil {
+			s.lg.Warn("radius: auth record failed", zap.String("user", name), zap.Error(err))
+		}
+	}
+
 	if name == "" {
 		s.lg.Debug("radius: access request without user-name", zap.String("client", src.String()))
+		audit("reject", "missing user-name")
 		return s.reply(p, withMA, codeAccessReject, "missing user-name", nil)
 	}
 
@@ -145,8 +175,10 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 		if _, hasCHAP := p.get(attrCHAPPassword); hasCHAP {
 			s.lg.Warn("radius: chap rejected, only pap is implemented",
 				zap.String("user", name), zap.String("client", src.String()))
+			audit("reject", "chap unsupported")
 			return s.reply(p, withMA, codeAccessReject, "CHAP/MSCHAPv2 is not supported, use PAP", nil)
 		}
+		audit("reject", "missing user-password")
 		return s.reply(p, withMA, codeAccessReject, "missing user-password", nil)
 	}
 
@@ -163,6 +195,7 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 	u, found, err := s.store.getUser(name)
 	if err != nil {
 		s.lg.Error("radius: user lookup failed", zap.String("user", name), zap.Error(err))
+		audit("reject", "user lookup failed")
 		return s.reply(p, withMA, codeAccessReject, "internal error", nil)
 	}
 	if found {
@@ -176,14 +209,35 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 		if disabled {
 			u, found, err = s.store.getUser(name)
 			if err != nil {
+				audit("reject", "quota check failed")
 				return s.reply(p, withMA, codeAccessReject, "internal error", nil)
 			}
+		}
+	}
+	if found && s.requireVhost {
+		// The vhost name reaches RADIUS only as NAS-Identifier; ocserv sends it
+		// when the vhost's auth string sets nas-identifier=. Without it there is
+		// nothing to match against, so the request cannot be attributed.
+		if meta.NASIdentifier == "" {
+			s.lg.Warn("radius: vhost required but the request carried no nas-identifier",
+				zap.String("user", name), zap.String("client", src.String()))
+			audit("reject", "vhost required but no nas-identifier")
+			return s.reply(p, withMA, codeAccessReject,
+				"vhost required: set nas-identifier in the ocserv vhost auth line", nil)
+		}
+		if u.Vhost == "" || !strings.EqualFold(u.Vhost, meta.NASIdentifier) {
+			s.lg.Warn("radius: vhost mismatch",
+				zap.String("user", name), zap.String("vhost", meta.NASIdentifier),
+				zap.String("account_vhost", u.Vhost), zap.String("client", src.String()))
+			audit("reject", "vhost mismatch")
+			return s.reply(p, withMA, codeAccessReject, "vhost does not match this account", nil)
 		}
 	}
 	if !found || !u.Enabled || !verifyPassword(u.Password, plain) {
 		s.lg.Debug("radius: authentication rejected",
 			zap.String("user", name), zap.String("client", src.String()),
 			zap.Bool("known", found))
+		audit("reject", "invalid credentials")
 		return s.reply(p, withMA, codeAccessReject, "invalid credentials", nil)
 	}
 
@@ -204,7 +258,9 @@ func (s *server) handleAccess(src *net.UDPAddr, raw []byte) []byte {
 	}
 	s.lg.Debug("radius: authentication accepted",
 		zap.String("user", name), zap.String("client", src.String()),
-		zap.String("group", u.Group), zap.String("ip", u.IP))
+		zap.String("group", u.Group), zap.String("ip", u.IP),
+		zap.String("vhost", meta.NASIdentifier), zap.String("station", meta.ClientIP))
+	audit("accept", "")
 	return s.reply(p, withMA, codeAccessAccept, "", extra)
 }
 
@@ -237,7 +293,12 @@ func (s *server) handleAccounting(src *net.UDPAddr, raw []byte) []byte {
 	inTotal := int64(in) + int64(inGiga)<<32
 	outTotal := int64(out) + int64(outGiga)<<32
 
-	disabled, err := s.store.applyAccounting(session, name, src.String(), status, inTotal, outTotal)
+	acctMeta := sessionMeta{
+		ClientIP:      p.getString(attrCallingStationID),
+		NASIdentifier: p.getString(attrNASIdentifier),
+		UserAgent:     p.getString(attrConnectInfo),
+	}
+	disabled, err := s.store.applyAccounting(session, name, src.String(), acctMeta, status, inTotal, outTotal)
 	if err != nil {
 		s.lg.Error("radius: accounting update failed", zap.String("user", name), zap.Error(err))
 	}

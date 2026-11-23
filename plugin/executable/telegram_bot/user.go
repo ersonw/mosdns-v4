@@ -191,6 +191,24 @@ func (p *telegramBot) handleUser(args []string, langs ...lang) string {
 		return l.t(fmt.Sprintf("%s: fixed ip %s", rest[1], rest[2]),
 			fmt.Sprintf("%s：固定 IP %s", rest[1], rest[2]))
 
+	case "vhost":
+		if len(rest) < 3 {
+			return l.t("usage: /user vhost <name> <vhost|->",
+				"用法：/user vhost <name> <vhost|->")
+		}
+		ok, err := adm.SetVhost(rest[1], rest[2])
+		if err != nil {
+			return l.t("vhost change failed: ", "修改 vhost 失败：") + err.Error()
+		}
+		if !ok {
+			return l.t("no such user: "+rest[1], "没有这个用户："+rest[1])
+		}
+		if rest[2] == "-" || rest[2] == "" {
+			return l.t(rest[1]+": vhost cleared", rest[1]+"：已清除 vhost 限制")
+		}
+		return l.t(fmt.Sprintf("%s: vhost %s", rest[1], rest[2]),
+			fmt.Sprintf("%s：vhost %s", rest[1], rest[2]))
+
 	case "limit":
 		if len(rest) < 3 {
 			return l.t("usage: /user limit <name> <max|0|-> [period|0|-]",
@@ -308,6 +326,9 @@ func formatUsers(tag string, users []radius.User, loc *time.Location, langs ...l
 		ip := u.IP
 		if ip == "" {
 			ip = "-"
+		}
+		if u.Vhost != "" {
+			group = group + " vhost=" + u.Vhost
 		}
 		fmt.Fprintf(&b, l.t("%-20s group=%-12s ip=%-15s %s used=%s/%s reset=%s updated %s\n",
 			"%-20s 组=%-12s IP=%-15s %s 已用=%s/%s 重置=%s 更新 %s\n"),

@@ -29,9 +29,13 @@ type Config struct {
 	Log           mlog.LogConfig                     `yaml:"log"`
 	Include       []string                           `yaml:"include"`
 	DataProviders []data_provider.DataProviderConfig `yaml:"data_providers"`
-	Plugins       []PluginConfig                     `yaml:"plugins"`
-	Servers       []ServerConfig                     `yaml:"servers"`
-	API           APIConfig                          `yaml:"api"`
+	// ProxyProvides describes the main-server entries a proxy protocol
+	// plugin can use. It is intentionally independent of data_providers:
+	// this is outbound proxy infrastructure, not DNS data.
+	ProxyProvides []ProxyProvideConfig `yaml:"proxy_provides"`
+	Plugins       []PluginConfig       `yaml:"plugins"`
+	Servers       []ServerConfig       `yaml:"servers"`
+	API           APIConfig            `yaml:"api"`
 
 	// Runtime tunes the Go runtime itself: its thread count, GC target and
 	// memory ceiling. Every field is optional, and an empty block leaves the

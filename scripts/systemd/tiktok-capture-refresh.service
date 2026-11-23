@@ -1,0 +1,8 @@
+[Unit]
+Description=Regenerate the fakeip_nat TikTok capture prefix list
+After=network-online.target mosdns.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/refresh_tiktok_capture.sh

@@ -42,5 +42,8 @@ func LoadConfigFile(dir, path string) (*Config, error) {
 	if err := mergeInclude(cfg, 0, []string{cfg.configPath}, []string{tryGetAbsPath(cfg.configPath)}); err != nil {
 		return nil, fmt.Errorf("failed to load sub config file, %w", err)
 	}
+	if err := cfg.prepareProxyProvides(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }

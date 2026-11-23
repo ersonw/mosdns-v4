@@ -26,6 +26,7 @@ import (
 	"github.com/ersonw/mosdns-v4/mlog"
 	"github.com/ersonw/mosdns-v4/pkg/concurrent_limiter"
 	"github.com/ersonw/mosdns-v4/pkg/data_provider"
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"github.com/ersonw/mosdns-v4/pkg/executable_seq"
 	"github.com/ersonw/mosdns-v4/pkg/ip_observer"
 	"github.com/ersonw/mosdns-v4/pkg/safe_close"
@@ -50,6 +51,11 @@ type Mosdns struct {
 
 	// Data
 	dataManager *data_provider.DataManager
+
+	// Proxy provides are main-server entries from the root config. The
+	// providers are protocol plugins that implement egress.Provider.
+	proxyProvides  []ProxyProvideConfig
+	proxyProviders map[string]egress.Provider
 
 	// Plugins
 	execs    map[string]executable_seq.Executable
@@ -136,20 +142,25 @@ func WaitShutdown(timeout time.Duration) bool {
 }
 
 func RunMosdns(cfg *Config) error {
+	if err := cfg.prepareProxyProvides(); err != nil {
+		return err
+	}
 	lg, err := mlog.NewLogger(&cfg.Log)
 	if err != nil {
 		return err
 	}
 
 	m := &Mosdns{
-		logger:      lg,
-		configDir:   cfg.configDir,
-		dataManager: data_provider.NewDataManager(),
-		execs:       make(map[string]executable_seq.Executable),
-		matchers:    make(map[string]executable_seq.Matcher),
-		httpAPIMux:  http.NewServeMux(),
-		metricsReg:  newMetricsReg(),
-		sc:          safe_close.NewSafeClose(),
+		logger:         lg,
+		configDir:      cfg.configDir,
+		dataManager:    data_provider.NewDataManager(),
+		proxyProvides:  cfg.ProxyProvides,
+		proxyProviders: make(map[string]egress.Provider),
+		execs:          make(map[string]executable_seq.Executable),
+		matchers:       make(map[string]executable_seq.Matcher),
+		httpAPIMux:     http.NewServeMux(),
+		metricsReg:     newMetricsReg(),
+		sc:             safe_close.NewSafeClose(),
 	}
 
 	done := registerActive(m)
@@ -299,12 +310,47 @@ func RunMosdns(cfg *Config) error {
 
 func (m *Mosdns) addPlugin(p Plugin) {
 	t := p.Tag()
+	if provider, ok := p.(egress.Provider); ok {
+		if m.proxyProviders == nil {
+			m.proxyProviders = make(map[string]egress.Provider)
+		}
+		m.proxyProviders[t] = provider
+	}
 	if p, ok := p.(ExecutablePlugin); ok {
 		m.execs[t] = p
 	}
 	if p, ok := p.(MatcherPlugin); ok {
 		m.matchers[p.Tag()] = p
 	}
+}
+
+// GetProxyProvides returns the root proxy_provides entries.
+func (m *Mosdns) GetProxyProvides() []ProxyProvideConfig {
+	if m == nil {
+		return nil
+	}
+	return append([]ProxyProvideConfig(nil), m.proxyProvides...)
+}
+
+// GetProxyProvide returns one root entry by tag.
+func (m *Mosdns) GetProxyProvide(tag string) (ProxyProvideConfig, bool) {
+	if m == nil {
+		return ProxyProvideConfig{}, false
+	}
+	for _, cfg := range m.proxyProvides {
+		if cfg.Tag == tag {
+			return cfg, true
+		}
+	}
+	return ProxyProvideConfig{}, false
+}
+
+// GetProxyProvider returns the protocol plugin registered for egress_route.
+func (m *Mosdns) GetProxyProvider(tag string) egress.Provider {
+	if m == nil {
+		return nil
+	}
+	return m.proxyProviders[tag]
 }
 
 func (m *Mosdns) GetDataManager() *data_provider.DataManager {

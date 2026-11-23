@@ -62,6 +62,14 @@ type Args struct {
 	// surface. Default "Asia/Shanghai"; the database itself always stores
 	// seconds since the epoch.
 	Timezone string `yaml:"timezone"`
+	// RequireVhost makes an account usable only from the vhost it was assigned
+	// to. Off by default: every vhost shares one account table. When on, the
+	// vhost is taken from NAS-Identifier, which ocserv only sends when the
+	// vhost's auth line sets nas-identifier=.
+	RequireVhost bool `yaml:"require_vhost"`
+	// AuthLogMax bounds the audit table (radius_auth_log). Default 20000 rows;
+	// 0 disables pruning and lets the table grow without limit.
+	AuthLogMax int `yaml:"auth_log_max"`
 
 	pool *ipPool
 	loc  *time.Location
@@ -104,6 +112,12 @@ func (a *Args) initDefault() error {
 	if err != nil {
 		return err
 	}
+	if a.AuthLogMax == 0 {
+		a.AuthLogMax = defaultAuthLogMax
+	}
+	if a.AuthLogMax < 0 {
+		a.AuthLogMax = 0 // a negative value means "no pruning"
+	}
 	if _, err := net.ResolveUDPAddr("udp", a.Listen); err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", a.Listen, err)
 	}
@@ -120,6 +134,7 @@ type User struct {
 	Name      string
 	Group     string
 	IP        string // fixed tunnel address, empty means "from the pool"
+	Vhost     string // NAS-Identifier this account is limited to, empty means any
 	Enabled   bool
 	CreatedAt int64
 	UpdatedAt int64
@@ -138,6 +153,9 @@ type Session struct {
 	SessionID string
 	Name      string
 	RemoteIP  string
+	ClientIP  string // Calling-Station-Id: the address the user connected from
+	NASID     string // NAS-Identifier of the vhost that reported it
+	UserAgent string // Connect-Info
 	StartedAt int64
 	UpdatedAt int64
 	EndedAt   int64
@@ -155,6 +173,7 @@ type Admin interface {
 	SetPassword(name, password string) (bool, error)
 	SetEnabled(name string, enabled bool) (bool, error)
 	SetIP(name, ip string) (bool, error)
+	SetVhost(name, vhost string) (bool, error)
 	Sessions(activeOnly bool, limit int) ([]Session, error)
 	SetQuota(name string, maxTotal, resetPeriod int64) (bool, error)
 	ResetQuota(name string) (bool, error)
@@ -187,6 +206,7 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	if err != nil {
 		return nil, err
 	}
+	st.setAuthLogMax(a.AuthLogMax)
 	srv, err := newServer(bp.L(), []byte(a.Secret), st, a.Listen, a.AccountingListen)
 	if err != nil {
 		_ = st.close()
@@ -194,6 +214,10 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 	}
 
 	p := &Plugin{BP: bp, args: a, store: st, srv: srv, pool: a.pool, loc: a.loc, quotaStop: make(chan struct{})}
+	srv.requireVhost = a.RequireVhost
+	if a.RequireVhost {
+		bp.L().Info("radius: vhost isolation is on, accounts must match NAS-Identifier")
+	}
 	srv.start()
 	p.startQuotaLoop()
 	p.attachClose()
@@ -305,7 +329,7 @@ func (p *Plugin) Users() ([]User, error) {
 	out := make([]User, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, User{
-			Name: r.Name, Group: r.Group, IP: r.IP, Enabled: r.Enabled,
+			Name: r.Name, Group: r.Group, IP: r.IP, Vhost: r.Vhost, Enabled: r.Enabled,
 			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 			UsedIn: r.UsedIn, UsedOut: r.UsedOut,
 			MaxTotal: r.MaxTotal, ResetPeriod: r.ResetPeriod,
@@ -393,6 +417,24 @@ func (p *Plugin) SetEnabled(name string, enabled bool) (bool, error) {
 // Framed-IP-Address attribute (8) in the Access-Accept and hands the same
 // address to that user on every login. An empty value (or "-" from the bot)
 // clears the pin and returns the user to the dynamic pool.
+// SetVhost limits an account to one vhost, identified by the NAS-Identifier that
+// vhost's auth line sends. An empty value clears the limit; with require_vhost
+// on, an account without a vhost cannot authenticate anywhere.
+func (p *Plugin) SetVhost(name, vhost string) (bool, error) {
+	name = strings.TrimSpace(name)
+	vhost = strings.TrimSpace(vhost)
+	if name == "" {
+		return false, fmt.Errorf("user name is required")
+	}
+	if vhost == "-" {
+		vhost = ""
+	}
+	if len(vhost) > 64 {
+		return false, fmt.Errorf("vhost is too long (max 64 characters)")
+	}
+	return p.store.setVhost(name, vhost)
+}
+
 func (p *Plugin) SetIP(name, ip string) (bool, error) {
 	normalized, err := normalizeFixedIP(ip)
 	if err != nil {
@@ -462,6 +504,7 @@ func (p *Plugin) Sessions(activeOnly bool, limit int) ([]Session, error) {
 	for _, r := range rows {
 		out = append(out, Session{
 			SessionID: r.SessionID, Name: r.Name, RemoteIP: r.RemoteIP,
+			ClientIP: r.ClientIP, NASID: r.NASIdentifier, UserAgent: r.UserAgent,
 			StartedAt: r.StartedAt, UpdatedAt: r.UpdatedAt, EndedAt: r.EndedAt,
 			In: r.InOctets, Out: r.OutOctets, Active: r.Active,
 		})
