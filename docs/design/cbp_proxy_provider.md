@@ -1091,3 +1091,19 @@ mosdns-v4 因此调整为：
 - 新增 `TestCBPICMPErrorRelaysHopToOneClient`，断言 traceroute 的 quoted UDP 源端口能匹配探测项，回包引用客户端原始 UDP 端口。
 - 新增 `TestBuildUDPProbeIPv4`，校验 IPv4 头校验和、TTL、UDP 端口和长度。
 - 本轮没有连接线上 CBP 节点，也没有替换线上二进制或配置。
+
+## 26. 线上 HK 出口切回 gost（2026-11-23）
+
+按要求把线上 VyOS `192.168.10.1` 的 HK 出口从 CBP 改回 gost，只改 `egress_hk.args.proxy`：
+
+- 改动前：`cbp_proxy:cbp_aa2:edge-vyos-hk1`
+- 改动后：`gost://11.10.10.13:1080`
+- 备份：`/etc/mosdns/config.yaml.bak.20261123T133704Z`
+- `mark`、`nft_table`、`route_table`、`next_hop`、`next_hop_dev` 均未动。
+
+验证：
+
+- `mosdns check-config` 通过，`systemctl restart mosdns` 后服务为 active，`:53` 正常监听。
+- `dig example.com @127.0.0.1` 返回 fakeip `198.18.3.84`；`curl --resolve example.com:443:198.18.3.84` 返回 HTTP 200。
+- `dig ipinfo.io @127.0.0.1` 返回 fakeip `198.18.15.146`；经该 fakeip 请求 `https://ipinfo.io/json` 返回 `103.49.60.205` / Hong Kong，说明 HK 出口已走 gost。
+- `ss -ntp` 显示 mosdns 到 `11.10.10.13:1080` 的 ESTAB 连接，确认实际使用 gost 而非 CBP。
