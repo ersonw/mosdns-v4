@@ -974,7 +974,9 @@ mosdns 客户端的对齐结果：
 2. **延迟优先**。ICMP 有回应时用 ICMP RTT，否则用 TCP connect 时间；按 RTT 升序排列。
 3. **逐个尝试**。TCP 可连接不代表 CBP TLS/AUTH 一定成功，因此按顺序尝试完所有候选，只有全部直连失败才回退主服务端 relay。
 
-`public_addr` 和 `public_tcp_endpoint` 仍然作为兼容地址；它们与 `control_addresses` 去重后合并。
+`control_addresses` 非空时是唯一可信的控制地址集合：服务端已经按真实 IP:port 校验，客户端不再混入 `public_tcp_endpoint`、`tcp_endpoint`、`lan_tcp_endpoint` 或 `public_addr`。只有旧版主服务端不返回 `control_addresses` 时，才按 `public_tcp_endpoint` → `tcp_endpoint` → `lan_tcp_endpoint` 的顺序回退；`public_addr` 只是节点上报给主服务端用于展示的 NAT 观察地址，绝不能优先拨号。
+
+`SESSION_READY` 的 `data_addresses` 是 QUIC 数据面地址列表，mosdns 的 CBP 控制流不直接使用；`pkg/cbp.SessionReady` 保留该字段，避免新旧节点互操作时丢字段。
 
 ---
 
@@ -993,3 +995,15 @@ mosdns 客户端的对齐结果：
 2. HK CBP 经 `198.18.15.146` fakeip 请求 `ipinfo.io`，出口为 `103.49.60.205`（Hong Kong）。
 3. DNS `example.com`、`google.com`、`www.tiktok.com` 均返回 fakeip；HTTPS 经 HK CBP 和 SG gost 均返回 200。
 4. HK CBP 直连 `11.10.10.13:8443` 时 `control TLS: EOF`，客户端按既有逻辑回退主服务端 relay `11.10.10.13:9443`，会话建立成功；运行 2 分钟以上无 `client closed`。
+
+---
+
+## 22. 与服务端最新 CBP 源码对齐（2026-11-23）
+
+对照 `/Users/macos/customBrowserServer` 当前工作区的 CBP 实现，mosdns-v4 客户端做了三处对齐：
+
+1. **`control_addresses` 权威化**：节点目录 `internal/edge/directory.go` 和多地址文档明确要求客户端探测 `control_addresses`，legacy `endpoint`/`tcp_endpoint`/`lan_tcp_endpoint` 只作 fallback，`public_addr` 只作展示。客户端的 `nodeControlAddresses` 已改为：`control_addresses` 非空时只使用该列表；为空时才回退 legacy 字段，最后才用 `public_addr`。这样 HK 这类只发布公网控制地址的 relay-only 节点不会再先拨一个服务端未发布的 LAN/旧地址。
+2. **`SESSION_READY.data_addresses`**：服务端 `internal/cbp/protocol.go` 新增该字段；客户端 `pkg/cbp.SessionReady` 已同步，`pkg/cbpstream` 解析时不会丢弃。mosdns 走 TCP control stream，不建立 QUIC data 会话，因此该字段只做协议对齐，不参与选路。
+3. **relay-only 节点的直连失败语义**：服务端 `internal/cbpserver/server.go` 的 `acceptControl()` 在 TLS 握手前调用 `allowControlSource()`；节点挂了 coordinator 后，非 `CoordinatorRelaySources` 来源会被直接 `conn.Close()`，客户端表现为 `control TLS: EOF`。这不是证书/ALPN 问题，客户端也不应绕过。现有逻辑在直连候选全部失败后回退 coordinator relay 是正确的；本次只去掉不可信的 legacy 直连地址，减少无意义尝试，不改变 relay 回退路径。
+
+本地验证：`go test ./plugin/executable/cbp_proxy ./pkg/cbp ./pkg/cbpstream` 通过；`go test ./...` 中仅 `plugin/executable/ocserv_ctl` 的 `TestMarksQueryForRemoteIP` 在整包并行运行时偶发失败，单独重跑通过，与本次 CBP 改动无关。

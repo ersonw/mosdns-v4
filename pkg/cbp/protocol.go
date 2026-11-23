@@ -288,6 +288,7 @@ type AuthRequest struct {
 type SessionReady struct {
 	SessionID        uint64   `json:"session_id"`
 	DataAddr         string   `json:"data_addr"`
+	DataAddresses    []string `json:"data_addresses,omitempty"`
 	LANDataAddr      string   `json:"lan_data_addr,omitempty"`
 	DataToken        string   `json:"data_token"`
 	TunnelIPv4       string   `json:"tunnel_ipv4,omitempty"`

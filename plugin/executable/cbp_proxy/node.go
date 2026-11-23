@@ -11,31 +11,47 @@ import (
 // nodeControlAddresses derives the CBP node's TCP control endpoints. These
 // are node endpoints from NODE_LIST, not main-server candidates.
 //
-// Order: public TCP endpoint, the main server's control_addresses, public
-// address, direct TCP endpoint, LAN TCP endpoint. Order is only a stable
-// tie-break; the dial path probes all entries and selects by latency.
+// The server's control_addresses list is authoritative: it already carries
+// every NIC/public control endpoint and is validated as IP:port. Only nodes
+// from an older coordinator fall back to public_tcp_endpoint, tcp_endpoint,
+// lan_tcp_endpoint and finally public_addr. public_addr is display metadata
+// derived from an observed NAT address, so it must never be preferred over
+// the published control endpoints. Order is only a stable tie-break; the
+// dial path probes all entries and selects by latency.
 func nodeControlAddresses(node cbpcoord.Node) []string {
-	var raw []string
-	add := func(value string) {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			raw = append(raw, value)
-		}
-	}
 	port := endpointPort(node.PublicTCPEndpoint)
 	if port == "" {
 		port = endpointPort(node.TCPEndpoint)
 	}
-	add(node.PublicTCPEndpoint)
-	for _, value := range node.ControlAddresses {
-		add(withNodePort(value, port))
+	addAll := func(values ...string) []string {
+		raw := make([]string, 0, len(values))
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value != "" {
+				raw = append(raw, value)
+			}
+		}
+		return raw
+	}
+
+	if len(node.ControlAddresses) > 0 {
+		raw := make([]string, 0, len(node.ControlAddresses))
+		for _, value := range node.ControlAddresses {
+			raw = append(raw, withNodePort(value, port))
+		}
+		if got := normalizeNodeAddresses(raw); len(got) > 0 {
+			return got
+		}
+	}
+
+	raw := addAll(node.PublicTCPEndpoint, node.TCPEndpoint, node.LANTCPEndpoint)
+	if got := normalizeNodeAddresses(raw); len(got) > 0 {
+		return got
 	}
 	if node.PublicAddr != "" {
-		add(withNodePort(node.PublicAddr, port))
+		return normalizeNodeAddresses([]string{withNodePort(node.PublicAddr, port)})
 	}
-	add(node.TCPEndpoint)
-	add(node.LANTCPEndpoint)
-	return normalizeNodeAddresses(raw)
+	return nil
 }
 
 // withNodePort turns a bare IP/host from the main-server address list into a

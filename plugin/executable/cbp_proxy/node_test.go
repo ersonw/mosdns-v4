@@ -55,24 +55,38 @@ func TestNodeControlAddressesEmptyWhenOnlyQUIC(t *testing.T) {
 	}
 }
 
-func TestNodeControlAddressesExpandPublishedList(t *testing.T) {
+func TestNodeControlAddressesPublishedListIsAuthoritative(t *testing.T) {
 	node := cbpcoord.Node{
 		ID:                "edge-sg-1",
+		PublicAddr:        "203.0.113.99",
 		PublicTCPEndpoint: "203.0.113.10:8443",
 		ControlAddresses:  []string{"198.51.100.7:8443", "198.51.100.8:9443"},
 		TCPEndpoint:       "tls://10.0.0.10:8443",
+		LANTCPEndpoint:    "tls://10.0.0.11:8443",
 	}
 	got := nodeControlAddresses(node)
-	want := map[string]bool{
-		"203.0.113.10:8443": true,
-		"198.51.100.7:8443": true,
-		"198.51.100.8:9443": true,
-		"10.0.0.10:8443":    true,
+	want := []string{"198.51.100.7:8443", "198.51.100.8:9443"}
+	if len(got) != len(want) {
+		t.Fatalf("addresses = %+v, want %+v", got, want)
 	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("addresses = %+v, want %+v", got, want)
+		}
+	}
+}
+
+func TestNodeControlAddressesLegacyFallbackSkipsDisplayPublicAddr(t *testing.T) {
+	node := cbpcoord.Node{
+		ID:                "edge-sg-1",
+		PublicAddr:        "203.0.113.99",
+		PublicTCPEndpoint: "203.0.113.10:8443",
+		TCPEndpoint:       "tls://10.0.0.10:8443",
+	}
+	got := nodeControlAddresses(node)
 	for _, address := range got {
-		delete(want, address)
-	}
-	if len(want) != 0 {
-		t.Fatalf("missing addresses %v in %+v", want, got)
+		if address == "203.0.113.99:8443" {
+			t.Fatalf("display public_addr must not be dialed: %+v", got)
+		}
 	}
 }
