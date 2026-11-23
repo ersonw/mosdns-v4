@@ -968,10 +968,10 @@ mosdns 客户端的对齐结果：
 
 ## 20. 节点多 IP 择优
 
-主服务端在 `NODE_LIST` 里可以为一个节点下发多个公网 IP（`public_ips`、`ip_addresses`、`ips`、`public_addrs`、`ip_list` 均已兼容）。客户端会把每个裸 IP 补上节点 TCP 端口，再逐个探测：
+主服务端在 `NODE_LIST` 的 `control_addresses` 里下发节点完整的控制地址集合（`host:port`，包含节点发现的网卡地址和主服务端补入的公网地址）；`data_addresses` 描述 QUIC 数据面，CBP 控制连接不直接使用，但客户端的 `Node` 结构保持同名字段以便对齐协议。对 `control_addresses` 逐个探测：
 
 1. **先要求 TCP 控制端口可连接**。只回应 ICMP 但 8443 被过滤的地址不参与排序。
 2. **延迟优先**。ICMP 有回应时用 ICMP RTT，否则用 TCP connect 时间；按 RTT 升序排列。
 3. **逐个尝试**。TCP 可连接不代表 CBP TLS/AUTH 一定成功，因此按顺序尝试完所有候选，只有全部直连失败才回退主服务端 relay。
 
-`public_addr` 仍然作为单地址兼容；IP 列表与它、`public_tcp_endpoint` 去重后合并。
+`public_addr` 和 `public_tcp_endpoint` 仍然作为兼容地址；它们与 `control_addresses` 去重后合并。

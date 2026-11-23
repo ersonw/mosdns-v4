@@ -11,7 +11,7 @@ import (
 // nodeControlAddresses derives the CBP node's TCP control endpoints. These
 // are node endpoints from NODE_LIST, not main-server candidates.
 //
-// Order: public TCP endpoint, the main server's public IP list, public
+// Order: public TCP endpoint, the main server's control_addresses, public
 // address, direct TCP endpoint, LAN TCP endpoint. Order is only a stable
 // tie-break; the dial path probes all entries and selects by latency.
 func nodeControlAddresses(node cbpcoord.Node) []string {
@@ -27,12 +27,8 @@ func nodeControlAddresses(node cbpcoord.Node) []string {
 		port = endpointPort(node.TCPEndpoint)
 	}
 	add(node.PublicTCPEndpoint)
-	for _, ip := range [][]string{
-		node.PublicIPs, node.IPAddresses, node.IPs, node.PublicAddrs, node.IPList,
-	} {
-		for _, value := range ip {
-			add(withNodePort(value, port))
-		}
+	for _, value := range node.ControlAddresses {
+		add(withNodePort(value, port))
 	}
 	if node.PublicAddr != "" {
 		add(withNodePort(node.PublicAddr, port))

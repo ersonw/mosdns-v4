@@ -65,18 +65,15 @@ type Node struct {
 	LANTCPEndpoint    string `json:"lan_tcp_endpoint,omitempty"`
 	PublicEndpoint    string `json:"public_endpoint,omitempty"`
 	PublicTCPEndpoint string `json:"public_tcp_endpoint,omitempty"`
-	// PublicIPs is the main server's list of external addresses for this
-	// node. A node can be reachable through several public IPs; the client
-	// probes all of them and keeps the lowest-latency one that accepts TCP.
-	// The aliases cover the field names used by older and newer coordinators.
-	PublicIPs   []string `json:"public_ips,omitempty"`
-	IPAddresses []string `json:"ip_addresses,omitempty"`
-	IPs         []string `json:"ips,omitempty"`
-	PublicAddrs []string `json:"public_addrs,omitempty"`
-	IPList      []string `json:"ip_list,omitempty"`
-	PublicKey   string   `json:"public_key"`
-	Weight      int      `json:"weight,omitempty"`
-	Load        float64  `json:"load,omitempty"`
+	// DataAddresses and ControlAddresses are the complete NIC/public address
+	// sets published by the main server. Entries are host:port; the CBP TCP
+	// control session uses ControlAddresses, while DataAddresses describe the
+	// QUIC data path and are kept for protocol parity.
+	DataAddresses    []string `json:"data_addresses,omitempty"`
+	ControlAddresses []string `json:"control_addresses,omitempty"`
+	PublicKey        string   `json:"public_key"`
+	Weight           int      `json:"weight,omitempty"`
+	Load             float64  `json:"load,omitempty"`
 }
 
 type hello struct {
