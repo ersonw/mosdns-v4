@@ -87,18 +87,18 @@ jobs:
           echo "files to publish:"
           ls -lh dist
 
-      # Uploading over an existing release replaces the asset, which makes a
-      # re-run after a failed step safe.
+      # Recreating the release instead of uploading over it makes a re-tag
+      # refresh the notes and source archives as well as the assets. The tag
+      # itself is kept: it is what this workflow was triggered by.
       - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "${VERSION}" >/dev/null 2>&1; then
-            gh release upload "${VERSION}" dist/* --clobber
-          else
-            gh release create "${VERSION}" dist/* \
-              --title "${VERSION}" \
-              --generate-notes \
-              --target "${GITHUB_SHA}"
+            gh release delete "${VERSION}" --yes
           fi
+          gh release create "${VERSION}" dist/* \
+            --title "${VERSION}" \
+            --generate-notes \
+            --target "${GITHUB_SHA}"
