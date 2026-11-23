@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,11 +80,13 @@ type Client struct {
 	// control stream. It is the fallback when the node's QUIC data port is
 	// unreachable from the client (for example when an upstream NAT forwards
 	// only TCP 8443), and it can traverse the main-server relay unchanged.
-	rawMu      sync.Mutex
-	rawReady   chan struct{}
-	rawOnce    sync.Once
-	rawPackets chan []byte
-	rawErr     error
+	rawMu         sync.Mutex
+	rawReady      chan struct{}
+	rawOnce       sync.Once
+	rawPackets    chan []byte
+	rawErr        error
+	rawTunnelIPv4 netip.Addr
+	rawTunnelIPv6 netip.Addr
 
 	nextID    uint64
 	closed    chan struct{}
@@ -546,6 +550,38 @@ func (c *Client) EnableRawControl(ctx context.Context) error {
 	}
 }
 
+// applyRawReady records the tunnel addresses the node assigns to this session.
+// The reader closes rawReady only after the fields are stored, so a caller that
+// returns from EnableRawControl always sees the address it must use as the raw
+// packet source.
+func (c *Client) applyRawReady(payload []byte) {
+	var ready struct {
+		TunnelIPv4 string `json:"tunnel_ipv4"`
+		TunnelIPv6 string `json:"tunnel_ipv6"`
+	}
+	if json.Unmarshal(payload, &ready) == nil {
+		v4, _ := netip.ParseAddr(strings.TrimSpace(ready.TunnelIPv4))
+		v6, _ := netip.ParseAddr(strings.TrimSpace(ready.TunnelIPv6))
+		c.rawMu.Lock()
+		if v4.IsValid() {
+			c.rawTunnelIPv4 = v4.Unmap()
+		}
+		if v6.IsValid() {
+			c.rawTunnelIPv6 = v6.Unmap()
+		}
+		c.rawMu.Unlock()
+	}
+	c.rawOnce.Do(func() { close(c.rawReady) })
+}
+
+// RawTunnelIPv4 is the source address the node accepts on RAW_PACKET frames.
+// It is valid only after EnableRawControl has returned successfully.
+func (c *Client) RawTunnelIPv4() netip.Addr {
+	c.rawMu.Lock()
+	defer c.rawMu.Unlock()
+	return c.rawTunnelIPv4
+}
+
 func (c *Client) setRawError(err error) {
 	c.rawMu.Lock()
 	c.rawErr = err
@@ -949,7 +985,7 @@ func (c *Client) readLoop() {
 				}
 			}
 		case "RAW_READY":
-			c.rawOnce.Do(func() { close(c.rawReady) })
+			c.applyRawReady(env.Payload)
 		case "RAW_PACKET":
 			var frame rawPacketFrame
 			if json.Unmarshal(env.Payload, &frame) != nil || frame.Data == "" {

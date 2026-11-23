@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"sort"
@@ -720,6 +721,44 @@ func (d *cbpDialer) DialContext(ctx context.Context, network, addr string) (net.
 	}
 	return nil, errors.New("cbp_proxy: CBP stream session is not available")
 }
+
+// OpenRawIP exposes the node's packet tunnel on the same authenticated CBP
+// session. fakeip_nat uses it for ICMP echo and traceroute probes, which a
+// TCP/UDP stream cannot carry.
+func (d *cbpDialer) OpenRawIP(ctx context.Context) (egress.RawIPConn, error) {
+	client, err := d.ensureClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := client.EnableRawControl(ctx); err != nil {
+		return nil, fmt.Errorf("cbp_proxy: enable raw control: %w", err)
+	}
+	tunnel := client.RawTunnelIPv4()
+	if !tunnel.IsValid() {
+		return nil, errors.New("cbp_proxy: raw control ready without a tunnel ipv4 address")
+	}
+	d.log.Info("cbp_proxy: CBP raw control enabled", zap.String("tunnel_ipv4", tunnel.String()))
+	return &cbpRawIPConn{client: client, tunnel: tunnel}, nil
+}
+
+var _ egress.RawIPDialer = (*cbpDialer)(nil)
+var _ egress.RawIPConn = (*cbpRawIPConn)(nil)
+
+type cbpRawIPConn struct {
+	client *cbpstream.Client
+	tunnel netip.Addr
+}
+
+func (c *cbpRawIPConn) TunnelIPv4() netip.Addr { return c.tunnel }
+
+func (c *cbpRawIPConn) WritePacket(packet []byte) error { return c.client.WriteRawPacket(packet) }
+
+func (c *cbpRawIPConn) ReadPacket(ctx context.Context) ([]byte, error) {
+	return c.client.ReadRawPacket(ctx)
+}
+
+// Close detaches this consumer without closing the shared CBP session.
+func (c *cbpRawIPConn) Close() error { return nil }
 
 func (d *cbpDialer) Probe(ctx context.Context) error {
 	d.log.Debug("cbp_proxy: probing CBP session")

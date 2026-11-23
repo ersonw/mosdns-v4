@@ -255,6 +255,9 @@ func buildICMPPortUnreachable(local, dst netip.Addr, orig []byte) []byte {
 // buildICMPError assembles an ICMP error message quoting the original IPv4
 // header plus the first 8 bytes of its payload, with addresses swapped.
 func buildICMPError(local, dst netip.Addr, orig []byte, typ, code uint8) []byte {
+	if !local.Is4() || !dst.Is4() {
+		return nil
+	}
 	ihl := int(orig[0]&0x0f) * 4
 	if ihl < ipv4HeaderMinLen || len(orig) < ihl {
 		return nil

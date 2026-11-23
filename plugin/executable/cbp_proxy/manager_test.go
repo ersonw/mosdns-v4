@@ -26,6 +26,7 @@ import (
 	"github.com/ersonw/mosdns-v4/coremain"
 	"github.com/ersonw/mosdns-v4/pkg/cbp"
 	"github.com/ersonw/mosdns-v4/pkg/cbpcoord"
+	"github.com/ersonw/mosdns-v4/pkg/cbpstream"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -383,6 +384,13 @@ func startFakeCBPNode(cert tls.Certificate, authTokens chan<- string) (string, f
 						return
 					}
 					switch env.Type {
+					case "RAW_OPEN":
+						_ = cbp.WriteControlFrame(conn, cbp.Envelope{
+							Type:    "RAW_READY",
+							Payload: mustJSON(map[string]any{"tunnel_ipv4": "10.66.0.2", "tunnel_ipv6": "fd00::2"}),
+						})
+					case "RAW_PACKET":
+						_ = cbp.WriteControlFrame(conn, cbp.Envelope{Type: "RAW_PACKET", Payload: env.Payload})
 					case "STREAM_OPEN":
 						var open struct {
 							StreamID uint64 `json:"stream_id"`
@@ -410,6 +418,57 @@ func startFakeCBPNode(cert tls.Certificate, authTokens chan<- string) (string, f
 		}
 	}()
 	return ln.Addr().String(), func() { _ = ln.Close() }, nil
+}
+
+func TestCBPProxyDialerOpenRawIP(t *testing.T) {
+	cert := testCertificate(t, "cbp-raw-test")
+	nodeAddr, stop, err := startFakeCBPNode(cert, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &cbpDialer{
+		cfg: cbpstream.Config{
+			ControlAddr: nodeAddr,
+			TLSConfig: &tls.Config{
+				MinVersion:         tls.VersionTLS13,
+				InsecureSkipVerify: true,
+			},
+			Token:       "test-token",
+			DeviceID:    "test-device",
+			PrivateKey:  privateKey,
+			DialTimeout: 5 * time.Second,
+		},
+		log:  zap.NewNop(),
+		node: "test-node",
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := d.OpenRawIP(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.TunnelIPv4(); got.String() != "10.66.0.2" {
+		t.Fatalf("tunnel ipv4 = %s", got)
+	}
+	packet := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 66, 0, 2, 93, 184, 216, 34}
+	if err := conn.WritePacket(packet); err != nil {
+		t.Fatal(err)
+	}
+	got, err := conn.ReadPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(packet) {
+		t.Fatalf("raw packet = %x, want %x", got, packet)
+	}
 }
 
 func mustJSON(v any) []byte {

@@ -1061,3 +1061,33 @@ mosdns-v4 因此调整为：
 - 新增 `TestManagerLogsLifecycleAndDialAtExpectedLevels`，用 fake bootstrap、fake coordinator、fake CBP node 跑完整链路，断言 `node cache stale` 为 Debug、`CBP node list refreshed` / `CBP stream session ready` / `CBP dial ready` 的级别，并确认日志中没有节点 token。
 - 新增 `TestLoggingDialerRecordsSuccessAtDebug` / `TestLoggingDialerRecordsFailureAtWarn`，断言出口逐连接成功为 Debug、失败为 Warn，且 `proxy_host` / `target` 字段存在。
 - 本地 `mosdns start` 冒烟：临时配置 `egress_route` + 本机 SOCKS5 监听，Debug 级别实际输出 `egress_route: exit config`、`egress_route: proxy probe passed`、`egress_route: proxy exit ready`、`egress_route: proxy outlet registered, no kernel state`；probe 失败时输出 `egress_route: proxy probe failed` 并阻止启动。该冒烟未连接线上节点，未改线上二进制和配置。
+
+## 25. CBP 出口的 ICMP 与 traceroute 走隧道（2026-11-23）
+
+此前所有代理出口统一按“代理不承载 ICMP”处理：`fakeip_nat` 用本机伪造的 echo reply 应答 ping，traceroute 也不发真实探测。本轮加入出口类型判定：**出口具备 CBP raw 能力时，ICMP echo 和 traceroute 必须代理出去，不能再返回本机伪造值。**
+
+判定与能力暴露：
+
+- `pkg/egress` 新增 `RawIPDialer` / `RawIPConn` 接口，表示出口除 TCP/UDP 流之外还能承载完整 IP 包；`egress.Unwrap` 用于穿过 `egress_route` 的日志包装层发现该能力。
+- `plugin/executable/cbp_proxy` 的 `cbpDialer` 实现 `OpenRawIP`：在同一个已认证 CBP 会话上发送 `RAW_OPEN`，等待 `RAW_READY`，并读取节点分配的 `tunnel_ipv4`。
+- `pkg/cbpstream` 的 `RAW_READY` 现在解析并保存 `tunnel_ipv4` / `tunnel_ipv6`；`RawTunnelIPv4()` 在 `EnableRawControl` 返回后可用。
+- `fakeip_nat` 在解析出口后做类型断言：只有出口暴露 `RawIPDialer` 才设置 `cbpOutlet`；普通 socks5 / http / trojan / gost 出口行为不变。
+
+报文路径：
+
+- **echo**：`forwardICMPEcho` 解析出真实目标后，若 `cbpOutlet` 为真，改用 CBP raw 隧道发送完整 IPv4 echo request，源地址必须是会话的 `tunnel_ipv4`（节点 `validSource` 会丢弃源地址不匹配的包）。节点把 echo reply 以 `RAW_PACKET` 回传，客户端按 ICMP id 找到待处理项，重写为 `fakeIP -> client` 并把 id 还给客户端。
+- **traceroute**：`shouldProbe` 在 `cbpOutlet` 下不依赖本机 raw socket；`probeHop` 构造带客户端 TTL 的 UDP 探测包，经 CBP raw 隧道发出。节点返回的 ICMP time exceeded 以 quoted UDP 源端口匹配探测项，客户端重建 ICMP error 并引用客户端原始 UDP 头，再写回 tun。
+- **失败策略**：CBP raw 未就绪或发送失败时丢弃并记 Warn，不回退到本机伪造应答；这与“CBP 出口必须代理出去”一致。
+
+本地验证：
+
+- `go build ./...` 通过。
+- `go test ./pkg/egress ./pkg/cbpstream ./plugin/executable/cbp_proxy ./plugin/executable/egress_route ./plugin/executable/fakeip_nat -count=1` 全部通过。
+- 新增 `TestRawControlEnablesPacketTunnel`，用本地 TLS 假节点走完 `RAW_OPEN` / `RAW_READY` / `RAW_PACKET` 往返，校验隧道地址和 raw 包收发。
+- 新增 `TestCBPProxyDialerOpenRawIP`，通过 `cbp_proxy` 的 provider dialer 走完整 CBP 认证与 raw 能力开启，验证 `OpenRawIP` 返回的隧道地址和包收发。
+- 新增 `TestCBPForwardEchoWritesReplyToTun`，用假 tun 设备验证 CBP 回包最终写到 tun，源地址是 fakeIP、目标是客户端。
+- 新增 `TestApplyRawReadyStoresTunnelAddresses`，覆盖 `RAW_READY` 的 `tunnel_ipv4` / `tunnel_ipv6` 解析。
+- 新增 `TestCBPICMPRelayForwardsEchoAndRewritesReply`，断言 echo request 的源地址是隧道地址、目标地址是真实 IP，并把节点回复重写为 fakeIP 到客户端。
+- 新增 `TestCBPICMPErrorRelaysHopToOneClient`，断言 traceroute 的 quoted UDP 源端口能匹配探测项，回包引用客户端原始 UDP 端口。
+- 新增 `TestBuildUDPProbeIPv4`，校验 IPv4 头校验和、TTL、UDP 端口和长度。
+- 本轮没有连接线上 CBP 节点，也没有替换线上二进制或配置。

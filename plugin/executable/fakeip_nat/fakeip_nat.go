@@ -361,6 +361,14 @@ type FakeIPNatPlugin struct {
 	icmpMu sync.Mutex
 	icmp   *icmpRelay
 
+	// CBP outlets expose a raw packet tunnel, so ICMP echo and traceroute
+	// probes can leave through the proxy instead of being answered locally.
+	// cbpRaw is set only when the resolved outlet advertises that capability.
+	cbpRaw    egress.RawIPDialer
+	cbpOutlet bool
+	cbpMu     sync.Mutex
+	cbpICMP   *cbpICMPRelay
+
 	// quote cache: the tun read loop keeps the header of recently sent UDP
 	// packets so an ICMP error can quote the exact bytes the client sent.
 	quoteMu sync.Mutex
@@ -852,6 +860,17 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		}
 	}
 
+	// A CBP outlet is the one proxy that can carry raw IP packets. Detect the
+	// capability after the outlet is resolved so echo and traceroute use the
+	// tunnel instead of the local stand-in answer every other proxy needs.
+	if d, ok := egress.Unwrap(p.egress).(egress.RawIPDialer); ok {
+		p.cbpRaw = d
+		p.cbpOutlet = true
+		p.L().Info("fakeip nat: cbp outlet carries raw ip",
+			zap.Bool("proxy_active", p.proxyActive),
+			zap.String("outlet", egress.Describe(p.egress)))
+	}
+
 	// IPv6 egress is the one input the DNS half cannot see: a fake IPv4 for an
 	// IPv6-only name is useless unless the outlet can dial the address behind
 	// it. The probe runs before the first answer so a restart decides with the
@@ -1145,7 +1164,11 @@ func (p *FakeIPNatPlugin) startTunDataPath() error {
 	p.L().Info("tun data path started", zap.String("dev", devName), zap.String("range", p.cidr))
 	// ICMP relay needs the device for replies and the mapping table for echo
 	// forwarding, so it starts once both exist.
-	p.startICMPRelay(runCtx, st)
+	if p.cbpOutlet {
+		p.startCBPICMP(runCtx, st)
+	} else {
+		p.startICMPRelay(runCtx, st)
+	}
 	go func() {
 		if err := p.runTunDevice(runCtx, dev, st); err != nil {
 			p.L().Warn("tun device loop stopped", zap.String("dev", devName), zap.Error(err))
@@ -1170,6 +1193,7 @@ func (p *FakeIPNatPlugin) stopTunDataPath() {
 		return
 	}
 	p.L().Debug("fakeip nat: stopping tun data path", zap.String("dev", p.tunDev))
+	p.stopCBPICMP()
 	p.stopICMPRelay()
 	if cancel != nil {
 		cancel()

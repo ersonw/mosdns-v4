@@ -42,6 +42,23 @@ type Gost = gostEgress
 // and a userspace IP stack, so TCP, UDP and ICMP all leave through one outlet.
 type CBP = cbpEgress
 
+// RawIPConn carries complete IPv4/IPv6 packets through an outlet that exposes
+// a tunnel plane, such as CBP. The caller owns packet construction and must
+// use TunnelIPv4 as the source address the remote tunnel accepts.
+type RawIPConn interface {
+	TunnelIPv4() netip.Addr
+	WritePacket(packet []byte) error
+	ReadPacket(ctx context.Context) ([]byte, error)
+	Close() error
+}
+
+// RawIPDialer is an outlet that can carry raw IP packets in addition to
+// TCP/UDP streams. It is what lets fakeip_nat forward ICMP and traceroute
+// probes through a CBP tunnel instead of answering them locally.
+type RawIPDialer interface {
+	OpenRawIP(ctx context.Context) (RawIPConn, error)
+}
+
 // egressCloser is implemented by outlets that hold long-lived resources.
 type egressCloser interface {
 	Close() error
@@ -90,6 +107,10 @@ func NewTrojan(server, password, sni string, insecure bool) *Trojan {
 type dialerUnwrapper interface {
 	UnwrapDialer() Dialer
 }
+
+// Unwrap returns the concrete outlet behind a decorator such as egress_route's
+// logging wrapper, allowing capability interfaces to be discovered.
+func Unwrap(d Dialer) Dialer { return unwrapDialer(d) }
 
 func unwrapDialer(d Dialer) Dialer {
 	for {

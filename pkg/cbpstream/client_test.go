@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -144,6 +145,112 @@ func TestStreamSessionOpensTCPAndCarriesData(t *testing.T) {
 	_ = conn.Close()
 }
 
+func TestRawControlEnablesPacketTunnel(t *testing.T) {
+	cert := streamTestCertificate(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+
+	go func() {
+		conn, err := tlsLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if err := cbp.WriteControlFrame(conn, cbp.Envelope{
+			Type: "HELLO_ACK",
+			Payload: mustStreamPayload(t, map[string]any{
+				"nonce":         base64.RawURLEncoding.EncodeToString([]byte("raw-test")),
+				"version":       1,
+				"auth_required": true,
+			}),
+		}); err != nil {
+			return
+		}
+		env, err := cbp.ReadControlFrame(conn)
+		if err != nil || env.Type != "AUTH" {
+			return
+		}
+		if err := cbp.WriteControlFrame(conn, cbp.Envelope{
+			Type: "SESSION_READY",
+			Payload: mustStreamPayload(t, map[string]any{
+				"session_id": 1,
+				"data_addr":  "",
+				"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+			}),
+		}); err != nil {
+			return
+		}
+		for {
+			env, err := cbp.ReadControlFrame(conn)
+			if err != nil {
+				return
+			}
+			switch env.Type {
+			case "RAW_OPEN":
+				_ = cbp.WriteControlFrame(conn, cbp.Envelope{
+					Type: "RAW_READY",
+					Payload: mustStreamPayload(t, map[string]any{
+						"tunnel_ipv4": "10.66.0.2",
+						"tunnel_ipv6": "fd00::2",
+					}),
+				})
+			case "RAW_PACKET":
+				var frame rawPacketFrame
+				if cbp.UnmarshalPayload(env.Payload, &frame) != nil || frame.Data == "" {
+					continue
+				}
+				_ = cbp.WriteControlFrame(conn, cbp.Envelope{Type: "RAW_PACKET", Payload: env.Payload})
+			case "CLOSE":
+				return
+			}
+		}
+	}()
+
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, Config{
+		ControlAddr: ln.Addr().String(),
+		TLSConfig: &tls.Config{
+			MinVersion:         tls.VersionTLS13,
+			InsecureSkipVerify: true,
+		},
+		Token:       "test-token",
+		DeviceID:    "test-device",
+		PrivateKey:  privateKey,
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.EnableRawControl(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.RawTunnelIPv4(); got != netip.MustParseAddr("10.66.0.2") {
+		t.Fatalf("tunnel ipv4 = %s", got)
+	}
+	packet := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 66, 0, 2, 93, 184, 216, 34}
+	if err := client.WriteRawPacket(packet); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.ReadRawPacket(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(packet) {
+		t.Fatalf("raw packet = %x, want %x", got, packet)
+	}
+}
+
 func mustStreamPayload(t *testing.T, v any) []byte {
 	t.Helper()
 	raw, err := cbp.MarshalPayload(v)
@@ -179,4 +286,23 @@ func streamTestCertificate(t *testing.T) tls.Certificate {
 		t.Fatal(err)
 	}
 	return cert
+}
+
+func TestApplyRawReadyStoresTunnelAddresses(t *testing.T) {
+	c := &Client{rawReady: make(chan struct{})}
+	c.applyRawReady([]byte(`{"tunnel_ipv4":"10.66.0.2","tunnel_ipv6":"fd00::2"}`))
+	select {
+	case <-c.rawReady:
+	default:
+		t.Fatal("rawReady was not closed")
+	}
+	if got := c.RawTunnelIPv4(); got != netip.MustParseAddr("10.66.0.2") {
+		t.Fatalf("tunnel ipv4 = %s", got)
+	}
+	c.rawMu.Lock()
+	v6 := c.rawTunnelIPv6
+	c.rawMu.Unlock()
+	if v6 != netip.MustParseAddr("fd00::2") {
+		t.Fatalf("tunnel ipv6 = %s", v6)
+	}
 }

@@ -652,6 +652,9 @@ func (p *FakeIPNatPlugin) shouldProbe(ttl uint8) bool {
 	if ttl < probeMinTTL || ttl > probeMaxTTL {
 		return false
 	}
+	if p.cbpOutlet {
+		return true
+	}
 	return p.icmpRelayActive()
 }
 
@@ -659,6 +662,10 @@ func (p *FakeIPNatPlugin) shouldProbe(ttl uint8) bool {
 // the ICMP error that names the hop. The entry is removed when the answer
 // arrives (probeReply) or when the probe times out.
 func (p *FakeIPNatPlugin) probeHop(flow icmpFlow, realIP netip.Addr, ttl int) {
+	if p.cbpOutlet {
+		p.cbpProbeHop(flow, realIP, ttl)
+		return
+	}
 	if p.isFakeAddr(realIP) {
 		// Probing an address that only exists inside this plugin cannot name a
 		// real hop, so the probe is skipped instead of waiting for a timeout.
@@ -902,6 +909,12 @@ func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Add
 			zap.String("fake_ip", fakeIP.String()), zap.String("real_ip", realIP.String()))
 		return
 	}
+	if p.cbpOutlet {
+		// CBP exposes a raw packet tunnel on the same session. The echo leaves
+		// through the node instead of being answered as the destination here.
+		p.cbpForwardEcho(st, client, fakeIP, realIP, clientID, seq, payload)
+		return
+	}
 	if p.proxyActive {
 		// A proxy outlet carries no ICMP: socks5 offers CONNECT, BIND and UDP
 		// ASSOCIATE, http only CONNECT, trojan only CONNECT and UDP ASSOCIATE.
@@ -946,6 +959,11 @@ func (p *FakeIPNatPlugin) forwardICMPEcho(st *tunStack, client, fakeIP netip.Add
 // trip of this device rather than of an unreachable host.
 func (p *FakeIPNatPlugin) answerEchoLocally(st *tunStack, client, fakeIP netip.Addr, clientID, seq uint16, payload []byte) {
 	pkt := buildICMPEchoIPv4(icmpEchoReply, fakeIP, client, clientID, seq, payload)
+	if pkt == nil {
+		p.L().Warn("tun icmp: cannot build local echo reply",
+			zap.String("fake_ip", fakeIP.String()), zap.String("client", client.String()))
+		return
+	}
 	if err := st.writeOut(pkt); err != nil {
 		p.L().Warn("tun icmp: write local echo reply failed", zap.Error(err))
 		return
@@ -970,6 +988,9 @@ func buildICMPEchoPacket(typ uint8, id, seq uint16, payload []byte) []byte {
 // buildICMPEchoIPv4 wraps an echo message in an IPv4 header addressed to the
 // client, with the fake ip as source.
 func buildICMPEchoIPv4(typ uint8, src, dst netip.Addr, id, seq uint16, payload []byte) []byte {
+	if !src.Is4() || !dst.Is4() {
+		return nil
+	}
 	msg := buildICMPEchoPacket(typ, id, seq, payload)
 	pkt := make([]byte, ipv4HeaderMinLen+len(msg))
 	pkt[0] = 0x45
