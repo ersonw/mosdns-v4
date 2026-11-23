@@ -56,18 +56,27 @@ type Node struct {
 	ID string `json:"id"`
 	// Label is the operator-facing display name reported by the node. Node
 	// identity and routing still key off ID; Label is only a lookup alias.
-	Label             string  `json:"label,omitempty"`
-	Region            string  `json:"region"`
-	Endpoint          string  `json:"endpoint"`
-	PublicAddr        string  `json:"public_addr,omitempty"`
-	LANEndpoint       string  `json:"lan_endpoint,omitempty"`
-	TCPEndpoint       string  `json:"tcp_endpoint"`
-	LANTCPEndpoint    string  `json:"lan_tcp_endpoint,omitempty"`
-	PublicEndpoint    string  `json:"public_endpoint,omitempty"`
-	PublicTCPEndpoint string  `json:"public_tcp_endpoint,omitempty"`
-	PublicKey         string  `json:"public_key"`
-	Weight            int     `json:"weight,omitempty"`
-	Load              float64 `json:"load,omitempty"`
+	Label             string `json:"label,omitempty"`
+	Region            string `json:"region"`
+	Endpoint          string `json:"endpoint"`
+	PublicAddr        string `json:"public_addr,omitempty"`
+	LANEndpoint       string `json:"lan_endpoint,omitempty"`
+	TCPEndpoint       string `json:"tcp_endpoint"`
+	LANTCPEndpoint    string `json:"lan_tcp_endpoint,omitempty"`
+	PublicEndpoint    string `json:"public_endpoint,omitempty"`
+	PublicTCPEndpoint string `json:"public_tcp_endpoint,omitempty"`
+	// PublicIPs is the main server's list of external addresses for this
+	// node. A node can be reachable through several public IPs; the client
+	// probes all of them and keeps the lowest-latency one that accepts TCP.
+	// The aliases cover the field names used by older and newer coordinators.
+	PublicIPs   []string `json:"public_ips,omitempty"`
+	IPAddresses []string `json:"ip_addresses,omitempty"`
+	IPs         []string `json:"ips,omitempty"`
+	PublicAddrs []string `json:"public_addrs,omitempty"`
+	IPList      []string `json:"ip_list,omitempty"`
+	PublicKey   string   `json:"public_key"`
+	Weight      int      `json:"weight,omitempty"`
+	Load        float64  `json:"load,omitempty"`
 }
 
 type hello struct {

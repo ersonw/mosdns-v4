@@ -11,8 +11,9 @@ import (
 // nodeControlAddresses derives the CBP node's TCP control endpoints. These
 // are node endpoints from NODE_LIST, not main-server candidates.
 //
-// Order: public TCP endpoint, public address plus the TCP port, direct TCP
-// endpoint, LAN TCP endpoint.
+// Order: public TCP endpoint, the main server's public IP list, public
+// address, direct TCP endpoint, LAN TCP endpoint. Order is only a stable
+// tie-break; the dial path probes all entries and selects by latency.
 func nodeControlAddresses(node cbpcoord.Node) []string {
 	var raw []string
 	add := func(value string) {
@@ -21,15 +22,45 @@ func nodeControlAddresses(node cbpcoord.Node) []string {
 			raw = append(raw, value)
 		}
 	}
+	port := endpointPort(node.PublicTCPEndpoint)
+	if port == "" {
+		port = endpointPort(node.TCPEndpoint)
+	}
 	add(node.PublicTCPEndpoint)
-	if node.PublicAddr != "" {
-		if port := endpointPort(node.TCPEndpoint); port != "" {
-			add(net.JoinHostPort(strings.Trim(node.PublicAddr, "[]"), port))
+	for _, ip := range [][]string{
+		node.PublicIPs, node.IPAddresses, node.IPs, node.PublicAddrs, node.IPList,
+	} {
+		for _, value := range ip {
+			add(withNodePort(value, port))
 		}
+	}
+	if node.PublicAddr != "" {
+		add(withNodePort(node.PublicAddr, port))
 	}
 	add(node.TCPEndpoint)
 	add(node.LANTCPEndpoint)
 	return normalizeNodeAddresses(raw)
+}
+
+// withNodePort turns a bare IP/host from the main-server address list into a
+// host:port endpoint. Values that already carry a port or a URL scheme are
+// passed through so normalizeNodeAddresses can parse them uniformly.
+func withNodePort(value, port string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, "://") {
+		return value
+	}
+	if _, _, err := net.SplitHostPort(value); err == nil {
+		return value
+	}
+	if port == "" {
+		return value
+	}
+	host := strings.Trim(value, "[]")
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return ""
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func endpointPort(endpoint string) string {

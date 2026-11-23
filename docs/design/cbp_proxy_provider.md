@@ -963,3 +963,15 @@ mosdns 客户端的对齐结果：
 `proxy_provides` 的 `refresh()` 在 egress_route 初始化阶段就要访问 `https://{domain}/v1/edge/bootstrap`，而 mosdns 的 DNS 监听此时还没有开始。若 `/etc/resolv.conf` 指向 `127.0.0.1`，服务冷启动/重启会形成循环依赖：bootstrap 需要 DNS，但 DNS 服务还没起来。
 
 线上 VyOS 的处理：在 `/etc/hosts` 固定 `api.aa2.dev` 的当前 A 记录，让冷启动的 bootstrap 请求不经过本机 53。该条目只用于 bootstrap，后续 NODE_LIST 刷新仍走正常网络。若域名 A 记录变更或迁移到非 Cloudflare 地址，需要同步更新 `/etc/hosts`；长期方案是给 provider 增加独立的 bootstrap resolver 或从 `.dat` 恢复节点表，避免启动依赖本机 DNS。
+
+---
+
+## 20. 节点多 IP 择优
+
+主服务端在 `NODE_LIST` 里可以为一个节点下发多个公网 IP（`public_ips`、`ip_addresses`、`ips`、`public_addrs`、`ip_list` 均已兼容）。客户端会把每个裸 IP 补上节点 TCP 端口，再逐个探测：
+
+1. **先要求 TCP 控制端口可连接**。只回应 ICMP 但 8443 被过滤的地址不参与排序。
+2. **延迟优先**。ICMP 有回应时用 ICMP RTT，否则用 TCP connect 时间；按 RTT 升序排列。
+3. **逐个尝试**。TCP 可连接不代表 CBP TLS/AUTH 一定成功，因此按顺序尝试完所有候选，只有全部直连失败才回退主服务端 relay。
+
+`public_addr` 仍然作为单地址兼容；IP 列表与它、`public_tcp_endpoint` 去重后合并。

@@ -54,3 +54,30 @@ func TestNodeControlAddressesEmptyWhenOnlyQUIC(t *testing.T) {
 		t.Fatalf("QUIC endpoint must not become a TCP control address: %+v", got)
 	}
 }
+
+func TestNodeControlAddressesExpandPublicIPList(t *testing.T) {
+	node := cbpcoord.Node{
+		ID:                "edge-sg-1",
+		PublicTCPEndpoint: "203.0.113.10:8443",
+		PublicIPs:         []string{"198.51.100.7", "198.51.100.8:9443", "0.0.0.0"},
+		TCPEndpoint:       "tls://10.0.0.10:8443",
+	}
+	got := nodeControlAddresses(node)
+	want := map[string]bool{
+		"203.0.113.10:8443": true,
+		"198.51.100.7:8443": true,
+		"198.51.100.8:9443": true,
+		"10.0.0.10:8443":    true,
+	}
+	for _, address := range got {
+		delete(want, address)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing addresses %v in %+v", want, got)
+	}
+	for _, address := range got {
+		if strings.HasPrefix(address, "0.0.0.0") {
+			t.Fatalf("wildcard address survived: %+v", got)
+		}
+	}
+}

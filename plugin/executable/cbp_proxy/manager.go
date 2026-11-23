@@ -164,20 +164,31 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	if len(addresses) == 0 {
 		return nil, "", fmt.Errorf("cbp_proxy: CBP node %q has no TCP control endpoint", nodeID)
 	}
-	address, err := selectNodeAddress(ctx, addresses)
+	probes, err := selectNodeAddresses(ctx, addresses)
 	if err != nil {
 		return nil, "", fmt.Errorf("cbp_proxy: node %q: %w", nodeID, err)
 	}
 
-	dialer, host, err := m.dialNode(ctx, state, node, address, coordinator, false, insecure)
-	if err == nil {
-		return dialer, host, nil
+	// Try every reachable address in latency order. A TCP-reachable address
+	// can still fail the CBP TLS/AUTH handshake, so the runner-up must be
+	// tried before falling back to the main-server relay.
+	var directErrs []string
+	for _, candidate := range probes {
+		dialer, host, err := m.dialNode(ctx, state, node, candidate.Address, coordinator, false, insecure)
+		if err == nil {
+			return dialer, host, nil
+		}
+		directErrs = append(directErrs, fmt.Sprintf("%s (%v)", candidate.Address, err))
+		m.logger.Warn("cbp_proxy: direct CBP node candidate failed",
+			zap.String("tag", tag), zap.String("node", nodeID),
+			zap.String("address", candidate.Address), zap.Duration("rtt", candidate.RTT), zap.Error(err))
 	}
+	relayAddress := probes[0].Address
 	m.logger.Warn("cbp_proxy: direct CBP node failed, trying main-server relay",
-		zap.String("tag", tag), zap.String("node", nodeID), zap.String("address", address), zap.Error(err))
-	dialer, host, relayErr := m.dialNode(ctx, state, node, address, coordinator, true, insecure)
+		zap.String("tag", tag), zap.String("node", nodeID), zap.String("address", relayAddress), zap.Error(errors.New(strings.Join(directErrs, "; "))))
+	dialer, host, relayErr := m.dialNode(ctx, state, node, relayAddress, coordinator, true, insecure)
 	if relayErr != nil {
-		return nil, "", fmt.Errorf("cbp_proxy: node %q direct: %v; relay %s: %w", nodeID, err, coordinator.Address, relayErr)
+		return nil, "", fmt.Errorf("cbp_proxy: node %q direct: %s; relay %s: %w", nodeID, strings.Join(directErrs, "; "), coordinator.Address, relayErr)
 	}
 	return dialer, host, nil
 }
@@ -490,37 +501,6 @@ func (s *tagState) nodeNames() string {
 		names = append(names, fmt.Sprintf("%s (%s)", id, label))
 	}
 	return strings.Join(names, ", ")
-}
-
-func selectNodeAddress(ctx context.Context, addresses []string) (string, error) {
-	type result struct {
-		address string
-		rtt     time.Duration
-		err     error
-	}
-	results := make(chan result, len(addresses))
-	for _, address := range addresses {
-		go func(address string) {
-			rtt, err := probeAddress(ctx, address)
-			results <- result{address: address, rtt: rtt, err: err}
-		}(address)
-	}
-	var best result
-	have := false
-	for range addresses {
-		r := <-results
-		if r.err != nil || r.rtt <= 0 {
-			continue
-		}
-		if !have || r.rtt < best.rtt {
-			best = r
-			have = true
-		}
-	}
-	if !have {
-		return "", errors.New("all CBP node control endpoints are unreachable")
-	}
-	return best.address, nil
 }
 
 // cbpDialer is the data entry returned to egress_route. TCP opens one CBP

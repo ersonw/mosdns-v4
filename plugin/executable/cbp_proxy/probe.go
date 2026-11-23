@@ -109,6 +109,64 @@ func probeAddress(ctx context.Context, address string) (time.Duration, error) {
 	return probeTCP(ctx, address)
 }
 
+// nodeAddressProbe is one CBP node endpoint that passed both the ICMP and
+// TCP checks. RTT is the ICMP round trip when available, otherwise the TCP
+// connect time.
+type nodeAddressProbe struct {
+	Address string
+	RTT     time.Duration
+}
+
+// probeNodeAddress requires the node's TCP control port to accept a
+// connection. ICMP is only a latency signal: a host that answers echo but
+// filters 8443 must not win the selection. If ICMP is unavailable, the TCP
+// connect time is used instead.
+func probeNodeAddress(ctx context.Context, address string) (time.Duration, error) {
+	tcpRTT, err := probeTCP(ctx, address)
+	if err != nil {
+		return 0, err
+	}
+	if icmpRTT, err := probeICMP(ctx, address); err == nil && icmpRTT > 0 {
+		return icmpRTT, nil
+	}
+	return tcpRTT, nil
+}
+
+// selectNodeAddresses probes every endpoint the main server published and
+// returns only endpoints whose TCP port is reachable, ordered by latency.
+func selectNodeAddresses(ctx context.Context, addresses []string) ([]nodeAddressProbe, error) {
+	type result struct {
+		address string
+		rtt     time.Duration
+		err     error
+	}
+	results := make(chan result, len(addresses))
+	for _, address := range addresses {
+		go func(address string) {
+			rtt, err := probeNodeAddress(ctx, address)
+			results <- result{address: address, rtt: rtt, err: err}
+		}(address)
+	}
+	reachable := make([]nodeAddressProbe, 0, len(addresses))
+	for range addresses {
+		r := <-results
+		if r.err != nil || r.rtt <= 0 {
+			continue
+		}
+		reachable = append(reachable, nodeAddressProbe{Address: r.address, RTT: r.rtt})
+	}
+	if len(reachable) == 0 {
+		return nil, errors.New("all CBP node control endpoints are unreachable")
+	}
+	sort.SliceStable(reachable, func(i, j int) bool {
+		if reachable[i].RTT != reachable[j].RTT {
+			return reachable[i].RTT < reachable[j].RTT
+		}
+		return reachable[i].Address < reachable[j].Address
+	})
+	return reachable, nil
+}
+
 func probeICMP(ctx context.Context, address string) (time.Duration, error) {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
