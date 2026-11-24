@@ -215,7 +215,7 @@ func (p *FakeIPNatPlugin) startCBPICMP(ctx context.Context, st *tunStack) {
 	}
 	// CBP bootstrap and AUTH only run after mosdns' DNS listeners are up. The
 	// raw tunnel is opened on that same session, so wait for the same signal
-	// instead of spending the 10s open timeout on a not-yet-started provider.
+	// instead of spending the open timeout on a not-yet-started provider.
 	if m := p.M(); m != nil {
 		select {
 		case <-m.ServersStarted():
@@ -228,21 +228,40 @@ func (p *FakeIPNatPlugin) startCBPICMP(ctx context.Context, st *tunStack) {
 			return
 		}
 	}
-	openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	conn, err := p.cbpRaw.OpenRawIP(openCtx)
-	if err != nil {
-		p.L().Warn("tun icmp: cbp raw tunnel unavailable, ping and traceroute stay unanswered",
-			zap.Error(err))
-		return
+	const (
+		// The first CBP login normally takes around 10s (bootstrap, NODE_LIST,
+		// relay AUTH). Keep a margin so OpenRawIP does not expire while waiting
+		// for that login; otherwise ICMP stays unanswered for the whole process.
+		rawOpenTimeout = 30 * time.Second
+		retryDelay     = 15 * time.Second
+	)
+	for {
+		openCtx, cancel := context.WithTimeout(ctx, rawOpenTimeout)
+		conn, err := p.cbpRaw.OpenRawIP(openCtx)
+		cancel()
+		if err == nil {
+			r := newCBPICMPRelay(conn, st.writeOut, p.L())
+			p.cbpMu.Lock()
+			p.cbpICMP = r
+			p.cbpMu.Unlock()
+			p.L().Info("tun icmp: cbp raw tunnel ready",
+				zap.String("tunnel_ipv4", r.tunnel.String()))
+			go p.cbpICMPLoop(ctx, r)
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		p.L().Warn("tun icmp: cbp raw tunnel unavailable, will retry",
+			zap.Error(err), zap.Duration("retry_in", retryDelay))
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
-	r := newCBPICMPRelay(conn, st.writeOut, p.L())
-	p.cbpMu.Lock()
-	p.cbpICMP = r
-	p.cbpMu.Unlock()
-	p.L().Info("tun icmp: cbp raw tunnel ready",
-		zap.String("tunnel_ipv4", r.tunnel.String()))
-	go p.cbpICMPLoop(ctx, r)
 }
 
 func (p *FakeIPNatPlugin) stopCBPICMP() {
