@@ -108,6 +108,7 @@ proxy_provides:
     node_token: ""                    # CBP 节点 AUTH
     # identity_file: /etc/mosdns/proxy_provides/cbp_sg.json  # 可选
     # config_dat: /etc/mosdns/proxy_provides/cbp_sg.dat      # 可选；不传则首次成功后自动生成
+    # data_streams: false                                    # 可选；节点支持后才建议开启
 
   - tag: cbp_hk
     domain: https://hk-api.example.com
@@ -126,6 +127,7 @@ proxy_provides:
 | `config_dat` | 否 | 桌面客户端 `custombrowser.config.proto/v1` 的 `.dat`；读取 `network.cbp`，YAML 显式字段优先。支持 portable `CBCFG1`、裸 proto 和带 `config_key_file` 的 runtime `CBCFG2`。不传时默认 `{config_dir}/proxy_provides/{tag}.dat`。无论默认还是显式路径，文件不存在都不算启动错误，首次成功拿到 `NODE_LIST` 后在该路径自动生成。默认路径和 `{config_dir}/proxy_provides/` 下的 `.dat` 由本插件管理，节点表变化时会原子重写；显式指向其他位置的已有 `.dat` 只读，不覆盖 |
 | `config_key_file` | 否 | runtime `CBCFG2` 用的 base64/hex 32 字节 CustomBrowser DB key；`CBCFG1` 忽略 |
 | `insecure` | 否 | TLS 校验覆盖；不填时使用 `config_dat` 的 `insecure_skip_verify` |
+| `data_streams` | 否 | 是否启用节点的 QUIC data stream TCP 数据面；默认 `false`。节点宣告 `data_streams=true` 且 data plane attach 成功才使用，否则或传输失败时回退控制流。不填时使用 `config_dat` 的 `network.cbp.data_streams` |
 
 `identity_file` 不要求预先存在。首次启动发现文件不存在时，自动走 `/v1/identity/client` 申请并原子写入；权限 `0600`。配置文件入口只是覆盖默认路径，不改变自动生成行为。
 
@@ -637,6 +639,7 @@ type ProxyProvideConfig struct {
     ConfigDat     string `yaml:"config_dat"`
     ConfigKeyFile string `yaml:"config_key_file"`
     Insecure      *bool  `yaml:"insecure"`
+    DataStreams   *bool  `yaml:"data_streams"`
 
     GenerateDat bool `yaml:"-"` // 默认 dat 不存在，等待首次 NODE_LIST 后生成
 }
@@ -1274,3 +1277,27 @@ read udp 127.0.0.1:52197->127.0.0.1:53: read: connection refused
 说明：登录完成前约 5 秒内，新的 CBP 数据连接会等待登录结果；超过
 普通 DNS 查询的 5 秒超时可能返回一次 `context deadline exceeded`。
 这是启动窗口的预期行为，登录完成后恢复正常。
+
+## 31. CBP QUIC data stream 对齐（2026-11-24）
+
+服务端 `81c5c20` 和桌面端 `799f550` 新增了 opt-in 的 QUIC data stream API。它复用已经完成 `SESSION_READY` 和 data token 绑定的 QUIC data connection，在同一连接上并发开 logical stream，用来承载 TCP 数据面。mosdns 按以下方式接入：
+
+- `pkg/cbp` 的 `SessionReady` 增加 `data_streams` 能力字段；新增 `DATA_STREAM_OPEN`、`DATA_STREAM_ACK` envelope 和 `DataStreamOpen/DataStreamAck` 类型。老节点缺省为 `false`，老客户端忽略该字段。
+- `pkg/cbpstream` 增加可选 data plane：控制登录拿到 `SESSION_READY` 后，只有 `UseDataStreams=true` 且节点宣告 `data_streams=true` 才拨节点的 QUIC 数据地址，发送 `DataTypeBind` data token，然后在同一 `quic.Connection` 上执行 `OpenDataStream`。
+- 数据地址按 `SESSION_READY.data_addresses`、NODE_LIST 的 `data_addresses`、`data_addr`、`lan_data_addr` 去重排序；`lan_data_addr` 放最后，避免远端 mosdns 把首个握手窗口花在私网地址上。每个地址都必须完成 QUIC 握手，ICMP 可达但 UDP 端口被过滤的地址会被跳过。
+- TCP 出口改为 `OpenStreamAuto`：能力具备且 data plane 已 attach 时优先走 QUIC；传输层失败（握手、开流、ACK 读超时等）对本会话粘性回退到控制流；目标地址被节点拒绝（例如目标端口不通、stream pool busy）只回退当前请求，不关闭后续 QUIC 尝试。
+- 现有控制流 `STREAM_*`、`RAW_PACKET`、`RESOLVE` 和 raw ICMP 路径保持不变；本次没有把 UDP 关联或 raw IP 改到 QUIC data stream。服务端当前也只接受 data stream 的 `tcp` network。
+- `proxy_provides[].data_streams` 默认 `false`；从桌面 `config_dat` 读取 `network.cbp.data_streams`（protobuf field 18）时，YAML 显式值优先。默认关闭是因为服务端 `81c5c20` 尚未部署到节点，不能把现有控制流路径替换掉。
+- 新增 `pkg/cbp/protocol_test.go` 覆盖能力字段和 open/ack envelope；`pkg/cbpstream/data_test.go` 用真实 QUIC listener 验证 bind、open、ack 和双向回显；`coremain/proxy_provide_dat_test.go` 覆盖 field 18 的读取与合并。
+
+本地验证：
+
+```text
+go test ./pkg/cbp ./pkg/cbpstream ./coremain ./plugin/executable/cbp_proxy
+ok github.com/ersonw/mosdns-v4/pkg/cbp
+ok github.com/ersonw/mosdns-v4/pkg/cbpstream
+ok github.com/ersonw/mosdns-v4/coremain
+ok github.com/ersonw/mosdns-v4/plugin/executable/cbp_proxy
+```
+
+启用条件：节点二进制升级到包含 `81c5c20` 的版本，并确认节点 `data_streams=true`、QUIC data 端口可达后，再把对应 `proxy_provides` 的 `data_streams` 设为 `true`。未升级节点会自动走控制流，不需要回滚配置。

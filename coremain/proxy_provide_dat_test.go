@@ -35,6 +35,9 @@ func TestParseProxyProvideDatCBPFields(t *testing.T) {
 	if !got.InsecureSkipVerify {
 		t.Fatal("insecure_skip_verify was not decoded")
 	}
+	if !got.DataStreamsSet || !got.DataStreams {
+		t.Fatal("data_streams was not decoded")
+	}
 }
 
 func TestPrepareProxyProvideFromPortableDat(t *testing.T) {
@@ -67,6 +70,9 @@ func TestPrepareProxyProvideFromPortableDat(t *testing.T) {
 	}
 	if got.Insecure == nil || !*got.Insecure {
 		t.Fatal("dat insecure_skip_verify was not applied")
+	}
+	if got.DataStreams == nil || !*got.DataStreams {
+		t.Fatal("dat data_streams was not applied")
 	}
 }
 
@@ -153,6 +159,8 @@ func proxyProvideTestDat() []byte {
 	cbp = proxyProvidePBString(cbp, 6, "identity-token")
 	cbp = proxyProvidePBString(cbp, 15, "https://backup.example.com")
 	cbp = protowire.AppendTag(cbp, 14, protowire.VarintType)
+	cbp = protowire.AppendVarint(cbp, 1)
+	cbp = protowire.AppendTag(cbp, 18, protowire.VarintType)
 	cbp = protowire.AppendVarint(cbp, 1)
 
 	var network []byte

@@ -117,17 +117,18 @@ func TestStreamSessionOpensTCPAndCarriesData(t *testing.T) {
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true,
 		},
-		Token:       "test-token",
-		DeviceID:    "test-device",
-		PrivateKey:  privateKey,
-		DialTimeout: 5 * time.Second,
+		Token:          "test-token",
+		DeviceID:       "test-device",
+		PrivateKey:     privateKey,
+		DialTimeout:    5 * time.Second,
+		UseDataStreams: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 
-	conn, err := client.OpenStream(ctx, "tcp", "example.com:443")
+	conn, err := client.OpenStreamAuto(ctx, "tcp", "example.com:443")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -37,6 +37,9 @@ type ProxyProvideConfig struct {
 	// Insecure is an explicit TLS override. When nil, a config_dat
 	// insecure_skip_verify value is used.
 	Insecure *bool `yaml:"insecure"`
+	// DataStreams opts into logical TCP streams over the node's QUIC data
+	// connection. Default false; the control stream is always the fallback.
+	DataStreams *bool `yaml:"data_streams"`
 	// ConfigKeyFile holds a base64/hex 32-byte CustomBrowser DB key for a
 	// runtime CBCFG2 config_dat. Ignored for portable CBCFG1.
 	ConfigKeyFile string `yaml:"config_key_file"`
@@ -134,6 +137,10 @@ func (c *Config) prepareProxyProvides() error {
 			if cfg.Insecure == nil {
 				insecure := dat.InsecureSkipVerify
 				cfg.Insecure = &insecure
+			}
+			if cfg.DataStreams == nil && dat.DataStreamsSet {
+				dataStreams := dat.DataStreams
+				cfg.DataStreams = &dataStreams
 			}
 		}
 

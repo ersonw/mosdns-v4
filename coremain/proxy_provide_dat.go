@@ -43,6 +43,8 @@ type proxyProvideDatConfig struct {
 	Token                      string
 	IdentityFile               string
 	InsecureSkipVerify         bool
+	DataStreams                bool
+	DataStreamsSet             bool
 }
 
 func loadProxyProvideDat(path, keyFile string) (proxyProvideDatConfig, error) {
@@ -279,6 +281,15 @@ func parseProxyProvideDat(plain []byte) (proxyProvideDatConfig, error) {
 				return proxyProvideDatConfig{}, err
 			}
 			out.SecondaryIdentityServerURL, data = value, data[n:]
+		case 18:
+			if typ != protowire.VarintType {
+				return proxyProvideDatConfig{}, fmt.Errorf("protobuf field 18 has wire type %d, want varint", typ)
+			}
+			value, n := protowire.ConsumeVarint(data)
+			if n < 0 {
+				return proxyProvideDatConfig{}, protowire.ParseError(n)
+			}
+			out.DataStreams, out.DataStreamsSet, data = value != 0, true, data[n:]
 		default:
 			n := protowire.ConsumeFieldValue(num, typ, data)
 			if n < 0 {

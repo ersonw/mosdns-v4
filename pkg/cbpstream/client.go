@@ -1,7 +1,8 @@
 // Package cbpstream carries TCP streams over an authenticated CBP control
 // session. It is the app-internal proxy path used when a packet tunnel
-// Network Extension is not installed. Raw IP packets still use the CBP QUIC
-// DATAGRAM data plane implemented by internal/cbp.
+// Network Extension is not installed. TCP can optionally use the node's QUIC
+// data-stream API; raw IP packets still use the control-stream mirror in this
+// package when the node's QUIC data port is unreachable.
 package cbpstream
 
 import (
@@ -43,6 +44,17 @@ type Config struct {
 	RelayAddr      string
 	RelayNodeID    string
 	RelayTLSConfig *tls.Config
+
+	// UseDataStreams opts into logical TCP streams over the node's QUIC data
+	// connection. It is false by default, so the stable control stream remains
+	// the default even when a node advertises the capability.
+	UseDataStreams bool
+	// DataAddrs is the main server's node data-address list, used when the
+	// SESSION_READY relay response omits data_addr. Entries are host:port.
+	DataAddrs []string
+	// DataDialTimeout bounds one QUIC data-endpoint handshake. It is separate
+	// from DialTimeout so a blocked UDP port does not delay control login.
+	DataDialTimeout time.Duration
 }
 
 type flushControlConn struct {
@@ -87,6 +99,11 @@ type Client struct {
 	rawErr        error
 	rawTunnelIPv4 netip.Addr
 	rawTunnelIPv6 netip.Addr
+
+	dataMu            sync.RWMutex
+	data              *dataPlane
+	dataErr           error
+	dataStreamsBroken bool
 
 	nextID    uint64
 	closed    chan struct{}
@@ -426,6 +443,13 @@ func Dial(ctx context.Context, cfg Config) (*Client, error) {
 	}
 	go client.readLoop()
 	go client.heartbeatLoop()
+	if cfg.UseDataStreams && ready.DataStreams {
+		if err := client.attachData(ctx); err != nil {
+			client.dataMu.Lock()
+			client.dataErr = err
+			client.dataMu.Unlock()
+		}
+	}
 	return client, nil
 }
 
@@ -1022,6 +1046,7 @@ func (c *Client) closeStream(id uint64) {
 func (c *Client) close() {
 	c.closeOnce.Do(func() {
 		close(c.closed)
+		c.closeData()
 		_ = c.control.Close()
 		c.streamsMu.Lock()
 		streams := c.streams

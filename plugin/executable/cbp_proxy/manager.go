@@ -26,6 +26,7 @@ const (
 	nodeRefreshTTL           = 5 * time.Minute
 	nodeRefreshCheckInterval = time.Minute
 	dialTimeout              = 10 * time.Second
+	cbpDataDialTimeout       = 5 * time.Second
 	// cbpReconnectBackoff keeps a failed AUTH from turning every new data
 	// connection into another allocation attempt against the center. The
 	// first failure waits two seconds, then doubles up to thirty seconds.
@@ -327,6 +328,9 @@ func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.N
 		ClientID:                   state.clientID(),
 		RelayAddr:                  relayAddr,
 		RelayNodeID:                node.ID,
+		UseDataStreams:             state.cfg.DataStreams != nil && *state.cfg.DataStreams,
+		DataAddrs:                  node.DataAddresses,
+		DataDialTimeout:            cbpDataDialTimeout,
 	}
 	if relay {
 		streamCfg.RelayTLSConfig = &tls.Config{
@@ -359,7 +363,14 @@ func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.N
 	state.log.Info("cbp_proxy: CBP stream session ready",
 		zap.String("node", node.ID), zap.String("control", address),
 		zap.Bool("relay", relay), zap.String("relay_addr", relayAddr),
-		zap.Uint64("session_id", ready.SessionID), zap.Duration("elapsed", time.Since(start)))
+		zap.Uint64("session_id", ready.SessionID), zap.Duration("elapsed", time.Since(start)),
+		zap.Bool("data_streams_supported", ready.DataStreams),
+		zap.Bool("data_streams_enabled", streamCfg.UseDataStreams),
+		zap.Bool("data_streams_available", client.DataStreamsAvailable()))
+	if err := client.DataStreamError(); err != nil {
+		state.log.Warn("cbp_proxy: CBP QUIC data stream unavailable, using control stream",
+			zap.String("node", node.ID), zap.Error(err))
+	}
 	dialer.client = client
 	return dialer, host, nil
 }
@@ -764,7 +775,7 @@ func (d *cbpDialer) DialContext(ctx context.Context, network, addr string) (net.
 		var conn net.Conn
 		switch {
 		case network == "" || network == "tcp":
-			conn, err = client.OpenStream(ctx, "tcp", addr)
+			conn, err = client.OpenStreamAuto(ctx, "tcp", addr)
 		case strings.HasPrefix(network, "udp"):
 			var udp *cbpstream.UDPConn
 			udp, err = client.OpenUDP(ctx)

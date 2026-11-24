@@ -285,12 +285,38 @@ type AuthRequest struct {
 	Signature string `json:"signature"`
 }
 
+// DataStreamOpen is the first control frame on a QUIC data stream. The data
+// connection itself is already authenticated by SESSION_READY and its data
+// token; this frame only names the target of one logical TCP stream.
+type DataStreamOpen struct {
+	Network string `json:"network"`
+	Address string `json:"address"`
+}
+
+// DataStreamAck is sent by the node before it starts copying bytes. It keeps
+// dial failures and admission failures distinguishable from a half-open QUIC
+// stream, which would otherwise look like a network stall.
+type DataStreamAck struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+const (
+	DataStreamOpenType = "DATA_STREAM_OPEN"
+	DataStreamAckType  = "DATA_STREAM_ACK"
+)
+
+// ErrDataStreamsUnsupported is returned when a node did not advertise the
+// opt-in QUIC data-stream capability.
+var ErrDataStreamsUnsupported = errors.New("cbp: node does not support QUIC data streams")
+
 type SessionReady struct {
 	SessionID        uint64   `json:"session_id"`
 	DataAddr         string   `json:"data_addr"`
 	DataAddresses    []string `json:"data_addresses,omitempty"`
 	LANDataAddr      string   `json:"lan_data_addr,omitempty"`
 	DataToken        string   `json:"data_token"`
+	DataStreams      bool     `json:"data_streams,omitempty"`
 	TunnelIPv4       string   `json:"tunnel_ipv4,omitempty"`
 	TunnelIPv6       string   `json:"tunnel_ipv6,omitempty"`
 	TunnelIPv4Prefix string   `json:"tunnel_ipv4_prefix,omitempty"`
