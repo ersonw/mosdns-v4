@@ -400,6 +400,13 @@ func (p *Plugin) start() error {
 	if file := strings.TrimSpace(p.args.DomainFile); file != "" {
 		p.watchDomainFile(file)
 	}
+	if p.proxyActive && p.outlet != nil {
+		p.wg.Add(1)
+		go func() {
+			defer p.wg.Done()
+			p.refreshProxyBypassAfterServers()
+		}()
+	}
 
 	p.L().Info("sni_route initialized",
 		zap.String("interface", p.iface),

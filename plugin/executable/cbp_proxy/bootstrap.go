@@ -9,9 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -60,8 +58,7 @@ func FetchMainCandidates(ctx context.Context, cfg coremain.ProxyProvideConfig, i
 		req.Header.Set("X-API-Key", token)
 	}
 	transport := &http.Transport{
-		Proxy:       http.ProxyFromEnvironment,
-		DialContext: bootstrapDialContext,
+		Proxy: http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: insecure,
@@ -151,72 +148,4 @@ func normalizeCandidateAddresses(raw []string) []string {
 		out = append(out, normalized)
 	}
 	return out
-}
-
-// bootstrapDNSServers are used only for the HTTPS bootstrap request. At
-// startup mosdns has not opened 127.0.0.1:53 yet, while the system resolver
-// points at that same address; resolving api.aa2.dev through the system
-// resolver would therefore deadlock. The bootstrap control plane is allowed
-// to use these public resolvers independently, then the normal data path
-// still uses the configured DNS pipeline.
-var bootstrapDNSServers = []string{"1.1.1.1:53", "8.8.8.8:53"}
-
-func bootstrapDialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	}
-	if ip, parseErr := netip.ParseAddr(host); parseErr == nil && ip.IsValid() {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	}
-	if strings.EqualFold(host, "localhost") {
-		var d net.Dialer
-		return d.DialContext(ctx, network, address)
-	}
-
-	addrs, lookupErr := lookupBootstrapHost(ctx, host)
-	if lookupErr == nil && len(addrs) > 0 {
-		var d net.Dialer
-		var lastErr error
-		for _, addr := range addrs {
-			conn, dialErr := d.DialContext(ctx, network, net.JoinHostPort(addr.String(), port))
-			if dialErr == nil {
-				return conn, nil
-			}
-			lastErr = dialErr
-		}
-		return nil, fmt.Errorf("cbp_proxy: bootstrap dial %s: %w", address, lastErr)
-	}
-	var d net.Dialer
-	return d.DialContext(ctx, network, address)
-}
-
-func lookupBootstrapHost(ctx context.Context, host string) ([]netip.Addr, error) {
-	var lastErr error
-	for _, server := range bootstrapDNSServers {
-		server := server
-		resolver := &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, network, server)
-			},
-		}
-		addrs, err := resolver.LookupNetIP(ctx, "ip", host)
-		if err == nil && len(addrs) > 0 {
-			// Prefer IPv4; a host with unreachable IPv6 should not make the
-			// bootstrap wait for an IPv6 connect timeout.
-			sort.SliceStable(addrs, func(i, j int) bool {
-				return addrs[i].Is4() && !addrs[j].Is4()
-			})
-			return addrs, nil
-		}
-		lastErr = err
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no bootstrap DNS server returned an address")
-	}
-	return nil, lastErr
 }

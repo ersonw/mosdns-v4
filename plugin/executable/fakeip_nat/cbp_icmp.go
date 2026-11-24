@@ -213,6 +213,21 @@ func (p *FakeIPNatPlugin) startCBPICMP(ctx context.Context, st *tunStack) {
 	if !p.cbpOutlet || p.cbpRaw == nil {
 		return
 	}
+	// CBP bootstrap and AUTH only run after mosdns' DNS listeners are up. The
+	// raw tunnel is opened on that same session, so wait for the same signal
+	// instead of spending the 10s open timeout on a not-yet-started provider.
+	if m := p.M(); m != nil {
+		select {
+		case <-m.ServersStarted():
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-time.After(200 * time.Millisecond):
+		case <-ctx.Done():
+			return
+		}
+	}
 	openCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := p.cbpRaw.OpenRawIP(openCtx)

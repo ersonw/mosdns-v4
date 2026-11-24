@@ -1165,7 +1165,9 @@ func (p *FakeIPNatPlugin) startTunDataPath() error {
 	// ICMP relay needs the device for replies and the mapping table for echo
 	// forwarding, so it starts once both exist.
 	if p.cbpOutlet {
-		p.startCBPICMP(runCtx, st)
+		// CBP raw control needs the DNS listeners and the deferred CBP login;
+		// do not hold the tun reader behind that wait.
+		go p.startCBPICMP(runCtx, st)
 	} else {
 		p.startICMPRelay(runCtx, st)
 	}

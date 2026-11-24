@@ -455,6 +455,19 @@ func (d *loggingDialer) DialContext(ctx context.Context, network, addr string) (
 
 func (d *loggingDialer) UnwrapDialer() egress.Dialer { return d.dialer }
 
+// ProxyHost follows the real outlet. A provider can register before its far
+// endpoint is known (CBP resolves its relay after the login that waits for DNS
+// servers), so borrowers must read this lazily instead of the placeholder
+// captured at registration time.
+func (d *loggingDialer) ProxyHost() string {
+	if h, ok := d.dialer.(interface{ ProxyHost() string }); ok {
+		if host := h.ProxyHost(); host != "" {
+			return host
+		}
+	}
+	return d.proxy
+}
+
 func (d *loggingDialer) Close() error {
 	return egress.Close(d.dialer)
 }
@@ -472,7 +485,16 @@ func (p *plugin) OutletDialer() egress.Dialer { return p.dialer }
 // OutletProxyHost is the address a borrower must keep out of its own marking,
 // because the socket that reaches the proxy cannot itself take the mark. The
 // password stays here and never reaches the borrower's decision value.
-func (p *plugin) OutletProxyHost() string { return p.proxy }
+func (p *plugin) OutletProxyHost() string {
+	if p.dialer != nil {
+		if h, ok := p.dialer.(interface{ ProxyHost() string }); ok {
+			if host := h.ProxyHost(); host != "" {
+				return host
+			}
+		}
+	}
+	return p.proxy
+}
 
 // OutletDestSet names the set this exit marks destinations in, or empty when
 // it carries no marking objects. A borrower reads it before asking to register

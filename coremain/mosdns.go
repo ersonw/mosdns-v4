@@ -69,6 +69,11 @@ type Mosdns struct {
 	badIPObserver ip_observer.IPObserver
 
 	sc *safe_close.SafeClose
+
+	// serversStarted is closed once every configured DNS listener is serving.
+	// Providers that need network access (CBP bootstrap and AUTH) use it to
+	// wait until mosdns itself can answer the resolver they depend on.
+	serversStarted chan struct{}
 }
 
 // The service wrapper and the signal handler need a way to ask the running
@@ -161,6 +166,7 @@ func RunMosdns(cfg *Config) error {
 		httpAPIMux:     http.NewServeMux(),
 		metricsReg:     newMetricsReg(),
 		sc:             safe_close.NewSafeClose(),
+		serversStarted: make(chan struct{}),
 	}
 
 	done := registerActive(m)
@@ -271,6 +277,7 @@ func RunMosdns(cfg *Config) error {
 			return fmt.Errorf("failed to start server #%d, %w", i, err)
 		}
 	}
+	close(m.serversStarted)
 
 	// Start http api server
 	if httpAddr := cfg.API.HTTP; len(httpAddr) > 0 {
@@ -369,6 +376,24 @@ func (m *Mosdns) ConfigDir() string {
 func (m *Mosdns) GetSafeClose() *safe_close.SafeClose {
 	return m.sc
 }
+
+// ServersStarted returns a channel that is closed after every configured DNS
+// listener is serving. A provider that must resolve its own control domain
+// can wait on it instead of touching the network during plugin initialization.
+// A nil Mosdns or a zero-value instance reports an already-closed channel so
+// callers never block in tests or in manually built instances.
+func (m *Mosdns) ServersStarted() <-chan struct{} {
+	if m == nil || m.serversStarted == nil {
+		return closedSignal
+	}
+	return m.serversStarted
+}
+
+var closedSignal = func() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
 
 func (m *Mosdns) GetExecutables() map[string]executable_seq.Executable {
 	return m.execs
