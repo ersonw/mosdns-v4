@@ -1356,3 +1356,37 @@ CBP 登录都失败。已在 `/etc/hosts` 固定当前 Cloudflare A 记录：
 注意：`egress_hk` 仍承担 `forward_hk`、默认 `fakeip_nat`、`asn_tun` 和
 `sni_tiktok` 的出口；本次只改 proxy，不动这些路由/表。HK CBP 的数据面已经
 实际承载流量，不是只完成登录。
+
+## 33. CBP raw ICMP 启动时序修复（2026-11-24）
+
+现象：`fakeip` 和 `fakeip_tiktok` 在 CBP 出口下持续输出
+`tun icmp: cbp raw tunnel is not ready, dropping echo`，客户端
+`ping <fakeip>` 没有回包；启动时只有
+`tun icmp: cbp raw tunnel unavailable, ping and traceroute stay unanswered`
+（`error=context deadline exceeded`）。
+
+根因：`startCBPICMP` 在 `ServersStarted` 信号后 200ms 才开始
+`OpenRawIP(10s)`；两个 CBP 会话的登录分别耗时约 `10.29s` 和 `10.84s`
+（bootstrap、NODE_LIST、relay AUTH），`OpenRawIP` 的 10 秒窗口在会话
+ready 之前就过期，随后函数直接返回，整个进程不再重试，ICMP 被永久丢弃。
+这不是 CBP raw 协议不可用，也不是节点没有 raw 能力；是启动窗口太窄。
+
+修复：
+
+- `rawOpenTimeout` 从 `10s` 放宽到 `30s`。
+- `startCBPICMP` 增加失败重试，间隔 `15s`；只有 `ctx` 取消才退出，避免
+  登录慢或瞬时失败后永久关闭 raw 隧道。
+- 不改 CBP 控制流、data stream、TCP/UDP 拨号和路由 mark/table。
+
+验证：
+
+- 新二进制 `dev/v4.0.0-14-gaea9390`，sha256
+  `9e6db65c4fad94875aef7797cc5b0452b97b93c3ba3a89cf16dbd1fc58767c48`；
+  旧二进制备份 `/usr/local/bin/mosdns.bak.20261124T1318Z`。
+- 重启后两个 outlet 都输出 `tun icmp: cbp raw tunnel ready`：
+  `fakeip tunnel_ipv4=10.68.0.3`、`fakeip_tiktok tunnel_ipv4=10.69.0.2`。
+- `ping 198.18.3.84`（example.com 的 fakeip，真实目标经 CBP raw 隧道）：
+  VyOS 本机 3/3 回包，RTT 约 39–44ms；下游 Mac 3/3 回包，RTT 约 44–60ms。
+- `traceroute` 到同一 fakeip 返回 5 跳，延迟约 84ms，说明不是本地伪造应答。
+- 修复后未再出现 `cbp raw tunnel is not ready, dropping echo`；`mosdns.service`
+  active，`NRestarts=0`。
