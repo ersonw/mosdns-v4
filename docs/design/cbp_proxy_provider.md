@@ -1184,3 +1184,29 @@ fakeip_nat DNAT -100 / mark 0
   拨号命中退避而不是再次 AUTH。
 - `go test ./plugin/executable/cbp_proxy ./plugin/executable/egress_route ./pkg/egress ./pkg/cbpstream -count=1` 通过。
 - 本轮未改线上配置，未替换线上 mosdns 二进制。
+
+## 29. 线上 CBP 节点重建后的本地验证（2026-11-24）
+
+线上 HK 节点已替换为 2026-11-24 07:50 部署的
+`dev/deploy-20261124-cbnode`，`cb-node.service` active。本地用真实
+`cbp_aa2` 节点 token 和身份文件，经 coordinator relay 连接
+`edge-vyos-hk1` 验证：
+
+- 基线 `sessions=0`、`stream_pool_used=0`、`stream_pool_slots=7642`。
+- 并发打开 50 条 TCP 流时 `stream_pool_used=50`，全部关闭后回到 `0`；
+  旧构建的 +50 泄漏不再出现。
+- 120 并发 TCP：120/120 成功，92ms，p50 90ms，p95 91ms；
+  关闭后 `stream_pool_used=0`。
+- 300 并发 TCP：300/300 成功，91ms，p50 86ms，p95 89ms；
+  关闭后 `stream_pool_used=0`。
+- 1000 请求 / 500 并发：1000/1000 成功，297ms，p50 113ms，
+  p95 140ms；关闭后 `stream_pool_used=0`。
+- HTTP 数据面：通过 CBP 流请求 `http://example.com:80` 返回
+  `HTTP/1.1 200 OK`，888 字节。
+- UDP 数据面：通过 CBP UDP 向 `8.8.8.8:53` 查询 `example.com A`，
+  `NOERROR`，返回 2 条 answer。
+- 测试结束后节点回到 `sessions=0`、`stream_pool_used=0`；临时凭据和
+  测试文件已删除。
+
+结论：线上节点已包含流槽释放修复，高并发下没有失败，正常关闭后不再
+泄漏 node-wide stream slot。
