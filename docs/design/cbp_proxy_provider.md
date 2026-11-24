@@ -1310,3 +1310,4 @@ ok github.com/ersonw/mosdns-v4/plugin/executable/cbp_proxy
 - SG 节点 `/healthz` 的 `data_streams` 在请求期间从 2 升到 3，空闲后回落，确认 TCP 走的是 QUIC data stream，不是只打印能力；`stream_pool_used` 同步变化。
 - `dig @127.0.0.1 www.tiktok.com A` 返回 `198.17.0.62`，`curl https://www.tiktok.com/` 返回 200。
 - `mosdns.service` active，`NRestarts=0`；回滚备份为 `/etc/mosdns/config.yaml.bak.20261124T115751Z` 和 `/usr/local/bin/mosdns.bak.20261124T115747Z`。
+- 下游客户反馈访问速度明显提升；复测 SG 节点 health 时 `data_streams=58`、`stream_pool_used=68`，说明并发 TCP 连接已在新数据面承载。
