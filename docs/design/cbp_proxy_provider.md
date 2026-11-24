@@ -1311,3 +1311,48 @@ ok github.com/ersonw/mosdns-v4/plugin/executable/cbp_proxy
 - `dig @127.0.0.1 www.tiktok.com A` 返回 `198.17.0.62`，`curl https://www.tiktok.com/` 返回 200。
 - `mosdns.service` active，`NRestarts=0`；回滚备份为 `/etc/mosdns/config.yaml.bak.20261124T115751Z` 和 `/usr/local/bin/mosdns.bak.20261124T115747Z`。
 - 下游客户反馈访问速度明显提升；复测 SG 节点 health 时 `data_streams=58`、`stream_pool_used=68`，说明并发 TCP 连接已在新数据面承载。
+
+## 32. 线上 HK 出口切换到 CBP（2026-11-24）
+
+按要求把 VyOS `192.168.10.1` 的 HK 出口从 gost 切到 CBP，`egress_hk.args.proxy` 由
+`gost://11.10.10.13:1080` 改为 `cbp_proxy:cbp_aa2:edge-vyos-hk1`；`mark=126`、
+`nft_table=hk_tun`、`route_table=126`、`next_hop/next_hop_dev` 均未改。
+
+改动前备份：`/etc/mosdns/config.yaml.bak.20261124T1226Z`。`mosdns check-config`
+通过后重启；diff 只有这一行 proxy 变化。
+
+启动时发现一个必须先处理的依赖：HK 改成 CBP 后，bootstrap 的
+`api.aa2.dev` 不能再借 HK gost 解析，否则会形成“CBP 登录等 DNS、DNS 又等 CBP”
+的循环。首次重启出现 `lookup api.aa2.dev on 127.0.0.1:53: i/o timeout`，两个
+CBP 登录都失败。已在 `/etc/hosts` 固定当前 Cloudflare A 记录：
+
+```text
+104.21.27.123 api.aa2.dev
+172.67.142.149 api.aa2.dev
+```
+
+同时新增 `/usr/local/sbin/mosdns-bootstrap-hosts` 和
+`/etc/systemd/system/mosdns-bootstrap-hosts.service`，在 `mosdns.service` 之前
+补写该 hosts 条目，避免重启后 `/etc/hosts` 被 VyOS 重新生成时丢失。该服务已
+`enable`，首次手动启动成功。VyOS `config.boot` 备份为
+`/config/config.boot.bak.20261124T1235Z`。
+
+验证结果：
+
+- 两个 CBP 会话都建立成功：HK 节点 `4e7b4fa9-85cf-46f5-9e82-872d8fa2fa3e`、
+  SG 节点 `61718919-4c09-47b6-a633-45465999cb16`，均显示
+  `data_streams_supported=true`、`enabled=true`、`available=true`。
+- HK 节点 health：`sessions=1`，`data_streams` 和 `stream_pool_used` 持续活跃；
+  20 并发 HTTPS 测试后 `stream_pool_used=161`、`data_streams=119`。
+- `dig @127.0.0.1 ipinfo.io A` 返回 fakeip `198.18.15.146`，经该 fakeip 请求
+  `https://ipinfo.io/json` 返回 `103.49.60.205`、`country=HK`，确认出口是香港。
+- `dig @127.0.0.1 example.com A` 返回 fakeip `198.18.3.84`，
+  `curl --resolve` 返回 HTTP 200。
+- 20 条并发 `example.com` HTTPS 请求全部返回 200，耗时约 1.5–2.5 秒。
+- `ss` 只看到 mosdns 到 `11.10.10.13:8443` 的两条 CBP 控制连接，没有到
+  `11.10.10.13:1080` 的 gost 连接。
+- `mosdns.service` active，`NRestarts=0`。
+
+注意：`egress_hk` 仍承担 `forward_hk`、默认 `fakeip_nat`、`asn_tun` 和
+`sni_tiktok` 的出口；本次只改 proxy，不动这些路由/表。HK CBP 的数据面已经
+实际承载流量，不是只完成登录。
