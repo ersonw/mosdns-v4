@@ -1211,7 +1211,7 @@ fakeip_nat DNAT -100 / mark 0
 结论：线上节点已包含流槽释放修复，高并发下没有失败，正常关闭后不再
 泄漏 node-wide stream slot。
 
-## 30. CBP bootstrap 独立 DNS 与 VyOS SG 出口切换（2026-11-24）
+## 30. CBP 初始化改为异步登录（2026-11-24）
 
 把 SG 出口从 gost 切到 `cbp_proxy:cbp_aa2:edge-vyos-sg1` 时，mosdns
 启动失败：
@@ -1234,35 +1234,42 @@ read udp 127.0.0.1:52197->127.0.0.1:53: read: connection refused
   resolver 指回尚未启动的 mosdns，于是 connection refused；
 - gost 出口不需要 bootstrap，所以此前一直没有暴露这个问题。
 
-不能简单把 CBP 初始化整体挪到端口监听之后。`egress_route` 在 Init 阶段
-就要注册 outlet，`forward_sg`、`fakeip_tiktok`、`sni_tiktok` 等插件随后
-通过 `routepolicy.OutletFor` 借用它；如果把 `egress_route` 延后，依赖
-链会断，mosdns 仍然无法完成启动。正确的做法是让 bootstrap 控制面不依赖
-本机 DNS。
+不能简单把 `egress_route` 或 CBP provider 整体挪到端口监听之后。
+`egress_route` 在 Init 阶段就要注册 outlet，`forward_sg`、
+`fakeip_tiktok`、`sni_tiktok` 等插件随后通过 `routepolicy.OutletFor`
+借用它；整体延后会断依赖链。
 
-实现（`plugin/executable/cbp_proxy/bootstrap.go`）：
+最终方案是异步登录，不单独给 bootstrap 增加独立 DNS 解析器：
 
-- 新增 `bootstrapDialContext`，仅用于 bootstrap 的 `http.Transport`；
-- 目标是 IP 或 `localhost` 时直接拨号，不改变原有行为；
-- 域名先通过独立公共 DNS（`1.1.1.1:53`、`8.8.8.8:53`）解析，再按解析
-  结果连接，TLS SNI 仍使用原域名；
-- 结果优先 IPv4，避免不可达 IPv6 拖长启动；
-- 公共 DNS 全部失败时回退到系统 resolver，保持原有可控失败路径；
-- 只影响 bootstrap 控制面，业务 DNS 仍走 `forward_local` / `forward_hk` /
-  `forward_sg`，数据面仍走 CBP 流，不会绕过现有分流。
+- `coremain.Mosdns` 新增 `serversStarted` 信号，在所有 DNS listener
+  启动成功后 `close`；`ServersStarted()` 对外暴露该信号。
+- `cbp_proxy` 在 Init 阶段仍然注册 outlet，但返回的是
+  `startupDialer`：`Probe` 立即返回 `egress.ErrDeferred`，不触网。
+- `startupDialer` 先等待 `ServersStarted()`，再异步执行 bootstrap、
+  NODE_LIST 刷新和 AUTH；`nodeRefreshLoop` 也延后到同一信号。
+- 首次数据拨号如果早于登录完成，会等待登录结果；登录失败则在拨号时
+  重试，而不是让插件初始化失败或让整个 mosdns 退出。
+- `fakeip_tiktok` 的 CBP raw tunnel 同样等到 DNS listener 启动信号
+  后再打开，避免启动阶段把 ICMP 能力永久丢掉。
+- `egress_route` 的 `OutletProxyHost()` 会从真正的 outlet 动态读取
+  登录后的 relay host；`sni_tiktok` 在登录完成后把真实 relay IP 补进
+  `bypass4`，避免代理 socket 自己又被 SNI 规则标记。
 
 验证：
 
-- 新增 `TestBootstrapDialContextResolvesThroughIndependentDNS`：本地启动
-  假 DNS，把 `bootstrap.test` 解析到 127.0.0.1，确认 `bootstrapDialContext`
-  不经过系统 resolver 即可连上目标 TCP 端口。
-- VyOS 上 `dig @1.1.1.1 api.aa2.dev A` 返回公网地址；旧系统 resolver 在
-  mosdns 启动后会把 `api.aa2.dev` 解析成 fakeip，因此不能只依赖系统 resolver。
-- 新二进制 `dev/v4.0.0-3-gdff9a47`，sha256
-  `011405d91b76dbd72920ebd5d7b9a9e5616c304ae339380ac8fa8e84b734d3f0`。
-- 部署后 `mosdns.service` active，`NRestarts=0`，53 端口正常监听；
-  `dig @127.0.0.1 example.com A` 返回 fakeip，`www.tiktok.com` 走
-  `fakeip_tiktok` 返回 200，SG 节点健康接口显示 `sessions=1`、
-  `stream_pool_used=3`，确认 SG 出口已经切到 CBP。
-- 线上配置备份：`/etc/mosdns/config.yaml.bak.20261124T094031Z`；二进制备份：
-  `/usr/local/bin/mosdns.bak.20261124T094040Z`。
+- 新增 `startup_test.go`：覆盖注册后不提前登录、信号后异步登录、
+  登录失败后首次拨号重试、并发拨号共享同一次登录、上下文取消。
+- VyOS 上线后日志顺序为：`provider outlet registered`（Init）→
+  `servers started, logging in CBP node` → `deferred CBP login ready`
+  → `tun icmp: cbp raw tunnel ready`；`sni_route: proxy bypass added to
+  nft set` 记录 relay IP `11.10.10.13`。
+- `dig @127.0.0.1 www.tiktok.com A` 返回 `198.17.0.62`，
+  `https://www.tiktok.com/` 经 `fakeip_tiktok` 返回 `200`。
+- `mosdns.service` active、`NRestarts=0`，53 端口正常监听。
+- 线上部署版本 `dev/v4.0.0-5-ga5ae22c`；配置备份
+  `/etc/mosdns/config.yaml.bak.20261124T094031Z`，二进制备份
+  `/usr/local/bin/mosdns.bak.20261124T095834Z`。
+
+说明：登录完成前约 5 秒内，新的 CBP 数据连接会等待登录结果；超过
+普通 DNS 查询的 5 秒超时可能返回一次 `context deadline exceeded`。
+这是启动窗口的预期行为，登录完成后恢复正常。
