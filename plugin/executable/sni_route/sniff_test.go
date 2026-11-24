@@ -131,6 +131,7 @@ func TestNFTRules(t *testing.T) {
 		"ip saddr @src4",
 		"ip daddr != @bypass4",
 		"tcp dport 443",
+		"meta mark == 0",
 		"meta mark set 130",
 	} {
 		if !bytes.Contains([]byte(rules), []byte(want)) {
@@ -148,7 +149,7 @@ func TestNFTRulesQUICDrop(t *testing.T) {
 		ports:     []int{443},
 		blockQUIC: true,
 	})
-	if !bytes.Contains([]byte(rules), []byte("udp dport 443 counter drop")) {
+	if !bytes.Contains([]byte(rules), []byte("udp dport 443 meta mark == 0 counter drop")) {
 		t.Errorf("QUIC drop rule missing:\n%s", rules)
 	}
 }

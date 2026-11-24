@@ -83,3 +83,7 @@ fakeip 段总是排除，不需要重复填写。`bypass_ip` 接受
 - 插件启动失败只禁用自身，不会让 DNS 服务退出；配置错误仍在初始化时直接失败。
 - 一个实例一套 `nft_table`/`mark`/`route_table`/`tun_dev`，多实例必须各用各的。
 - 命中判断只看 SNI；ECH 或没有 SNI 的连接按未命中处理，字节透传。
+- 只接管 `meta mark == 0` 的包。入口分流顺序是 fakeip_nat 的 DNAT（-100）
+  和 mark（0）→ `asn_tun`（10）→ `sni_route`（12）；前两级已经打过 mark 的
+  包不会再被本插件覆盖。否则 Telegram 这类没有 TLS SNI、但已被 `asn_tun`
+  标记的 443 流量会被拽进 `sn0`，随后走未命中的直连路径而超时。

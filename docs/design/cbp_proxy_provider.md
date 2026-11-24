@@ -1107,3 +1107,37 @@ mosdns-v4 因此调整为：
 - `dig example.com @127.0.0.1` 返回 fakeip `198.18.3.84`；`curl --resolve example.com:443:198.18.3.84` 返回 HTTP 200。
 - `dig ipinfo.io @127.0.0.1` 返回 fakeip `198.18.15.146`；经该 fakeip 请求 `https://ipinfo.io/json` 返回 `103.49.60.205` / Hong Kong，说明 HK 出口已走 gost。
 - `ss -ntp` 显示 mosdns 到 `11.10.10.13:1080` 的 ESTAB 连接，确认实际使用 gost 而非 CBP。
+
+## 27. sni 分流顺序修正（2026-11-24）
+
+问题：iPhone Telegram 的 443 连接一直超时。`asn_tun` 的 `asn4` 已包含
+`91.108.56.0/22`、`149.154.160.0/20`，在 priority 10 给这些目的地址打
+`0x7d`，本应进 `asn0` 再走 `egress_hk`。但 `sni_route` 的 mark_pre 在
+priority 12 无条件匹配同一批 TCP/443，把 `0x7d` 覆盖成 `0x82`，流量进入
+`sn0`；Telegram MTProto 没有 TLS SNI，`sni_route` 判为未命中后走直连，
+日志为 `sni="" matched=false` + `dial tcp ... i/o timeout`。Telegram 的
+80/5222 不被 `sni_route` 抓取，所以备用端口反而能建立。
+
+修正：`sni_route` 的 mark_pre 规则只在 `meta mark == 0` 时接管；UDP/443
+的 `block_quic` drop 同样加该条件。入口顺序固定为：
+
+```text
+fakeip_nat DNAT -100 / mark 0
+  -> asn_tun 10
+  -> sni_route 12 (只处理仍然没有 mark 的包)
+```
+
+这样 `asn_tun` 已标记的 Telegram 保留 `0x7d`，走 `asn0` -> `egress_hk`；
+`sni_route` 只处理前两级都没有决定的流量。
+
+验证：
+
+- `GOTOOLCHAIN=go1.20.14 go test ./plugin/executable/sni_route -count=1` 通过。
+- 新二进制 `check-config` 通过；线上替换前备份
+  `/usr/local/bin/mosdns.bak.20261124T0709Z`。
+- 重启后 `nft list chain inet sni_route mark_pre` 显示
+  `tcp dport 443 meta mark 0x00000000 counter ... meta mark set 0x00000082`。
+- 重启后 `sni_tiktok` 不再出现 `91.108.*` / `149.154.*` 的未命中直连日志；
+  `conntrack` 中出现 `192.168.10.15/19/16 -> 91.108.56.*:443 ESTABLISHED`。
+- `curl -x http://11.10.10.13:1080 https://91.108.56.131` 的 CONNECT 返回
+  200，确认 HK gost 能打到 Telegram 443。

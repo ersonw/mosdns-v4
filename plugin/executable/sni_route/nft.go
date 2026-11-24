@@ -12,11 +12,12 @@ import (
 	"go.uber.org/zap"
 )
 
-// markHookPriority runs after VyOS's policy-routing mangle chain (-150), after
-// mosdns's own oversea chain (0), and after asn_tun's mark chain (10). The SNI
-// mark is the decision of this plugin, so it has to be the last writer for the
-// destinations it captures: an earlier mark would otherwise win and the flow
-// would never enter the device.
+// markHookPriority runs after fakeip_nat's DNAT (-100) and destination-mark
+// chain (0), after asn_tun's mark chain (10), and after VyOS's policy-routing
+// mangle chain (-150). The SNI rule only captures packets that carry no mark:
+// an earlier mark is already a decision (asn_tun sends Telegram ASNs into
+// asn0, for example), and this plugin must not overwrite it and strand the
+// flow on the unmatched direct path.
 const markHookPriority = 12
 
 type cmdRunner interface {
@@ -75,14 +76,14 @@ func nftRules(p nftParams) string {
 		bypassMatch = "ip daddr != @bypass4 "
 	}
 	ports := nftPortSet(p.ports)
-	fmt.Fprintf(&b, "add rule inet %s mark_pre iifname %q %s%s tcp dport %s counter meta mark set %d\n",
+	fmt.Fprintf(&b, "add rule inet %s mark_pre iifname %q %s%s tcp dport %s meta mark == 0 counter meta mark set %d\n",
 		p.table, p.iface, srcMatch, bypassMatch, ports, p.mark)
 	if p.blockQUIC {
 		// QUIC carries its own encrypted DNS and its SNI is not readable by a
 		// TLS parser. Dropping it on the captured path makes the client fall
 		// back to TCP, where the SNI decision actually applies. The bypass set
 		// keeps LAN and fake-IP destinations out of this drop.
-		fmt.Fprintf(&b, "add rule inet %s mark_pre iifname %q %s%s udp dport %s counter drop\n",
+		fmt.Fprintf(&b, "add rule inet %s mark_pre iifname %q %s%s udp dport %s meta mark == 0 counter drop\n",
 			p.table, p.iface, srcMatch, bypassMatch, ports)
 	}
 

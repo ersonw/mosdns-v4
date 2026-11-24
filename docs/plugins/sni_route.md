@@ -88,3 +88,9 @@ including `provider:<tag>:<category>`.
 - One instance owns one `nft_table`/`mark`/`route_table`/`tun_dev`; multiple
   instances need distinct values.
 - Matching is SNI only. ECH or a handshake without SNI is relayed untouched.
+- Only packets with `meta mark == 0` are captured. The ingress order is
+  fakeip_nat's DNAT (-100) and mark chain (0), then `asn_tun` (10), then
+  `sni_route` (12). A packet already marked by an earlier stage is not
+  overwritten. Without this guard, Telegram 443 - no TLS SNI but already
+  marked by `asn_tun` - would be pulled into `sn0` and time out on the
+  unmatched direct path.
