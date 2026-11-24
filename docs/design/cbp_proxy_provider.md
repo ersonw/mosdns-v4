@@ -1210,3 +1210,59 @@ fakeip_nat DNAT -100 / mark 0
 
 结论：线上节点已包含流槽释放修复，高并发下没有失败，正常关闭后不再
 泄漏 node-wide stream slot。
+
+## 30. CBP bootstrap 独立 DNS 与 VyOS SG 出口切换（2026-11-24）
+
+把 SG 出口从 gost 切到 `cbp_proxy:cbp_aa2:edge-vyos-sg1` 时，mosdns
+启动失败：
+
+```text
+failed to init plugin #10, egress_route: proxy provider cbp_proxy:
+cbp_proxy: refresh cbp_aa2:
+cbp_proxy: bootstrap https://api.aa2.dev/v1/edge/bootstrap:
+Get "https://api.aa2.dev/v1/edge/bootstrap": dial tcp:
+lookup api.aa2.dev on 127.0.0.1:53:
+read udp 127.0.0.1:52197->127.0.0.1:53: read: connection refused
+```
+
+根因不是节点或 token，而是启动顺序造成的 DNS 自依赖：
+
+- VyOS 的 `/etc/resolv.conf` 由系统自动生成，内容是 `nameserver 127.0.0.1`；
+- CBP provider 在 `RunMosdns` 的插件初始化阶段就要请求 bootstrap 接口；
+- 此时 `m.startServers` 还没执行，mosdns 尚未监听 127.0.0.1:53；
+- `FetchMainCandidates` 使用 Go 默认 resolver，解析 `api.aa2.dev` 时被系统
+  resolver 指回尚未启动的 mosdns，于是 connection refused；
+- gost 出口不需要 bootstrap，所以此前一直没有暴露这个问题。
+
+不能简单把 CBP 初始化整体挪到端口监听之后。`egress_route` 在 Init 阶段
+就要注册 outlet，`forward_sg`、`fakeip_tiktok`、`sni_tiktok` 等插件随后
+通过 `routepolicy.OutletFor` 借用它；如果把 `egress_route` 延后，依赖
+链会断，mosdns 仍然无法完成启动。正确的做法是让 bootstrap 控制面不依赖
+本机 DNS。
+
+实现（`plugin/executable/cbp_proxy/bootstrap.go`）：
+
+- 新增 `bootstrapDialContext`，仅用于 bootstrap 的 `http.Transport`；
+- 目标是 IP 或 `localhost` 时直接拨号，不改变原有行为；
+- 域名先通过独立公共 DNS（`1.1.1.1:53`、`8.8.8.8:53`）解析，再按解析
+  结果连接，TLS SNI 仍使用原域名；
+- 结果优先 IPv4，避免不可达 IPv6 拖长启动；
+- 公共 DNS 全部失败时回退到系统 resolver，保持原有可控失败路径；
+- 只影响 bootstrap 控制面，业务 DNS 仍走 `forward_local` / `forward_hk` /
+  `forward_sg`，数据面仍走 CBP 流，不会绕过现有分流。
+
+验证：
+
+- 新增 `TestBootstrapDialContextResolvesThroughIndependentDNS`：本地启动
+  假 DNS，把 `bootstrap.test` 解析到 127.0.0.1，确认 `bootstrapDialContext`
+  不经过系统 resolver 即可连上目标 TCP 端口。
+- VyOS 上 `dig @1.1.1.1 api.aa2.dev A` 返回公网地址；旧系统 resolver 在
+  mosdns 启动后会把 `api.aa2.dev` 解析成 fakeip，因此不能只依赖系统 resolver。
+- 新二进制 `dev/v4.0.0-3-gdff9a47`，sha256
+  `011405d91b76dbd72920ebd5d7b9a9e5616c304ae339380ac8fa8e84b734d3f0`。
+- 部署后 `mosdns.service` active，`NRestarts=0`，53 端口正常监听；
+  `dig @127.0.0.1 example.com A` 返回 fakeip，`www.tiktok.com` 走
+  `fakeip_tiktok` 返回 200，SG 节点健康接口显示 `sessions=1`、
+  `stream_pool_used=3`，确认 SG 出口已经切到 CBP。
+- 线上配置备份：`/etc/mosdns/config.yaml.bak.20261124T094031Z`；二进制备份：
+  `/usr/local/bin/mosdns.bak.20261124T094040Z`。
