@@ -3,12 +3,16 @@ package cbp_proxy
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ersonw/mosdns-v4/coremain"
+	"github.com/miekg/dns"
 )
 
 func TestFetchMainCandidatesUsesHTTPSAndAPIKey(t *testing.T) {
@@ -103,4 +107,49 @@ func TestNormalizeCandidateAddressesRejectsSomethingWithoutPort(t *testing.T) {
 	if len(got) != 1 || strings.Contains(got[0], "tls://") {
 		t.Fatalf("addresses = %+v", got)
 	}
+}
+
+func TestBootstrapDialContextResolvesThroughIndependentDNS(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dnsSrv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		for _, q := range r.Question {
+			if q.Qtype == dns.TypeA && strings.EqualFold(q.Name, "bootstrap.test.") {
+				m.Answer = append(m.Answer, &dns.A{
+					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+					A:   net.ParseIP("127.0.0.1"),
+				})
+			}
+		}
+		_ = w.WriteMsg(m)
+	})}
+	go func() { _ = dnsSrv.ActivateAndServe() }()
+	defer func() { _ = dnsSrv.Shutdown() }()
+
+	oldServers := bootstrapDNSServers
+	bootstrapDNSServers = []string{pc.LocalAddr().String()}
+	defer func() { bootstrapDNSServers = oldServers }()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := bootstrapDialContext(ctx, "tcp", "bootstrap.test:"+strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
 }
