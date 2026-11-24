@@ -1390,3 +1390,32 @@ ready 之前就过期，随后函数直接返回，整个进程不再重试，IC
 - `traceroute` 到同一 fakeip 返回 5 跳，延迟约 84ms，说明不是本地伪造应答。
 - 修复后未再出现 `cbp raw tunnel is not ready, dropping echo`；`mosdns.service`
   active，`NRestarts=0`。
+
+## 34. 线上 SG/HK 出口切回 gost（2026-11-24）
+
+按要求把 SG 和 HK 两个出口都从 CBP 切回 gost，只改两个
+`egress_route.args.proxy`：
+
+- `egress_sg`：`cbp_proxy:cbp_aa2:edge-vyos-sg1` → `gost://11.10.10.31:1080`
+- `egress_hk`：`cbp_proxy:cbp_aa2:edge-vyos-hk1` → `gost://11.10.10.13:1080`
+
+`mark`、`nft_table`、`route_table`、`next_hop`、`next_hop_dev` 均未改。改动前备份：
+`/etc/mosdns/config.yaml.bak.20261124T1331Z`；diff 只有这两行。
+
+切换前确认两个 gost 端点：
+
+- `11.10.10.13:1080` 端口开放，HTTP 代理访问 Google 返回 200。
+- `11.10.10.31:1080` 端口开放，HTTP 代理访问 Google 返回 302（代理可用）。
+
+重启验证：
+
+- `mosdns.service` active，`NRestarts=0`。
+- `ss` 观察到 mosdns 同时连接到 `11.10.10.13:1080` 和 `11.10.10.31:1080`。
+- `ipinfo.io` 经 fakeip 返回 `103.49.60.205`、`country=HK`，说明默认 HK 出口按 gost 工作。
+- `www.tiktok.com` 经 fakeip 返回 HTTP 200，SG 分流仍正常。
+- CBP 插件仍加载但当前两个出口不再借用它；没有新的 `CBP stream session ready`，
+  也没有 `tun icmp: cbp raw tunnel ready`。CBP provider 的 `data_streams: true`
+  保留，供以后切回时使用。
+- 当前 gost 出口不提供 CBP raw，ICMP 不再走 CBP raw；`fakeip_nat` 按普通代理
+  出口的既有逻辑处理。第 33 节的 CBP raw ICMP 启动修复仍保留在二进制中，切回
+  CBP 时才会生效。
