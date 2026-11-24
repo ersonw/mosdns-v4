@@ -1266,9 +1266,10 @@ read udp 127.0.0.1:52197->127.0.0.1:53: read: connection refused
 - `dig @127.0.0.1 www.tiktok.com A` 返回 `198.17.0.62`，
   `https://www.tiktok.com/` 经 `fakeip_tiktok` 返回 `200`。
 - `mosdns.service` active、`NRestarts=0`，53 端口正常监听。
-- 线上部署版本 `dev/v4.0.0-5-ga5ae22c`；配置备份
-  `/etc/mosdns/config.yaml.bak.20261124T094031Z`，二进制备份
-  `/usr/local/bin/mosdns.bak.20261124T095834Z`。
+- 线上部署版本 `dev/v4.0.0-7-g4b65e5f`，sha256
+  `553a5544619e1555142e16194f49ef062a43e1df595fe75c5eca44715b4abf44`；
+  配置备份 `/etc/mosdns/config.yaml.bak.20261124T094031Z`，二进制备份
+  `/usr/local/bin/mosdns.bak.20261124T100119Z`。
 
 说明：登录完成前约 5 秒内，新的 CBP 数据连接会等待登录结果；超过
 普通 DNS 查询的 5 秒超时可能返回一次 `context deadline exceeded`。

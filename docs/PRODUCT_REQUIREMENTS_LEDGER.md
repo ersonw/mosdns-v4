@@ -16,4 +16,4 @@
 - 代码只提交本地；`git push` 和发布新版本必须等用户明确指示。
 - 线上变更前必须保留配置和二进制备份；本次备份为
   `/etc/mosdns/config.yaml.bak.20261124T094031Z` 和
-  `/usr/local/bin/mosdns.bak.20261124T095834Z`。
+  `/usr/local/bin/mosdns.bak.20261124T100119Z`。
