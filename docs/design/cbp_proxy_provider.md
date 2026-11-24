@@ -1287,7 +1287,7 @@ read udp 127.0.0.1:52197->127.0.0.1:53: read: connection refused
 - 数据地址按 `SESSION_READY.data_addresses`、NODE_LIST 的 `data_addresses`、`data_addr`、`lan_data_addr` 去重排序；`lan_data_addr` 放最后，避免远端 mosdns 把首个握手窗口花在私网地址上。每个地址都必须完成 QUIC 握手，ICMP 可达但 UDP 端口被过滤的地址会被跳过。
 - TCP 出口改为 `OpenStreamAuto`：能力具备且 data plane 已 attach 时优先走 QUIC；传输层失败（握手、开流、ACK 读超时等）对本会话粘性回退到控制流；目标地址被节点拒绝（例如目标端口不通、stream pool busy）只回退当前请求，不关闭后续 QUIC 尝试。
 - 现有控制流 `STREAM_*`、`RAW_PACKET`、`RESOLVE` 和 raw ICMP 路径保持不变；本次没有把 UDP 关联或 raw IP 改到 QUIC data stream。服务端当前也只接受 data stream 的 `tcp` network。
-- `proxy_provides[].data_streams` 默认 `false`；从桌面 `config_dat` 读取 `network.cbp.data_streams`（protobuf field 18）时，YAML 显式值优先。默认关闭是因为服务端 `81c5c20` 尚未部署到节点，不能把现有控制流路径替换掉。
+- `proxy_provides[].data_streams` 默认 `false`；从桌面 `config_dat` 读取 `network.cbp.data_streams`（protobuf field 18）时，YAML 显式值优先。默认关闭保留为兼容默认，线上只对已升级且验证过的 provider 显式开启。
 - 新增 `pkg/cbp/protocol_test.go` 覆盖能力字段和 open/ack envelope；`pkg/cbpstream/data_test.go` 用真实 QUIC listener 验证 bind、open、ack 和双向回显；`coremain/proxy_provide_dat_test.go` 覆盖 field 18 的读取与合并。
 
 本地验证：
@@ -1300,4 +1300,13 @@ ok github.com/ersonw/mosdns-v4/coremain
 ok github.com/ersonw/mosdns-v4/plugin/executable/cbp_proxy
 ```
 
-启用条件：节点二进制升级到包含 `81c5c20` 的版本，并确认节点 `data_streams=true`、QUIC data 端口可达后，再把对应 `proxy_provides` 的 `data_streams` 设为 `true`。未升级节点会自动走控制流，不需要回滚配置。
+启用条件：节点二进制升级到包含 `81c5c20` 的版本，并确认节点 `data_streams=true`、QUIC data 端口可达后，再把对应 `proxy_provides` 的 `data_streams` 设为 `true`。未升级节点会自动走控制流，不需要回滚配置。本次 SG 节点已满足条件并已显式启用；HK 出口仍为 gost，不属于本次替换范围。
+
+线上启用记录（2026-11-24 19:58 CST）：
+
+- VyOS `egress_sg` 使用的 `proxy_provides.cbp_aa2` 已增加 `data_streams: true`；`egress_hk` 的 gost 配置未改。
+- 新二进制 `dev/v4.0.0-9-g67c8806`，sha256 `f349d66c7e57509668403b31cd21ee4ced506688c8eb12c9ccae4107d22e3d4c`。
+- 登录日志：`data_streams_supported=true`、`data_streams_enabled=true`、`data_streams_available=true`，relay `11.10.10.13:8443`。
+- SG 节点 `/healthz` 的 `data_streams` 在请求期间从 2 升到 3，空闲后回落，确认 TCP 走的是 QUIC data stream，不是只打印能力；`stream_pool_used` 同步变化。
+- `dig @127.0.0.1 www.tiktok.com A` 返回 `198.17.0.62`，`curl https://www.tiktok.com/` 返回 200。
+- `mosdns.service` active，`NRestarts=0`；回滚备份为 `/etc/mosdns/config.yaml.bak.20261124T115751Z` 和 `/usr/local/bin/mosdns.bak.20261124T115747Z`。
