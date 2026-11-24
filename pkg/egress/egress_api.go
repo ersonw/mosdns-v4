@@ -13,8 +13,15 @@ package egress
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net/netip"
 )
+
+// ErrDeferred marks a proxy whose startup handshake has not succeeded yet.
+// The outlet is still usable: its first data connection retries the handshake,
+// and egress_route must keep the rest of mosdns running instead of treating a
+// transient authentication or allocation failure as fatal.
+var ErrDeferred = errors.New("egress: proxy session deferred")
 
 // Dialer is the outbound contract every outlet satisfies.
 type Dialer = egressDialer

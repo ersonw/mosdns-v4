@@ -10,6 +10,7 @@ package egress_route
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -257,21 +258,30 @@ func Init(bp *coremain.BP, args interface{}) (coremain.Plugin, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultProbeTimeout)
 		probeErr := egress.Probe(ctx, d)
 		cancel()
-		if probeErr != nil {
+		deferred := errors.Is(probeErr, egress.ErrDeferred)
+		if probeErr != nil && !deferred {
 			p.L().Warn("egress_route: proxy probe failed",
 				zap.String("proxy", egress.Redact(raw)), zap.String("exit", p.decision.String()),
 				zap.Duration("elapsed", time.Since(probeStart)), zap.Error(probeErr))
 			// A configured proxy is a policy decision: falling back to direct
-			// would leak the traffic this exit exists to carry.
+			// would leak the traffic this exit exists to carry. Only a
+			// provider that explicitly marks its session deferred is allowed
+			// to start without a completed startup handshake.
 			return nil, fmt.Errorf("egress_route: proxy %s is not usable: %w", egress.Redact(raw), probeErr)
 		}
 		p.dialer = d
 		p.proxy = host
-		p.L().Debug("egress_route: proxy probe passed",
-			zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host),
-			zap.Duration("elapsed", time.Since(probeStart)))
-		p.L().Info("egress_route: proxy exit ready",
-			zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host), zap.String("exit", p.decision.String()))
+		if deferred {
+			p.L().Warn("egress_route: proxy session deferred; keeping the outlet for a later dial",
+				zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host),
+				zap.String("exit", p.decision.String()), zap.Error(probeErr))
+		} else {
+			p.L().Debug("egress_route: proxy probe passed",
+				zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host),
+				zap.Duration("elapsed", time.Since(probeStart)))
+			p.L().Info("egress_route: proxy exit ready",
+				zap.String("proxy", egress.Redact(raw)), zap.String("proxy_host", host), zap.String("exit", p.decision.String()))
+		}
 		if cfg.DirectFallback != nil && !*cfg.DirectFallback {
 			if !egress.SetNoDirectFallback(p.dialer) {
 				p.L().Warn("egress_route: direct_fallback is false but this link is a single protocol and never falls back",

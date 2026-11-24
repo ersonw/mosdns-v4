@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -27,6 +28,7 @@ import (
 	"github.com/ersonw/mosdns-v4/pkg/cbp"
 	"github.com/ersonw/mosdns-v4/pkg/cbpcoord"
 	"github.com/ersonw/mosdns-v4/pkg/cbpstream"
+	"github.com/ersonw/mosdns-v4/pkg/egress"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
@@ -121,6 +123,86 @@ func TestManagerClosesLoopFromBootstrapToCBPStream(t *testing.T) {
 		t.Fatalf("response = %q", buf[:n])
 	}
 	_ = egressClose(dialer)
+}
+
+func TestManagerDefersAuthFailureInsteadOfFailingStartup(t *testing.T) {
+	cert := testCertificate(t, "cbp-test")
+	nodeAddr, closeNode, err := startFakeCBPNodeAuthError(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeNode()
+	coordinatorAddr, closeCoordinator, err := startFakeCoordinator(cert, "edge-sg-1", nodeAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeCoordinator()
+
+	identity := newTestIdentity(t, "cbp_sg")
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/edge/bootstrap":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"server": map[string]any{
+					"candidates": []map[string]any{{
+						"id":        "main",
+						"role":      "main",
+						"addresses": []string{coordinatorAddr},
+					}},
+				},
+			})
+		case "/v1/identity/client":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"client_id":   identity.clientID,
+				"public_key":  identity.publicKey,
+				"private_key": identity.privateKey,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := coremain.ProxyProvideConfig{
+		Tag:          "cbp_sg",
+		Domain:       srv.URL,
+		Token:        "test-token",
+		NodeToken:    "node-token",
+		IdentityFile: filepath.Join(t.TempDir(), "identity.json"),
+	}
+	m, err := NewManager([]coremain.ProxyProvideConfig{cfg}, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer, host, err := m.NewProxyDialer("cbp_sg:"+"edge-sg-1", true)
+	if err != nil {
+		t.Fatalf("NewProxyDialer() returned a fatal error after AUTH failure: %v", err)
+	}
+	if host == "" {
+		t.Fatal("deferred dialer has no proxy host")
+	}
+	defer func() { _ = egressClose(dialer) }()
+
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	probeErr := egress.Probe(probeCtx, dialer)
+	probeCancel()
+	if !errors.Is(probeErr, egress.ErrDeferred) {
+		t.Fatalf("Probe() error = %v, want ErrDeferred", probeErr)
+	}
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer dialCancel()
+	_, err = dialer.DialContext(dialCtx, "tcp", "example.com:443")
+	if err == nil {
+		t.Fatal("first data dial unexpectedly succeeded after AUTH failure")
+	}
+	if !strings.Contains(err.Error(), "auth failed") {
+		t.Fatalf("first data dial error = %v, want auth failure", err)
+	}
+	_, err = dialer.DialContext(dialCtx, "tcp", "example.com:443")
+	if !errors.Is(err, errCBPSessionBackoff) {
+		t.Fatalf("second data dial error = %v, want retry backoff", err)
+	}
 }
 
 func TestManagerUsesExistingIdentityClientID(t *testing.T) {
@@ -414,6 +496,41 @@ func startFakeCBPNode(cert tls.Certificate, authTokens chan<- string) (string, f
 						return
 					}
 				}
+			}()
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }, nil
+}
+
+func startFakeCBPNodeAuthError(cert tls.Certificate) (string, func(), error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", nil, err
+	}
+	tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})
+	go func() {
+		for {
+			conn, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_ = cbp.WriteControlFrame(conn, cbp.Envelope{
+					Type:    "HELLO_ACK",
+					Payload: mustJSON(map[string]any{"nonce": "dGVzdC1ub25jZQ", "version": 1}),
+				})
+				env, err := cbp.ReadControlFrame(conn)
+				if err != nil || env.Type != "AUTH" {
+					return
+				}
+				_ = cbp.WriteControlFrame(conn, cbp.Envelope{
+					Type: "ERROR",
+					Payload: mustJSON(map[string]any{
+						"code":    "session_failed",
+						"message": "center IP allocation: context deadline exceeded",
+					}),
+				})
 			}()
 		}
 	}()

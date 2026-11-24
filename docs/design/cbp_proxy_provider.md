@@ -1141,3 +1141,46 @@ fakeip_nat DNAT -100 / mark 0
   `conntrack` 中出现 `192.168.10.15/19/16 -> 91.108.56.*:443 ESTABLISHED`。
 - `curl -x http://11.10.10.13:1080 https://91.108.56.131` 的 CONNECT 返回
   200，确认 HK gost 能打到 Telegram 443。
+
+## 28. CBP 认证失败不再拖垮整个 mosdns（2026-11-24）
+
+问题：线上 HK 出口曾出现 CBP `AUTH` 失败，节点返回
+`session_failed: center IP allocation: ... context deadline exceeded`。
+`cbp_proxy.NewProxyDialer` 在启动阶段急切握手，失败直接返回 error；
+`egress_route` 把 provider 初始化失败当作致命错误，导致插件初始化中止、
+`server exited`，DNS 和所有出口一起断网。`direct_fallback` 在这个阶段
+根本走不到。
+
+改动：
+
+- `pkg/egress` 新增 `ErrDeferred` 哨兵错误，表示“代理出口已注册，但启动
+  握手尚未完成，首次数据拨号时再重试”。
+- `cbp_proxy.dialNode` 在握手失败时仍返回已经构造好的 `cbpDialer`（`client`
+  为空），同时返回错误；`NewProxyDialer` 继续尝试其余 relay / legacy direct
+  候选。所有候选都失败时返回该 deferred dialer，而不是让调用方直接失败；
+  优先保留真正走到 `AUTH` 才失败的候选。
+- `cbpDialer.Probe` 在会话为空或不健康时返回 `ErrDeferred`，不会在启动阶段
+  再次强制 AUTH。
+- `cbpDialer.ensureClient` 在连接失败后进入 2s 起步、最长 30s 的指数退避，
+  避免并发数据连接连续重试 AUTH、反复打中心 IP 分配接口；成功后清空退避。
+- `egress_route` 只对 `ErrDeferred` 放行：记录 Warn，保留出口和路由，让首次
+  数据连接触发 `ensureClient` 重连；其他 proxy probe 失败仍然是致命错误，
+  不改变“代理出口必须走代理、不直连泄漏”的策略。
+- 节点列表 / NODE_LIST 刷新失败仍然致命：没有节点信息就无法构造可靠的
+  CBP 目标，不能假装出口可用。
+
+行为：
+
+- CBP 认证失败时 mosdns 继续运行，其他出口和 DNS 不受影响。
+- 使用该 CBP 出口的连接在首次拨号时重试 AUTH；如果中心 IP 分配仍失败，
+  只影响该连接，不会导致全局断网。
+- CBP 出口没有 direct fallback，不存在认证失败后偷偷直连的路径。
+
+验证：
+
+- 新增 `TestManagerDefersAuthFailureInsteadOfFailingStartup`：假节点在 AUTH
+  后返回 `ERROR session_failed`，断言 `NewProxyDialer` 不返回致命错误、
+  `Probe` 返回 `ErrDeferred`，首次数据拨号仍报 `auth failed`，紧接着的第二次
+  拨号命中退避而不是再次 AUTH。
+- `go test ./plugin/executable/cbp_proxy ./plugin/executable/egress_route ./pkg/egress ./pkg/cbpstream -count=1` 通过。
+- 本轮未改线上配置，未替换线上 mosdns 二进制。

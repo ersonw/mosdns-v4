@@ -26,7 +26,14 @@ const (
 	nodeRefreshTTL           = 5 * time.Minute
 	nodeRefreshCheckInterval = time.Minute
 	dialTimeout              = 10 * time.Second
+	// cbpReconnectBackoff keeps a failed AUTH from turning every new data
+	// connection into another allocation attempt against the center. The
+	// first failure waits two seconds, then doubles up to thirty seconds.
+	cbpReconnectBackoff = 2 * time.Second
+	cbpReconnectMax     = 30 * time.Second
 )
+
+var errCBPSessionBackoff = errors.New("cbp_proxy: CBP session retry backoff")
 
 // Manager owns one state per proxy_provides tag. A state caches the current
 // CBP node list from NODE_LIST and the selected main-server TCP candidate.
@@ -82,6 +89,9 @@ func NewManager(configs []coremain.ProxyProvideConfig, logger *zap.Logger) (*Man
 // resolves <node> by node ID first and then by node label, and opens its stream
 // session. The selected coordinator relay is tried first; legacy direct node
 // control endpoints are only a fallback for older standalone nodes.
+// If every candidate fails during the handshake, the resolver still returns a
+// usable dialer with an empty session so egress_route can keep the rest of
+// mosdns alive; the first data connection retries AUTH with backoff.
 // RunRefreshLoop keeps the NODE_LIST cache current. Without it the table
 // would only be refreshed when egress_route asks for a dialer at startup.
 func (m *Manager) RunRefreshLoop(ctx context.Context) {
@@ -186,6 +196,8 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	// whenever one exists, and keep the legacy direct path only as a fallback
 	// for an older standalone node that is not registered at the coordinator.
 	var relayErrs []string
+	var deferred egress.Dialer
+	var deferredHost string
 	choices := relayChoices(coordinator, fallbacks)
 	m.logger.Debug("cbp_proxy: relay choices", zap.Int("count", len(choices)), zap.Strings("addresses", relayAddresses(choices)))
 	for _, relay := range choices {
@@ -194,6 +206,10 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 		if err == nil {
 			return dialer, host, nil
 		}
+		if dialer != nil && (deferred == nil || isCBPAuthFailure(err)) {
+			deferred = dialer
+			deferredHost = host
+		}
 		relayErrs = append(relayErrs, fmt.Sprintf("%s (%s): %v", relay.Address, relay.Role, err))
 		m.logger.Warn("cbp_proxy: coordinator relay candidate failed",
 			zap.String("tag", tag), zap.String("node", nodeID),
@@ -201,6 +217,12 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 	}
 
 	if len(addresses) == 0 {
+		if deferred != nil {
+			m.logger.Warn("cbp_proxy: CBP session deferred until first dial",
+				zap.String("tag", tag), zap.String("node", nodeID),
+				zap.Strings("handshake_errors", relayErrs))
+			return deferred, deferredHost, nil
+		}
 		return nil, "", fmt.Errorf("cbp_proxy: node %q has no direct control endpoint; relay failed: %s", nodeID, strings.Join(relayErrs, "; "))
 	}
 
@@ -217,11 +239,21 @@ func (m *Manager) NewProxyDialer(params string, insecure bool) (egress.Dialer, s
 			if err == nil {
 				return dialer, host, nil
 			}
+			if dialer != nil && (deferred == nil || isCBPAuthFailure(err)) {
+				deferred = dialer
+				deferredHost = host
+			}
 			directErrs = append(directErrs, fmt.Sprintf("%s (%v)", candidate.Address, err))
 			m.logger.Warn("cbp_proxy: legacy direct CBP node candidate failed",
 				zap.String("tag", tag), zap.String("node", nodeID),
 				zap.String("address", candidate.Address), zap.Duration("rtt", candidate.RTT), zap.Error(err))
 		}
+	}
+	if deferred != nil {
+		m.logger.Warn("cbp_proxy: CBP session deferred until first dial",
+			zap.String("tag", tag), zap.String("node", nodeID),
+			zap.Strings("handshake_errors", append(relayErrs, directErrs...)))
+		return deferred, deferredHost, nil
 	}
 	return nil, "", fmt.Errorf("cbp_proxy: node %q relay: %s; direct: %s", nodeID, strings.Join(relayErrs, "; "), strings.Join(directErrs, "; "))
 }
@@ -307,24 +339,29 @@ func (m *Manager) dialNode(ctx context.Context, state *tagState, node cbpcoord.N
 		zap.String("node", node.ID), zap.String("address", address),
 		zap.String("server_name", serverName), zap.Bool("relay", relay),
 		zap.String("relay_addr", relayAddr), zap.Duration("timeout", dialTimeout))
-	client, err := cbpstream.Dial(ctx, streamCfg)
-	if err != nil {
-		state.log.Warn("cbp_proxy: CBP handshake failed",
-			zap.String("node", node.ID), zap.Bool("relay", relay), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
-		return nil, "", err
-	}
 	host := address
 	if relay {
 		host = relayAddr
 	}
 	host = hostOnly(host)
+	sessionLog := state.log.With(zap.String("node", node.ID), zap.Bool("relay", relay))
+	dialer := &cbpDialer{cfg: streamCfg, host: host, node: node.ID, log: sessionLog}
+	client, err := cbpstream.Dial(ctx, streamCfg)
+	if err != nil {
+		state.log.Warn("cbp_proxy: CBP handshake failed",
+			zap.String("node", node.ID), zap.Bool("relay", relay), zap.Duration("elapsed", time.Since(start)), zap.Error(err))
+		// Return the prepared dialer with an empty session. egress_route can
+		// start the rest of mosdns and let the first data connection retry the
+		// handshake instead of taking every exit offline at boot.
+		return dialer, host, err
+	}
 	ready := client.Ready()
 	state.log.Info("cbp_proxy: CBP stream session ready",
 		zap.String("node", node.ID), zap.String("control", address),
 		zap.Bool("relay", relay), zap.String("relay_addr", relayAddr),
 		zap.Uint64("session_id", ready.SessionID), zap.Duration("elapsed", time.Since(start)))
-	return &cbpDialer{client: client, cfg: streamCfg, host: host, node: node.ID,
-		log: state.log.With(zap.String("node", node.ID), zap.Bool("relay", relay))}, host, nil
+	dialer.client = client
+	return dialer, host, nil
 }
 
 func hostOnly(address string) string {
@@ -634,6 +671,9 @@ type cbpDialer struct {
 	node   string
 	log    *zap.Logger
 	closed bool
+
+	retryAt    time.Time
+	retryDelay time.Duration
 }
 
 // ensureClient returns a live control session, replacing one that was closed
@@ -647,7 +687,12 @@ func (d *cbpDialer) ensureClient(ctx context.Context) (*cbpstream.Client, error)
 		return nil, errors.New("cbp_proxy: dialer is closed")
 	}
 	if d.client != nil && d.client.Healthy() {
+		d.retryAt = time.Time{}
+		d.retryDelay = 0
 		return d.client, nil
+	}
+	if now := time.Now(); d.retryAt.After(now) {
+		return nil, fmt.Errorf("%w: retry in %s", errCBPSessionBackoff, time.Until(d.retryAt).Round(time.Millisecond))
 	}
 	if d.client != nil {
 		d.log.Warn("cbp_proxy: CBP session unhealthy, reconnecting")
@@ -656,9 +701,14 @@ func (d *cbpDialer) ensureClient(ctx context.Context) (*cbpstream.Client, error)
 	}
 	client, err := cbpstream.Dial(ctx, d.cfg)
 	if err != nil {
-		d.log.Warn("cbp_proxy: CBP reconnect failed", zap.Error(err))
+		d.retryDelay = nextReconnectDelay(d.retryDelay)
+		d.retryAt = time.Now().Add(d.retryDelay)
+		d.log.Warn("cbp_proxy: CBP reconnect failed",
+			zap.Error(err), zap.Duration("retry_in", d.retryDelay))
 		return nil, fmt.Errorf("cbp_proxy: reconnect node %s: %w", d.node, err)
 	}
+	d.retryAt = time.Time{}
+	d.retryDelay = 0
 	d.log.Info("cbp_proxy: CBP session reconnected", zap.Uint64("session_id", client.Ready().SessionID))
 	if d.closed {
 		_ = client.Close()
@@ -666,6 +716,17 @@ func (d *cbpDialer) ensureClient(ctx context.Context) (*cbpstream.Client, error)
 	}
 	d.client = client
 	return client, nil
+}
+
+func nextReconnectDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return cbpReconnectBackoff
+	}
+	current *= 2
+	if current > cbpReconnectMax {
+		return cbpReconnectMax
+	}
+	return current
 }
 
 func (d *cbpDialer) invalidate(client *cbpstream.Client) {
@@ -679,6 +740,17 @@ func (d *cbpDialer) invalidate(client *cbpstream.Client) {
 
 func isClientClosed(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "client closed")
+}
+
+// isCBPAuthFailure reports whether the handshake reached node AUTH and was
+// rejected there. Such a candidate is preferred as the deferred one because
+// its transport works; only the session allocation is temporarily unhealthy.
+func isCBPAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "auth failed") || strings.Contains(msg, "session_failed")
 }
 
 func (d *cbpDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -761,12 +833,22 @@ func (c *cbpRawIPConn) ReadPacket(ctx context.Context) ([]byte, error) {
 func (c *cbpRawIPConn) Close() error { return nil }
 
 func (d *cbpDialer) Probe(ctx context.Context) error {
-	d.log.Debug("cbp_proxy: probing CBP session")
-	_, err := d.ensureClient(ctx)
-	if err != nil {
-		d.log.Warn("cbp_proxy: CBP probe failed", zap.Error(err))
+	d.mu.Lock()
+	client := d.client
+	closed := d.closed
+	d.mu.Unlock()
+	if closed {
+		return errors.New("cbp_proxy: dialer is closed")
 	}
-	return err
+	if client == nil || !client.Healthy() {
+		// The startup AUTH may have failed (for example the center's IP
+		// allocator timed out). Keep the outlet alive and let the first data
+		// connection retry; egress_route treats this as a deferred session.
+		d.log.Warn("cbp_proxy: CBP session deferred, first dial will retry the handshake")
+		return fmt.Errorf("cbp_proxy: CBP session not ready: %w", egress.ErrDeferred)
+	}
+	d.log.Debug("cbp_proxy: CBP session probe passed")
+	return nil
 }
 
 func (d *cbpDialer) Close() error {
